@@ -13,7 +13,7 @@ include $(top_srcdir)/common.mk
 etcdir = $(prefix)/etc
 noinst_DATA = openlava.sh openlava.csh \
 	lsf.conf lsf.cluster.${openlavacluster} lsf.shared lsf.task \
-	lsb.hosts lsb.params lsb.queues lsb.users 
+	lsb.hosts lsb.params lsb.queues lsb.users lsb.resources limits.sh
 
 etc_SCRIPTS = openlava
 
@@ -22,8 +22,9 @@ etc_SCRIPTS = openlava
 install-data-local:
 	mkdir -p $(DESTDIR)$(prefix)/work/logdir
 	mkdir -p $(DESTDIR)$(prefix)/log
+	mkdir -p $(DESTDIR)$(prefix)/etc
 
 # Tell automake to install during distcheck the
 # configuration and etc files. 
-#
+#etc_DATA = gitcommit
 #EXTRA_DIST = $(etc_DATA)

@@ -1,13 +1,18 @@
 #
 # openlava project
 #
-# Copyright (C) 2011-2015 David Bigagli
+# Copyright (C) 2011-2016 David Bigagli
 #
-AC_INIT(openlava, 3.1)
+AC_INIT(openlava, 4.0)
 AC_CONFIG_HEADERS(config.h)
-AC_PREFIX_DEFAULT([/opt/openlava-3.1])
-AC_DEFINE(_OPENLAVA_PROJECT_, "OpenLava 3.1", "Set project string in binaries.")
-AC_DEFINE(OPENLAVA_VERSION, 31, "Current openlava version.")
+AC_CONFIG_SRCDIR([configure.ac])
+AC_CONFIG_MACRO_DIR([m4])
+AC_CONFIG_AUX_DIR([m4])
+
+AC_PREFIX_DEFAULT([/opt/openlava-master])
+AC_PREFIX_DEFAULT([/opt/openlava-master])
+AC_DEFINE(_OPENLAVA_PROJECT_, "OpenLava master", "Set project string in binaries.")
+AC_DEFINE(OPENLAVA_VERSION, 40, "Current openlava version.")
 #AC_DEFINE(REL_DATE, "Nov 11 2013", "Set the release date.")
 
 # Non Linux support
@@ -21,7 +26,7 @@ case "${target_os}" in
     AM_CONDITIONAL([SOLARIS], [true]) ;;
 esac
 
-# Initialize the automake
+# Initialize automake
 AM_INIT_AUTOMAKE
 
 # Experimental scheduling module
@@ -41,10 +46,28 @@ AC_PROG_LN_S
 AC_PROG_MAKE_SET
 AC_PROG_LIBTOOL
 
-# Force warnings on for gcc
+# --enable-debug to turn on -Werror and enable assert()
+#OL_DEBUG
 if test "x$ac_compiler_gnu" = xyes; then
-    CFLAGS="$CFLAGS -Wall -Wno-switch -fPIC"
+    CFLAGS="$CFLAGS -Wall -ggdb -O0 -Wno-switch -fPIC -rdynamic"
 fi
+
+# --with-hwloc to turn on numa support
+AM_CONDITIONAL([HWLOC], [false])
+AC_ARG_WITH(
+    [hwloc],
+    [AS_HELP_STRING(
+        [--with-hwloc[[=DIR]]],
+        [Specify path to hwloc installation]
+    )],
+    [AS_IF([test "x$withval" != "xyes"], [CPPFLAGS="-I$withval/include $CPPFLAGS"
+        LDFLAGS="-L$withval/lib -L$withval/lib64 $LDFLAGS"])
+        AC_CHECK_HEADERS([hwloc.h], [], [AC_MSG_ERROR([cannot build openlava without hwloc])])
+        AC_CHECK_LIB([hwloc], [hwloc_topology_init], [], [AC_MSG_ERROR([cannot build openlava without hwloc])])
+        AC_CHECK_HEADER([numa.h], [], [AC_MSG_ERROR([cannot build openlava without numa])])
+        AC_CHECK_LIB([numa], [numa_bitmask_alloc], [], [AC_MSG_ERROR([cannot build openlava without numa])])
+        AM_CONDITIONAL([HWLOC], [true])
+])
 
 AC_CHECK_HEADERS(ncurses.h,[cf_cv_ncurses_header="ncurses.h"], [
  AC_MSG_ERROR([cannot build openlava without ncurses])
@@ -102,6 +125,7 @@ LDFLAGS="$LDFLAGS -lm -lpthread -ldl -no-install"
 
 AC_CONFIG_FILES([
 	Makefile                 \
+	m4/Makefile              \
 	config/Makefile          \
 	lsf/Makefile             \
 	lsf/intlib/Makefile      \
@@ -131,6 +155,7 @@ AC_CONFIG_FILES([
 	config/lsb.params        \
 	config/lsb.queues        \
 	config/lsb.users         \
+	config/lsb.resources     \
 	config/lsf.cluster.${openlavacluster}:config/lsf.cluster.openlava.in \
 	config/lsf.shared        \
 	config/lsf.task          \
@@ -138,6 +163,7 @@ AC_CONFIG_FILES([
 	config/openlava          \
 	config/openlava.setup    \
 	config/openlava.sh       \
+        config/limits.sh
 	examples/Makefile        \
 	examples/docker/Makefile \
 	tests/Makefile],,

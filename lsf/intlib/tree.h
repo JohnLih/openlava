@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2014-2015 David Bigagli
+ * Copyright (C) 2014-2016 David Bigagli
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of version 2 of the GNU General Public License as
@@ -42,7 +42,7 @@ struct tree_node_ {
 };
 
 extern struct tree_ *tree_init(const char *);
-extern void tree_free(struct tree_ *);
+extern void tree_free(struct tree_ *, void(*f)(void *));
 extern struct tree_node_ *tree_insert_node(struct tree_node_ *,
                                            struct tree_node_ *);
 extern struct tree_node_ *tree_rm_node(struct tree_node_ *);
@@ -54,6 +54,5 @@ extern int tree_walk2(struct tree_ *,
                       int (*f)(struct tree_node_ *,
                                struct tree_ *));
 extern struct tree_node_ *tree_next_node(struct tree_node_ *);
-extern struct tree_node_ *tree_rm_leaf(struct tree_node_ *);
 
 #endif /* _TREE_HEADER */

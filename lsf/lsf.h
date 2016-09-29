@@ -43,6 +43,8 @@
 #include <pwd.h>
 #include <dlfcn.h>
 #include <limits.h>
+#include <pthread.h>
+#include <poll.h>
 #include <sys/param.h>
 #include <sys/time.h>
 #include <sys/statvfs.h>
@@ -87,11 +89,11 @@ extern char **environ;
  * comparibility where vN daemon talks
  * to vN-1 library
  */
-#define OPENLAVA_XDR_VERSION 31
+#define OPENLAVA_XDR_VERSION 40
 
 #define LSF_DEFAULT_SOCKS       15
 #define MAXLINELEN              PATH_MAX
-#define MAXLSFNAMELEN           256
+#define MAXLSFNAMELEN           1024
 #define MAXSRES                 32
 #define MAXRESDESLEN            256
 #define NBUILTINDEX             11
@@ -99,7 +101,7 @@ extern char **environ;
 #define MAXMODELS               128
 #define MAXTYPES_31             25
 #define MAXMODELS_31            30
-#define MAXFILENAMELEN          256
+#define MAXFILENAMELEN          PATH_MAX
 
 #define FIRST_RES_SOCK  20
 
@@ -111,6 +113,10 @@ extern char **environ;
 # define LS_WAIT_T      int
 # define LS_STATUS(s)   (s)
 #endif
+
+/* Where all the proc information are.
+ */
+#define PROC_DIR "/proc"
 
 typedef enum {
     R15S,
@@ -128,6 +134,9 @@ typedef enum {
     USR2
 } lsindx_t;
 
+/* These defines are here for historic reasons.
+ * We should use the defined in stdint.h
+ */
 #if !defined(MAXFLOAT)
 #define MAXFLOAT        3.40282347e+38F
 #endif
@@ -306,8 +315,9 @@ enum orderType {INCR, DECR, NA};
 #define RESF_SHARED      0x08 /* shared resource for some hosts */
 #define RESF_EXTERNAL    0x10 /* external resource */
 #define RESF_RELEASE     0x20 /* releasable if job suspended */
-#define RESF_MBD_MXJ     0x40 /* MBD slots */
-#define RESF_MBD_CPUF    0x80 /* MBD sort hosts by cpufactor */
+#define RESF_MBD_FREE_SLOTS     0x40 /* MBD slots */
+#define RESF_MBD_CPUF    0x80  /* MBD sort hosts by cpufactor */
+#define RESF_MBD_MXJ     0x100 /* MBD order by MXJ */
 #define RESF_DEFINED_IN_RESOURCEMAP  0x40
 
 #define true TRUE
@@ -506,25 +516,24 @@ struct sharedConf {
     char            *servers;
 };
 
-typedef struct lsSharedResourceInstance {
+struct lsSharedResourceInstance {
     char *value;
     int  nHosts;
     char **hostList;
+};
 
-} LS_SHARED_RESOURCE_INST_T;
-
-typedef struct lsSharedResourceInfo {
+struct lsSharedResourceInfo {
     char *resourceName;
     int  nInstances;
-    LS_SHARED_RESOURCE_INST_T  *instances;
-} LS_SHARED_RESOURCE_INFO_T;
+    struct lsSharedResourceInstance  *instances;
+};
 
 struct clusterConf {
     struct clusterInfo *clinfo;
-    int       numHosts;
+    int numHosts;
     struct hostInfo *hosts;
     int numShareRes;
-    LS_SHARED_RESOURCE_INFO_T *shareRes;
+    struct lsSharedResourceInfo *shareRes;
 };
 
 /* Maximum number of processes reported by PIM
@@ -532,6 +541,10 @@ struct clusterConf {
  */
 #define MAX_PROC_ENT (2 * 1024)
 
+/* These records are used to collect rusage of
+ * processes using PIM or the standalone ls_getprocusage()
+ * API
+ */
 struct pidInfo {
     int pid;
     int ppid;
@@ -548,6 +561,20 @@ struct jRusage {
     struct pidInfo *pidInfo;
     int npgids;
     int *pgid;
+};
+
+/* /proc/pid/stat fields we are interested in. We still use int
+ * for now but 2147483647 this value is no longer enough.
+
+ */
+struct proc_info {
+    int pid;
+    int ppid;
+    int pgid;
+    int mem;
+    int swap;
+    int utime;
+    int stime;
 };
 
 typedef enum {
@@ -586,16 +613,6 @@ struct hostEntryLog {
     char    **resList;
     int     rexPriority;
     char    *window;
-};
-
-/* This data structure keeps track of the
- * CPUs on the machine where sbatchd is running
- * and how many tasks are allocated vis cgroup
- * to each CPU.
- */
-struct infoCPUs {
-    int numCPU;     /* CPU number */
-    int numTasks;   /* number of tasks on this CPU */
 };
 
 /* openlava error numbers
@@ -722,10 +739,9 @@ struct infoCPUs {
 #define TIMEIT(level,func,name)                                         \
     { if (timinglevel > level) {                                        \
             struct timeval before, after;                               \
-            struct timezone tz;                                         \
-            gettimeofday(&before, &tz);                                 \
+            gettimeofday(&before, NULL);                                 \
             func;                                                       \
-            gettimeofday(&after, &tz);                                  \
+            gettimeofday(&after, NULL);                                  \
             ls_syslog(LOG_INFO,"L%d %s %d ms",level,name,               \
                       (int)((after.tv_sec - before.tv_sec)*1000 +       \
                             (after.tv_usec-before.tv_usec)/1000));      \
@@ -737,10 +753,9 @@ struct infoCPUs {
 #define TIMEVAL(level,func,val)                                 \
     { if (timinglevel > level) {                                \
             struct timeval before, after;                       \
-            struct timezone tz;                                 \
-            gettimeofday(&before, &tz);                         \
+            gettimeofday(&before, NULL);                         \
             func;                                               \
-            gettimeofday(&after, &tz);                          \
+            gettimeofday(&after, NULL);                          \
             val = (int)((after.tv_sec - before.tv_sec)*1000 +   \
                         (after.tv_usec-before.tv_usec)/1000);   \
         } else {                                                \
@@ -754,10 +769,10 @@ struct infoCPUs {
 #define LC_TRACE    0x00000004
 #define LC_COMM     0x00000008
 #define LC_XDR      0x00000010
-#define LC_CHKPNT   0x00000020
+#define LC_FAIR     0x00000020
 #define LC_FILE     0x00000080
 #define LC_AUTH     0x00000200
-#define LC_HANG     0x00000400
+#define LC_DEP      0x00000400
 #define LC_SIGNAL   0x00001000
 #define LC_PIM      0x00004000
 #define LC_SYS      0x00008000
@@ -768,7 +783,7 @@ struct infoCPUs {
 #define LC_JARRAY   0x00800000
 #define LC_PREEMPT  0x01000000
 #define LC_ELIM     0x02000000
-#define LC_M_LOG    0x04000000
+#define LC_SWITCH   0x04000000
 #define LC_PERFM    0x08000000
 
 #define LOG_DEBUG1  LOG_DEBUG + 1
@@ -911,7 +926,7 @@ extern struct clusterConf *ls_readcluster_ex(char *, struct lsInfo *, int);
 extern int     ls_initdebug(char *appName);
 extern void    ls_syslog(int level, const char *fmt, ...);
 extern void    ls_verrlog(FILE *fp, const char *fmt, va_list ap);
-
+extern int     ls_logchown(uid_t);
 extern int      ls_rescontrol(char *host, int opcode, int options);
 extern int      ls_stdinmode(int onoff);
 extern int      ls_stoprex(void);
@@ -996,13 +1011,21 @@ extern int expSyntax_(char *);
 /* Cgroups
  */
 extern int ls_get_numcpus(void);
-struct infoCPUs *ls_get_cpu_info(int *);
 extern bool_t ls_check_mount(const char *);
 extern char *ls_make_job_container(const char *, int);
 extern int ls_constrain_mem(int, pid_t);
 extern int ls_rmcgroup_mem(pid_t);
 extern int lsb_constrain_mem(const char *, int, pid_t);
 extern int lsb_rmcgroup_mem(const char *,  pid_t);
+
+/* ls_getrpid()
+ *
+ * Get remote process id of a task based in its
+ * taskid which is set locally by the library.
+ */
+extern int ls_getrpid(int, pid_t *);
+extern struct jRusage *ls_getrusage(int);
+extern struct jRusage *ls_getprocusage(pid_t);
 
 #ifndef __CYGWIN__
 extern int optind;

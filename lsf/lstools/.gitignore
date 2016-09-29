@@ -11,3 +11,5 @@ lsrcp
 lsrun
 lsaddhost
 lsrmhost
+lsclusters
+lsgetpid

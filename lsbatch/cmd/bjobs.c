@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2011-2015 David Bigagli
+ * Copyright (C) 2011-2016 David Bigagli
  * Copyright (C) 2007 Platform Computing Inc
  *
  * This program is free software; you can redistribute it and/or modify
@@ -31,10 +31,11 @@ extern int sig_decode(int);
 extern char *get_status(struct jobInfoEnt *job);
 
 static void do_options(int, char **, int *, char **, char **,
-                       char **, char **, float *, int *, char **);
+                       char **, char **, float *, int *, char **, char **);
 static int  skip_job(struct jobInfoEnt *);
 static void displayJobs(struct jobInfoEnt *, struct jobInfoHead *,
                         int, int);
+static void displayCustom(struct jobInfoEnt *, struct jobInfoHead *, int);
 
 static LS_LONG_INT *usrJids;
 static int *numJobs;
@@ -46,6 +47,13 @@ static int foundJids;
 #define MAX_TIMESTRLEN          20
 int uflag = false;
 int Wflag = false;
+int noheaderflag = false;
+char *cusFormat = NULL;
+
+#define FORMAT_WL 1
+#define FORMAT_WP 2
+#define FORMAT_WF 3
+int fintimeformat = 0;
 
 static int isLSFAdmin(void);
 static char *Timer2String(float timer);
@@ -54,27 +62,17 @@ static char *Time2String(int timer);
 void
 usage (char *cmd)
 {
-    fprintf(stderr, I18N_Usage);
 
-    fprintf(stderr, \
-            ": %s [-h] [-V] [-w |-l] [-a] [-d] [-p] [-s] [-r]", cmd);
-
-    if (lsbMode_ == LSB_MODE_BATCH)
-        fprintf(stderr, " [-A]\n");
-
-    fprintf(stderr, "%s\n",
-            "             [-m host_name] [-q queue_name] [-u user_name | -u all]");
-
-    if (lsbMode_ & LSB_MODE_BATCH)
-        fprintf(stderr,
-                "             [-P project_name] [-N host_spec]\n");
-
-    fprintf(stderr, "             [-J name_spec]");
-
-    if (lsbMode_ & LSB_MODE_BATCH)
-        fprintf(stderr, " [jobId | \"jobId[idxList]\" ...]\n");
-    else
-        fprintf(stderr, " [jobId ...]\n");
+    fprintf(stderr, "\
+Usage: %s [-h] [-V] [-w |-l] [-W] [-a] [-d] [-p] [-s] [-r] [-g job_group]\n", cmd);
+    fprintf(stderr, "\
+             [-A] [-m host_name] [-q queue_name] [-u user_name | -u all]\n");
+    fprintf(stderr,"\
+             [-P project_name] [-N host_spec] [-J name_spec] [-UF] [-WL|-WP|-WF] [-noheader]\n");
+    fprintf(stderr, "\
+             [-o ""field_name ... [delimiter='character']]""\n");
+    fprintf(stderr, "\
+             [jobId | \"jobId[idxList]\" ...]\n");
 
     exit(-1);
 }
@@ -88,6 +86,7 @@ main(int argc, char **argv)
     char *queue;
     char *host;
     char *projectName;
+    char *job_group;
     int  format = 0;
     struct jobInfoHead *jInfoH;
     struct jobInfoEnt *job;
@@ -101,25 +100,26 @@ main(int argc, char **argv)
     int cc;
 
     projectName = NULL;
+    job_group = NULL;
     options = 0;
     if (lsb_init(argv[0]) < 0) {
         lsb_perror("lsb_init");
         exit(-1);
     }
 
-    TIMEIT(0, do_options(argc,
-                         argv,
-                         &options,
-                         &user,
-                         &queue,
-                         &host,
-                         &jobName,
-                         &cpuFactor,
-                         &format,
-                         &projectName),
-           "do_options");
+    do_options(argc,
+               argv,
+               &options,
+               &user,
+               &queue,
+               &host,
+               &jobName,
+               &cpuFactor,
+               &format,
+               &projectName,
+               &job_group);
 
-    if ((format == LONG_FORMAT) && (options & PEND_JOB))
+    if ((format == LONG_FORMAT || format == LSFUF_FORMAT) && (options & PEND_JOB))
         options |= HOST_NAME;
 
     if ((options & JGRP_ARRAY_INFO) && numJids <= 0 ) {
@@ -140,7 +140,7 @@ main(int argc, char **argv)
     else
         jobId = 0;
 
-    if (format != LONG_FORMAT && !(options & (HOST_NAME | PEND_JOB)))
+    if (format != LONG_FORMAT && format != LSFUF_FORMAT && !(options & (HOST_NAME | PEND_JOB)))
         options |= NO_PEND_REASONS;
 
     TIMEIT(0, (cc = getUser(lsfUserName, MAXLINELEN)), "getUser");
@@ -187,20 +187,35 @@ main(int argc, char **argv)
                 continue;
         }
 
+        if (numJids == 0 && job_group) {
+            if (strcmp(job->submit.job_group, job_group) != 0)
+                continue;
+        }
+
         if (numJids > 0)
             if (skip_job(job))
                 continue;
 
-        if (format ==  LONG_FORMAT) {
+        if (format ==  LONG_FORMAT || format == LSFUF_FORMAT) {
             if (i > 0) {
                 sprintf(prline, "------------------------------------------------------------------------------\n");
                 prtLine(prline);
             }
-            if (options & PEND_JOB)
-                displayLong(job, jInfoH, cpuFactor);
-            else
-                displayLong(job, NULL, cpuFactor);
+            if (options & PEND_JOB) {
+                if (format == LSFUF_FORMAT)
+                    displayUF(job, jInfoH, cpuFactor);
+                else
+                    displayLong(job, jInfoH, cpuFactor);
+            }
+            else {
+                if (format == LSFUF_FORMAT)
+                    displayUF(job, NULL, cpuFactor);
+                else
+                    displayLong(job, NULL, cpuFactor);
+            }
         }
+        else if (format == CUSTOM_FORMAT)
+            displayCustom(job, jInfoH, options);
         else
             displayJobs(job, jInfoH, options, format);
 
@@ -211,6 +226,9 @@ main(int argc, char **argv)
         sprintf(prline, "\n");
         prtLine(prline);
     }
+
+    if (format == LSFUF_FORMAT)
+        printf("\n");
 
     TIMEIT(0, lsb_closejobinfo(), "lsb_closejobinfo");
 
@@ -230,6 +248,9 @@ main(int argc, char **argv)
         if (jobDisplayed == 0) {
             if (projectName) {
                 fprintf (stderr, "No job found in project %s\n", projectName);
+            }
+            if (job_group) {
+                fprintf (stderr, "No job found in job group %s\n", job_group);
             }
         }
     }
@@ -251,7 +272,8 @@ do_options(int argc,
            char **jobName,
            float *cpuFactor,
            int *format,
-           char **projectName)
+           char **projectName,
+           char **job_group)
 {
     int cc, Nflag = 0;
     char *norOp = NULL;
@@ -263,17 +285,20 @@ do_options(int argc,
     *jobName = NULL;
     *format = 0;
 
-    while ((cc = getopt(argc, argv, "VladpsrwWgRAhJ:q:u:m:N:P:S")) != EOF) {
+    while ((cc = getopt(argc, argv, "VladpsrwW::RAhJ:q:u:m:n:N:o:P:SU:g:")) != EOF) {
         switch (cc) {
             case 'w':
-                if (*format == LONG_FORMAT)
+                if (*format == LONG_FORMAT || *format == LSFUF_FORMAT ||
+                    *format == CUSTOM_FORMAT || fintimeformat != 0)
                     usage(argv[0]);
                 *format = WIDE_FORMAT;
                 break;
             case 'l':
-                if (*format == WIDE_FORMAT)
+                if (*format == WIDE_FORMAT || *format == CUSTOM_FORMAT ||
+                    fintimeformat != 0)
                     usage(argv[0]);
-                *format = LONG_FORMAT;
+		if (*format != LSFUF_FORMAT)
+                    *format = LONG_FORMAT;
                 break;
             case 'a':
                 *options |= ALL_JOB;
@@ -318,18 +343,68 @@ do_options(int argc,
                 Nflag = true;
                 norOp = optarg;
                 break;
+            case 'o':
+                if (*format == LONG_FORMAT || *format == LSFUF_FORMAT ||
+                    *format == WIDE_FORMAT || fintimeformat != 0)
+                    usage(argv[0]);
+                *format = CUSTOM_FORMAT;
+                cusFormat = optarg;
+                break;
             case 'P':
                 if ((*projectName) || (*optarg == '\0'))
                     usage(argv[0]);
                 *projectName = optarg;
                 break;
             case 'W':
-                Wflag = true;
-                *format = WIDE_FORMAT;
+                if (*format == CUSTOM_FORMAT)
+                    usage(argv[0]);
+                if (optarg == NULL) {
+                    Wflag = true;
+                    *format = WIDE_FORMAT;
+                }
+                else {
+                    if (*format != 0)
+                        usage(argv[0]);
+                    switch (optarg[0]) {
+                    case 'L':
+                        fintimeformat = FORMAT_WL;
+                        break;
+                    case 'P':
+                        fintimeformat = FORMAT_WP;
+                        break;
+                    case 'F':
+                        fintimeformat = FORMAT_WF;
+                        break;
+                    default:
+                        usage(argv[0]);
+                        break;
+                    }
+                }
                 break;
             case 'V':
                 fputs(_LS_VERSION_, stderr);
                 exit(0);
+            case 'U':
+                if (optarg[0]=='F') {
+                    *format = LSFUF_FORMAT;
+                    break;
+                }
+		usage(argv[0]);
+            case 'n':
+                if (strcmp(optarg,"oheader")==0) {
+		    if ((*format == 0) || (*format == WIDE_FORMAT) ||
+                        (*format == CUSTOM_FORMAT)) {
+			/* short format or wide format */
+                        noheaderflag=true;
+		    }
+		    break;
+                }
+                usage(argv[0]);
+            case 'g':
+                if (*job_group)
+                    usage(argv[0]);
+                *job_group = optarg;
+                break;
             case 'h':
             default:
                 usage(argv[0]);
@@ -374,6 +449,498 @@ do_options(int argc,
 
 }
 
+enum {
+    F_ID, F_STAT, F_USER, F_UGROUP, F_QUEUE, F_NAME,
+    F_DESCRIPTION, F_PROJ, F_GROUP, F_DEPENDENCY,
+    F_CMD, F_PRE_CMD, F_PIDS, F_EXIT_CODE, F_FROM_HOST, F_FIRST_HOST,
+    F_EXEC_HOST, F_NEXEC_HOST, F_SUBMIT_TIME, F_START_TIME,
+    F_ESTART_TIME, F_SSTART_TIME, F_STERMINTE_TIME, F_TIME_LEFT,
+    F_FINISH_TIME, F_COMPLETE, F_CPU_USED, F_SLOTS,
+    F_RUN_TIME, F_IDLE_FACTOR, F_MEM, F_MEMLIMIT, F_SWAP, F_SWAPLIMIT,
+    F_MIN_REQ_PROC, F_MAX_REQ_PROC, F_FILELIMIT, F_CORELIMIT,
+    F_STACKLIMIT, F_PROCESSLIMIT, F_INPUT_FILE, F_OUTPUT_FILE,
+    F_ERROR_FILE, F_SUB_CWD, F_EXEC_HOME, F_EXEC_CWD, F_RESREQ,
+    F_LAST
+};
+
+char *fieldNames[F_LAST] =
+    {"jobid:id", "stat", "user", "user_group:ugroup", "queue", "job_name:name",
+    "job_description:description", "proj_name:proj.:project", "job_group:group", "dependency",
+    "command:cmd", "pre-exec_command:pre_cmd", "pids", "exit_code", "from_host", "first_host",
+    "exec_host", "nexec_host", "submit_time", "start_time",
+    "estimated_start_time:estart_time", "specified_start_time:sstart_time", "specified_terminate_time:sterminate_time", "time_left",
+    "finish_time", "%complete", "cpu_used", "slots",
+    "run_time", "idle_factor", "mem", "memlimit", "swap", "swaplimit",
+    "min_req_proc", "max_req_proc", "filelimit", "corelimit",
+    "stacklimit", "processlimit", "input_file", "output_file",
+    "error_file", "sub_cwd", "exec_home", "exec_cwd", "effective_resreq:eresreq:resreq"
+    };
+
+/* for future extension
+int recommWidths[F_LAST] =
+    { 7,  5,  7, 15, 10, 10,
+     17, 11, 10, 15,
+     15, 16, 20, 10, 11, 11,
+     11, 10, 15, 15,
+     20, 20, 24, 11,
+     16, 11, 10, 5,
+     15, 11, 10, 10, 10, 10,
+     12, 12, 10, 10,
+     10, 12, 10, 11,
+     10, 10, 10, 10, 17
+    };
+*/
+
+char *fieldFormats[F_LAST] =
+    {"d", "s", "s", "s", "s", "s",
+     "s", "s", "s", "s",
+     "s", "s", "s", "d", "s", "s",
+     "s", "s", ".15s", ".15s",
+     "-12.19s", "-12.19s", "-12.19s", "d",
+     "s", ".2f%%", ".1f", "d",
+     "d", ".3f", "d", "d", "d", "d",
+     "d", "d", "d", "d",
+     "d", "d", "s", "s",
+     "s", "s", "s", "s", "s"
+     };
+
+static char
+*strupr(char *str)
+{
+    static char *p = NULL;
+    int i;
+    p = realloc(p, strlen(str));
+    for (i = 0; str[i] != '\0'; i++)
+        p[i] = toupper(str[i]);
+    p[i] = '\0';
+    return p;
+}
+
+static void
+displayCustom(struct jobInfoEnt *job, struct jobInfoHead *jInfoH,
+            int options)
+{
+    struct submit *submitInfo;
+    static char first = true;
+    static char delimiter[2];
+    char *status, *p, *s, *savecusformat, *savefield, *jobName;
+    char parsestr[4096], pidstr[32];
+    static char pformat[F_LAST][10];
+    struct nameList *hostList=NULL;
+    static struct loadIndexLog *loadIndex = NULL;
+    static int nfields, fields[F_LAST];
+    int i, j, found;
+    time_t now, run_time;
+
+#define printempty    printf("-")
+#define ifnonempty(x) if((x!=NULL)&&(x[0]!='\0'))
+
+    if (!(hostList = lsb_compressStrList(job->exHosts, job->numExHosts)))
+        exit(99);
+
+    if (loadIndex == NULL)
+        loadIndex = initLoadIndex();
+
+    if (first) {
+        first = false;
+        delimiter[0] = ' ';
+        delimiter[1] = '\0';
+        nfields = 0;
+        if ((p = strstr(cusFormat, "delimiter='")) != NULL ||
+            (p = strstr(cusFormat, "delimiter=\"")) != NULL ) {
+            delimiter[0] = p[11];
+            if (p != cusFormat)
+                *(p-1) = '\0';
+            else
+                *p = '\0';
+        }
+        if ((p = strtok_r(cusFormat, " ", &savecusformat)) == NULL) {
+            printf("Invalid field specs %s\n", cusFormat);
+            exit(99);
+        }
+        do {
+            s = strchr(p, ':');
+            if (s != NULL)
+                *s = '\0';
+            found = -1;
+            for (i = 0; i < F_LAST; i++) {
+                strcpy(parsestr, fieldNames[i]);
+                s = strtok_r(parsestr, ":", &savefield);
+                do {
+                    if (strcasecmp(p, s) == 0) {
+                        found = i;
+                        break;
+                    }
+                } while ((s = strtok_r(NULL, ":", &savefield)) != NULL);
+                if (found > -1)
+                    break;
+             }
+             if (found == -1) {
+                 printf("Invalid field specs %s\n", p);
+                 exit(99);
+             }
+             fields[nfields] = found;
+             nfields++;
+        } while ((p = strtok_r(NULL, " ", &savecusformat)) != NULL);
+
+        if (noheaderflag == false) {
+            for (i = 0; i < nfields; i++) {
+                strcpy(parsestr, fieldNames[fields[i]]);
+                printf("%-s", strupr(strtok(parsestr,":")));
+                if (i != nfields-1)
+                    printf("%s", delimiter);
+            }
+            printf("\n");
+        }
+        for (i = 0; i < F_LAST; i++)
+            sprintf(pformat[i], "%%%s", fieldFormats[i]);
+    }
+
+    submitInfo = &job->submit;
+    status = get_status(job);
+    if (job->numExHosts > 1) {
+        hostList = lsb_compressStrList(job->exHosts, job->numExHosts);
+        if (!hostList) {
+             fprintf(stderr,
+                 "Parallel job execution hosts data corrupted or out of memory.\n");
+             exit(99);
+        }
+    }
+    now = time(NULL);
+    run_time = 0;
+    if (job->startTime > 0) {
+        if (job->endTime > 0)
+            run_time = job->endTime - job->startTime;
+        else
+            run_time = now - job->startTime;
+    }
+
+    for (i = 0; i < nfields; i++) {
+        switch (fields[i]) {
+        case F_ID:
+            printf(pformat[F_ID], LSB_ARRAY_JOBID(job->jobId));
+            break;
+        case F_STAT:
+            printf(pformat[F_STAT], status);
+            break;
+        case F_USER:
+            printf(pformat[F_USER], job->user);
+            break;
+        case F_UGROUP:
+            ifnonempty (submitInfo->userGroup)
+                printf(pformat[F_UGROUP], submitInfo->userGroup);
+            else
+                printempty;
+            break;
+        case F_QUEUE:
+            printf(pformat[F_QUEUE], submitInfo->queue);
+            break;
+        case F_NAME:
+            jobName = submitInfo->jobName;
+            if (LSB_ARRAY_IDX(job->jobId) && (p = strchr(jobName, '['))) {
+                *p = '\0';
+                sprintf(jobName, "%s[%d]", submitInfo->jobName,
+                    LSB_ARRAY_IDX(job->jobId));
+            }
+            printf(pformat[F_NAME], jobName);
+            break;
+        case F_DESCRIPTION:
+            ifnonempty (submitInfo->job_description)
+                printf(pformat[F_DESCRIPTION], submitInfo->job_description);
+            else
+                printempty;
+            break;
+        case F_PROJ:
+            printf(pformat[F_PROJ], submitInfo->projectName);
+            break;
+        case F_GROUP:
+            ifnonempty (submitInfo->job_group)
+                printf(pformat[F_GROUP], submitInfo->job_group);
+            else
+                printempty;
+            break;
+        case F_DEPENDENCY:
+            ifnonempty (submitInfo->dependCond)
+                printf(pformat[F_DEPENDENCY], submitInfo->dependCond);
+            else
+                printempty;
+            break;
+        case F_CMD:
+            printf(pformat[F_CMD], submitInfo->command);
+            break;
+        case F_PRE_CMD:
+            ifnonempty (submitInfo->preExecCmd)
+                printf(pformat[F_PRE_CMD], submitInfo->preExecCmd);
+            else
+                printempty;
+            break;
+        case F_PIDS:
+            parsestr[0]='\0';
+            for (j = 0; j < job->runRusage.npids; j++) {
+                sprintf(pidstr, "%d", job->runRusage.pidInfo[j].pid);
+                strcat(parsestr, pidstr);
+                if (j != job->runRusage.npids - 1)
+                    strcat(parsestr, " ");
+            }
+            printf(pformat[F_PIDS], parsestr);
+            break;
+        case F_EXIT_CODE:
+            switch (job->status) {
+                case JOB_STAT_DONE:
+                case (JOB_STAT_DONE | JOB_STAT_PDONE):
+                case (JOB_STAT_DONE | JOB_STAT_PERR):
+                case (JOB_STAT_EXIT | JOB_STAT_PDONE):
+                case (JOB_STAT_EXIT | JOB_STAT_PERR):
+                case JOB_STAT_EXIT:
+                    if (strcmp(status, "DONE") == 0)
+                         printf("0");
+                    else {
+                       if (job->exitStatus>>8 != 0)
+                            printf(pformat[F_EXIT_CODE],
+                                job->exitStatus>>8);
+                    }
+                default:
+                    break;
+            }
+            break;
+        case F_FROM_HOST:
+            printf(pformat[F_FROM_HOST], job->fromHost);
+            break;
+        case F_FIRST_HOST:
+            if (job->numExHosts > 0)
+                printf(pformat[F_FIRST_HOST], job->exHosts[0]);
+            else
+                printempty;
+            break;
+        case F_EXEC_HOST:
+            if (job->numExHosts == 1)
+                printf(pformat[F_EXEC_HOST], job->exHosts[0]);
+            else if (job->numExHosts > 1) {
+                parsestr[0]='\0';
+                for (j = 0; j < hostList->listSize; j++) {
+                    sprintf(pidstr, "%d*%s", hostList->counter[i],
+                        hostList->names[i]);
+                    if (j != hostList->listSize-1)
+                        strcat(pidstr, " ");
+                    strcat(parsestr, pidstr);
+                }
+                printf(pformat[F_EXEC_HOST], parsestr);
+            } else
+                printempty;
+            break;
+        case F_NEXEC_HOST:
+            if (job->numExHosts > 1)
+                printf(pformat[F_NEXEC_HOST], hostList->listSize);
+            else if (job->numExHosts == 1)
+                printf(pformat[F_NEXEC_HOST], job->numExHosts);
+            else
+                printempty;
+            break;
+        case F_SLOTS:
+            if (job->numExHosts > 0)
+                printf(pformat[F_SLOTS], job->numExHosts);
+            else
+                printempty;
+            break;
+        case F_SUBMIT_TIME:
+            printf(pformat[F_SUBMIT_TIME],
+                _i18n_ctime(ls_catd, CTIME_FORMAT_b_d_H_M, &job->submitTime));
+            break;
+        case F_START_TIME:
+            if (job->startTime > 0)
+                printf(pformat[F_START_TIME],
+                    _i18n_ctime(ls_catd, CTIME_FORMAT_b_d_H_M, &job->startTime));
+            else
+                printempty;
+            break;
+        case F_ESTART_TIME:
+            if (job->predictedStartTime > 0)
+                printf(pformat[F_ESTART_TIME],
+                    ctime(&job->predictedStartTime));
+            else
+                printempty;
+            break;
+        case F_SSTART_TIME:
+            if (submitInfo->beginTime > 0)
+                printf(pformat[F_SSTART_TIME],
+                    ctime(&submitInfo->beginTime));
+            else
+                printempty;
+            break;
+        case F_STERMINTE_TIME:
+            if (submitInfo->termTime > 0)
+                printf(pformat[F_STERMINTE_TIME],
+                    ctime(&submitInfo->termTime));
+            else
+                printempty;
+            break;
+        case F_TIME_LEFT:
+            if (submitInfo->rLimits[LSF_RLIMIT_RUN] >=0 && job->startTime > 0
+                && job->endTime <= 0) {
+                printf(pformat[F_TIME_LEFT],
+                    (int)(job->startTime + submitInfo->rLimits[LSF_RLIMIT_RUN]
+                    - now));
+            }
+            else
+               printempty;
+            break;
+        case F_FINISH_TIME:
+            if (IS_FINISH(job->status) && job->endTime > 0)
+                printf(pformat[F_FINISH_TIME],
+                     _i18n_ctime(ls_catd, CTIME_FORMAT_b_d_H_M, &job->endTime));
+            else {
+                if (submitInfo->rLimits[LSF_RLIMIT_RUN] >=0 &&
+                    job->startTime > 0) {
+                    now = job->startTime + submitInfo->rLimits[LSF_RLIMIT_RUN];
+                    printf(pformat[F_FINISH_TIME],
+                        _i18n_ctime(ls_catd, CTIME_FORMAT_b_d_H_M, &now));
+                }
+                else
+                    printempty;
+            }
+            break;
+        case F_COMPLETE:
+            if (submitInfo->rLimits[LSF_RLIMIT_RUN] >=0 &&
+                job->startTime > 0 && job->endTime <= 0) {
+                printf(pformat[F_COMPLETE], (float)(now - job->startTime) /
+                    (float)submitInfo->rLimits[LSF_RLIMIT_RUN] * 100.f);
+            }
+            else
+                printempty;
+            break;
+        case F_CPU_USED:
+            if (job->startTime > 0)
+                printf(pformat[F_CPU_USED], job->cpuTime);
+            else
+                printempty;
+            break;
+        case F_RUN_TIME:
+            if (job->startTime > 0)
+                printf(pformat[F_RUN_TIME], run_time);
+            else
+                printempty;
+            break;
+        case F_IDLE_FACTOR:
+            if (job->startTime > 0)
+                printf(pformat[F_IDLE_FACTOR],
+                    run_time > 0 ? job->cpuTime / (float)run_time : 0.f);
+            else
+                printempty;
+            break;
+        case F_MEM:
+            if (job->startTime > 0)
+                printf(pformat[F_MEM], job->runRusage.mem);
+            else
+                printempty;
+            break;
+        case F_MEMLIMIT:
+            if (submitInfo->rLimits[LSF_RLIMIT_DATA] >= 0)
+                printf(pformat[F_MEMLIMIT],
+                    submitInfo->rLimits[LSF_RLIMIT_DATA]);
+            else
+                printempty;
+            break;
+        case F_SWAP:
+            if (job->startTime > 0)
+                printf(pformat[F_SWAP], job->runRusage.swap);
+            else
+                printempty;
+            break;
+        case F_SWAPLIMIT:
+            if (submitInfo->rLimits[LSF_RLIMIT_SWAP] >= 0)
+                printf(pformat[F_MEMLIMIT],
+                    submitInfo->rLimits[LSF_RLIMIT_SWAP]);
+            else
+                printempty;
+            break;
+        case F_MIN_REQ_PROC:
+            printf(pformat[F_MIN_REQ_PROC], submitInfo->numProcessors);
+            break;
+        case F_MAX_REQ_PROC:
+            if (submitInfo->maxNumProcessors > 0)
+                printf(pformat[F_MAX_REQ_PROC], submitInfo->maxNumProcessors);
+            else
+                printempty;
+            break;
+        case F_FILELIMIT:
+            if (submitInfo->rLimits[LSF_RLIMIT_FSIZE] >= 0)
+                printf(pformat[F_FILELIMIT],
+                    submitInfo->rLimits[LSF_RLIMIT_FSIZE]);
+            else
+                printempty;
+            break;
+        case F_CORELIMIT:
+            if (submitInfo->rLimits[LSF_RLIMIT_CORE] >= 0)
+                printf(pformat[F_CORELIMIT],
+                    submitInfo->rLimits[LSF_RLIMIT_CORE]);
+            else
+                printempty;
+            break;
+        case F_STACKLIMIT:
+            if (submitInfo->rLimits[LSF_RLIMIT_STACK] >= 0)
+                printf(pformat[F_STACKLIMIT],
+                    submitInfo->rLimits[LSF_RLIMIT_STACK]);
+            else
+                printempty;
+            break;
+        case F_PROCESSLIMIT:
+            if (submitInfo->rLimits[LSF_RLIMIT_PROCESS] >= 0)
+                printf(pformat[F_PROCESSLIMIT],
+                    submitInfo->rLimits[LSF_RLIMIT_PROCESS]);
+            else
+                printempty;
+            break;
+        case F_INPUT_FILE:
+            ifnonempty (submitInfo->inFile)
+                printf(pformat[F_INPUT_FILE], submitInfo->inFile);
+            else
+                printempty;
+            break;
+        case F_OUTPUT_FILE:
+            ifnonempty (submitInfo->outFile)
+                printf(pformat[F_OUTPUT_FILE], submitInfo->outFile);
+            else
+                printempty;
+            break;
+        case F_ERROR_FILE:
+            ifnonempty (submitInfo->errFile)
+                printf(pformat[F_ERROR_FILE], submitInfo->errFile);
+            else
+                printempty;
+            break;
+        case F_SUB_CWD:
+            ifnonempty (job->cwd)
+                printf(pformat[F_SUB_CWD], job->cwd);
+            else
+                printempty;
+            break;
+        case F_EXEC_HOME:
+            ifnonempty (job->execHome)
+                printf(pformat[F_EXEC_HOME], job->execHome);
+            else
+                printempty;
+            break;
+        case F_EXEC_CWD:
+            ifnonempty (job->execCwd)
+                printf(pformat[F_EXEC_CWD], job->execCwd);
+            else
+                printempty;
+            break;
+        case F_RESREQ:
+            ifnonempty (submitInfo->resReq)
+                printf(pformat[F_RESREQ], submitInfo->resReq);
+            else
+                printempty;
+            break;
+        default:
+            break;
+        }
+        if (i != nfields - 1)
+            printf("%s", delimiter);
+    }
+    printf ("\n");
+    return;
+}
 
 static void
 displayJobs(struct jobInfoEnt *job, struct jobInfoHead *jInfoH,
@@ -382,7 +949,7 @@ displayJobs(struct jobInfoEnt *job, struct jobInfoHead *jInfoH,
     struct submit *submitInfo;
     static char first = true;
     char *status;
-    char subtime[64], donetime[64];
+    char subtime[64], donetime[64], esttime[64];
     static char  *exechostfmt;
     static struct loadIndexLog *loadIndex = NULL;
     char *exec_host = "";
@@ -390,6 +957,9 @@ displayJobs(struct jobInfoEnt *job, struct jobInfoHead *jInfoH,
     struct nameList  *hostList = NULL;
     char tmpBuf[MAXLINELEN];
     int i = 0;
+    time_t now;
+    int remain;
+    float completed;
 
     if (lsbParams[LSB_SHORT_HOSTLIST].paramValue && job->numExHosts > 1
         && strcmp(lsbParams[LSB_SHORT_HOSTLIST].paramValue, "1") == 0 ) {
@@ -427,20 +997,29 @@ displayJobs(struct jobInfoEnt *job, struct jobInfoHead *jInfoH,
             exec_host = job->exHosts[0];
     }
 
-    if (first) {
+    if (first && noheaderflag==false) {
         first = false;
         if (job->jType == JGRP_NODE_ARRAY)
             printf("JOBID    ARRAY_SPEC  OWNER   NJOBS PEND DONE  RUN EXIT SSUSP USUSP PSUSP\n");
-        else if (options == PEND_JOB) {
-            printf("JOBID   USER    STAT  QUEUE       FROM_HOST      JOB_NAME           SUBMIT_TIME\n");
-            exechostfmt = "  ";
-        } else {
+        else {
             printf("JOBID   USER    STAT  QUEUE      FROM_HOST   EXEC_HOST   JOB_NAME   SUBMIT_TIME");
 
             if (Wflag == true) {
                 printf("  PROJ_NAME CPU_USED MEM SWAP PIDS START_TIME FINISH_TIME");
             }
-
+            switch (fintimeformat) {
+            case FORMAT_WL:
+                printf("   TIME_LEFT");
+                break;
+            case FORMAT_WP:
+                printf("   %%COMPLETE");
+                break;
+            case FORMAT_WF:
+                printf("   FINISH_TIME");
+                break;
+            default:
+                break;
+            }
             printf("\n");
 
             exechostfmt = "%45s%-s\n";
@@ -473,20 +1052,53 @@ displayJobs(struct jobInfoEnt *job, struct jobInfoHead *jInfoH,
         *pos = '\0';
         sprintf(jobName, "%s[%d]", jobName, LSB_ARRAY_IDX(job->jobId));
     }
-    if (options == PEND_JOB) {
-
-        TRUNC_STR(jobName, 20);
-        printf("%-7d %-7.7s %-5.5s %-11.11s %-14.14s %-18.18s %s\n",
-               LSB_ARRAY_JOBID(job->jobId), job->user, status,
-               submitInfo->queue, job->fromHost,
-               jobName, subtime);
-    } else if (format != WIDE_FORMAT) {
+    if (format != WIDE_FORMAT) {
         TRUNC_STR(jobName, 10);
-        printf("%-7d %-7.7s %-5.5s %-10.10s %-11.11s %-11.11s %-10.10s %s\n",
+        printf("%-7d %-7.7s %-5.5s %-10.10s %-11.11s %-11.11s %-10.10s %-14.14s",
                LSB_ARRAY_JOBID(job->jobId), job->user, status,
                submitInfo->queue, job->fromHost,
                exec_host,
                jobName, subtime);
+        switch(fintimeformat) {
+        case FORMAT_WL:
+            if (submitInfo->rLimits[LSF_RLIMIT_RUN] >=0 && job->startTime > 0 &&
+                job->endTime <= 0) {
+                now = time(NULL);
+                remain = (int)(job->startTime + submitInfo->rLimits[LSF_RLIMIT_RUN]
+                    - now) / 60;
+                printf ("%d:%d L", remain/60, remain%60);
+            }
+            else
+                printf ("   -");
+            break;
+        case FORMAT_WP:
+            if (submitInfo->rLimits[LSF_RLIMIT_RUN] >=0 && job->startTime > 0 &&
+                job->endTime <= 0) {
+                now = time(NULL);
+                completed = (float)(now - job->startTime) /
+                    (float)submitInfo->rLimits[LSF_RLIMIT_RUN];
+                printf ("%.2f%% L",completed*100.f);
+            }
+            else
+                printf ("   -");
+            break;
+        case FORMAT_WF:
+            if (job->endTime > 0)
+                printf("%s",donetime);
+            else {
+                if (submitInfo->rLimits[LSF_RLIMIT_RUN] >=0 && job->startTime > 0) {
+                    now = job->startTime + submitInfo->rLimits[LSF_RLIMIT_RUN];
+                    strcpy(esttime, _i18n_ctime( ls_catd, CTIME_FORMAT_b_d_H_M, &(now)));
+                    printf("%s", esttime);
+                }
+                else
+                    printf ("   -");
+            }
+            break;
+        default:
+            break;
+        }
+        printf("\n");
     } else {
         if (IS_PEND(job->status)) {
             exec_host = "   -    ";

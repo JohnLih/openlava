@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2014-2015 David Bigagli
+ * Copyright (C) 2014-2016 David Bigagli
  * Copyright (C) 2007 Platform Computing Inc
  *
  * This program is free software; you can redistribute it and/or modify
@@ -23,7 +23,9 @@
 
 /* Include all Unix and openlava base definition.
  */
-#include "../lsf/lsf.h"
+#include <lsf.h>
+#include "../lsf/intlib/intlibout.h"
+
 
 #define _PATH_NULL      "/dev/null"
 
@@ -32,8 +34,10 @@
 #define  MAX_GROUPS          150
 #define  MAX_CHARLEN         20
 #define  MAX_LSB_NAME_LEN    60
-#define  MAX_CMD_DESC_LEN    256
+#define  MAX_CMD_DESC_LEN    4096
+#define  MAX_JOB_DESC_LEN    4096
 #define  MAX_USER_EQUIVALENT 128
+#define  MAX_RES_LIMITS      256
 #define  DEFAULT_MSG_DESC    "no description"
 
 #define HOST_STAT_OK         0x0
@@ -65,6 +69,13 @@
 
 #define LSB_HOST_UNAVAIL(status)     ((status & HOST_STAT_UNAVAIL) != 0)
 
+#define LSB_HOST_UNUSABLE(status)  ((status & (HOST_STAT_WIND |         \
+                                               HOST_STAT_DISABLED |     \
+                                               HOST_STAT_LOCKED |       \
+                                               HOST_STAT_LOCKED_MASTER | \
+                                               HOST_STAT_NO_LIM |       \
+                                               HOST_STAT_UNREACH |      \
+                                               HOST_STAT_UNAVAIL)) != 0)
 #define HOST_BUSY_NOT          0x000
 #define HOST_BUSY_R15S         0x001
 #define HOST_BUSY_R1M          0x002
@@ -101,6 +112,8 @@
 #define Q_ATTRIB_CHKPNT           0x8000
 #define Q_ATTRIB_RERUNNABLE       0x10000
 #define Q_ATTRIB_FAIRSHARE        0x80000
+#define Q_ATTRIB_OWNERSHIP        0x100000
+#define Q_ATTRIB_MEM_RESERVE      0x200000
 
 #define MASTER_NULL           200
 #define MASTER_RESIGN         201
@@ -154,8 +167,11 @@
 #define    EVENT_JOB_MODIFY2      28
 #define    EVENT_JOB_ATTR_SET     29
 #define    EVENT_STREAM_END       30
-#define    EVENT_UNUSED_31        31
-#define    EVENT_UNUSED_32        32
+#define    EVENT_NEW_JGRP         31
+#define    EVENT_DEL_JGRP         32
+#define    EVENT_MOD_JGRP         33
+#define    EVENT_JOB_PREEMPTING   34
+#define    EVENT_JOB_PREEMPTED    35
 
 /* Job specific reasons
  */
@@ -182,6 +198,7 @@
 #define PEND_JOB_ARRAY_JLIMIT  38
 #define PEND_CHKPNT_DIR        39
 #define PEND_JOB_PREEMPTED     40
+#define PEND_JGROUP_LIMIT      41
 
 /* Queue and sys reasons
  */
@@ -198,6 +215,7 @@
 #define PEND_QUE_PJOB_LIMIT        314
 #define PEND_QUE_WINDOW_WILL_CLOSE 315
 #define PEND_QUE_PROCLIMIT         316
+#define PEND_RES_LIMIT             317
 
 /* User reasons
  */
@@ -283,6 +301,7 @@
 #define SUSP_QUEUE_WINDOW     0x00000008
 #define SUSP_HOST_LOCK        0x00000020
 #define SUSP_LOAD_REASON      0x00000040
+#define SUSP_MBD_PREEMPT      0x00000080
 #define SUSP_QUE_STOP_COND    0x00000200
 #define SUSP_QUE_RESUME_COND  0x00000400
 #define SUSP_PG_IT            0x00000800
@@ -318,12 +337,19 @@
 
 #define LSB_MODE_BATCH    0x1
 
-#define    LSBE_NO_ERROR      00
-#define    LSBE_NO_JOB        01
-#define    LSBE_NOT_STARTED   02
-#define    LSBE_JOB_STARTED   03
-#define    LSBE_JOB_FINISH    04
-#define    LSBE_STOP_JOB      05
+/*
+ * Error codes for lsblib calls
+ * Each error code has its corresponding error message defined in lsb.err.c
+ * The code number is just the position number of its message.
+ * Adding a new code here must add its message there in the corresponding
+ * position.  Changing any code number here must change the position there.
+ */
+#define    LSBE_NO_ERROR      0
+#define    LSBE_NO_JOB        1
+#define    LSBE_NOT_STARTED   2
+#define    LSBE_JOB_STARTED   3
+#define    LSBE_JOB_FINISH    4
+#define    LSBE_STOP_JOB      5
 #define    LSBE_DEPEND_SYNTAX  6
 #define    LSBE_EXCLUSIVE      7
 #define    LSBE_ROOT           8
@@ -450,7 +476,12 @@
 #define    LSBE_MOD_ERRFILE         129
 #define    LSBE_LOCKED_MASTER       130
 #define    LSBE_DEP_ARRAY_SIZE      131
-#define    LSBE_NUM_ERR             131
+#define    LSBE_JGRP_EXIST          132  /* the job group exists */
+#define    LSBE_NODEP_COND          133
+#define    LSBE_JGRP_NOTEMPTY       134  /* jgrp is not empty */
+#define    LSBE_JGRP_LIMIT          135  /* jgrp limit violated */
+#define    LSBE_NUM_ERR             136
+
 
 #define  SUB_JOB_NAME       0x01
 #define  SUB_QUEUE          0x02
@@ -496,12 +527,21 @@
 #define  SUB2_USE_DEF_PROCLIMIT  0x400
 #define  SUB2_MODIFY_RUN_JOB 0x800
 #define  SUB2_MODIFY_PEND_JOB 0x1000
+#define  SUB2_JOB_GROUP       0x2000
+#define  SUB2_JOB_DESC      0x4000
 
 #define  LOST_AND_FOUND  "lost_and_found"
 
 #define  DELETE_NUMBER     -2
 #define  DEL_NUMPRO        INFINIT_INT
 #define  DEFAULT_NUMPRO    INFINIT_INT -1
+
+/* Sometime the calls SBD so here we define
+ * the protocol codes for those calls
+ */
+typedef enum {
+    SBD_BLAUNCH_RUSAGE = 500
+} sbd_lib_opcode_t;
 
 struct xFile {
     char subFn[MAXFILENAMELEN];
@@ -547,6 +587,9 @@ struct submit {
     char   *loginShell;
     int    userPriority;
     char *userGroup;
+    char *job_group; /* job group the job is attached to */
+    char *job_description;
+    char *cwd;
 };
 
 struct submitReply {
@@ -604,18 +647,31 @@ struct submig {
 #define LSB_ARRAY_JOBID(jobId)                                          \
     (((jobId) == -1) ? (-1) : (int)(jobId & LSB_MAX_ARRAY_JOBID))
 
-
+/* State of a job group
+ */
 #define JGRP_ACTIVE        1
 #define JGRP_UNDEFINED     -1
-#define JGRP_COUNT_NJOBS   0
-#define JGRP_COUNT_PEND    1
-#define JGRP_COUNT_NPSUSP  2
-#define JGRP_COUNT_NRUN    3
-#define JGRP_COUNT_NSSUSP  4
-#define JGRP_COUNT_NUSUSP  5
-#define JGRP_COUNT_NEXIT   6
-#define JGRP_COUNT_NDONE   7
-#define NUM_JGRP_COUNTERS 8
+
+/* Job group counters
+ */
+typedef enum {
+    JGRP_COUNT_NJOBS,
+    JGRP_COUNT_PEND,
+    JGRP_COUNT_NPSUSP,
+    JGRP_COUNT_NRUN,
+    JGRP_COUNT_NSSUSP,
+    JGRP_COUNT_NUSUSP,
+    JGRP_COUNT_NEXIT,
+    JGRP_COUNT_NDONE,
+    NUM_JGRP_COUNTERS
+} jgrp_count_;
+
+struct jobGroupInfo {
+    char *name;
+    char *path;
+    int counts[NUM_JGRP_COUNTERS + 1];
+    int max_jobs;
+};
 
 struct jobAttrInfoEnt {
     LS_LONG_INT jobId;
@@ -678,6 +734,7 @@ struct jobInfoEnt {
     u_short port;
     int     jobPriority;
     char *userGroup;
+    char *job_group; /* job group the job is attached too */
 };
 
 struct userInfoEnt {
@@ -755,9 +812,13 @@ struct queueInfoEnt {
     int    defProcLimit;
     char   *fairshare;
     int    numAccts;
-    uint32_t numFairSlots;
-    struct share_acct **saccts;
+    uint32_t numFairSlots;      /* number of share accounts */
+    struct share_acct **saccts; /* array of share accts */
     char *preemption;
+    char *ownership;          /* queue slots ownership */
+    int  loan_duration;   /* loan resources duration */
+    int  num_owned_slots; /* number of owned slots */
+    char   *hostshare;
 };
 
 #define ACT_NO              0
@@ -789,13 +850,24 @@ struct hostInfoEnt {
     float *realLoad;
     int   numRESERVE;
     int   chkSig;
+    char  *hCtrlMsg;
+    int   affinity;
 };
 
 #define DEF_MAX_JOBID   999999
 #define MAX_JOBID_LOW   999999
 #define MAX_JOBID_HIGH 9999999
-#define DEF_MAX_PREEMPT_JOBS 12
 
+/* Maximum number of jobs to preempt per cycle
+ */
+#define DEF_MAX_PREEMPT_JOBS 12
+/* Slot decay factor. The accumulated lost usage
+ * is decayed every HIST_MINS by this number.
+ */
+#define DEF_SLOT_DECAY_FACTOR 10
+
+/* mbd control parameter
+ */
 struct parameterInfo {
     char *defaultQueues;
     char *defaultHostSpec;
@@ -825,7 +897,6 @@ struct parameterInfo {
     int jobPriorityValue;
     int jobPriorityTime;
     int sharedResourceUpdFactor;
-    int scheRawLoad;
     int preExecDelay;
     int slotResourceReserve;
     int maxJobId;
@@ -834,6 +905,14 @@ struct parameterInfo {
     int acctArchiveInSize;
     int maxPreemptJobs;
     int maxStreamRecords;
+    int max_num_candidates;
+    int enable_proxy_hosts;
+    int disable_peer_jobs;
+    int hist_mins;
+    int run_abs_limit; /* if specificied -W is not scaled */
+    char *preemptableResources; /* resource based queue preemption */
+    bool_t preempt_slot_suspend;
+    int slot_decay_factor;
 };
 
 
@@ -843,16 +922,37 @@ struct loadInfoEnt {
     float  *load;
 };
 
+/* Information about job dependencies
+ */
+struct job_dep {
+    char *dependency;     /* done(), exit(), ended() */
+    char *jobid;          /* 1234 */
+    int jstatus;          /* PEND RUN */
+    int depstatus;        /* dependency status */
+};
+
+/* structure for lsb_addjgrp()/lsb_deljgrp()/lsb_modjgrp() call
+ */
+struct job_group {
+    char *group_name;
+    int max_jobs;
+};
+
 #define USER_GRP          0x1
 #define HOST_GRP          0x2
 #define GRP_RECURSIVE     0x8
 #define GRP_ALL           0x10
 #define GRP_SHARES        0x40
 
+/* Anytime this structure is changed group_acct in
+ * sshare.h must change as well.
+ */
 struct groupInfoEnt {
     char *group;
     char *memberList;
     char *user_shares;
+    char *group_slots;
+    int max_slots;
 };
 
 struct runJobRequest {
@@ -944,6 +1044,10 @@ struct jobNewLog {
     int    idx;
     int    userPriority;
     char *userGroup;
+    int abs_run_limit;
+    char *job_group;
+    char *job_description;
+    int64_t priority;
 };
 
 struct jobModLog {
@@ -1001,6 +1105,7 @@ struct jobModLog {
     char    *loginShell;
     char    *schedHostType;
     int     userPriority;
+    char    *job_description;
 };
 
 
@@ -1020,10 +1125,11 @@ struct jobStartLog {
 };
 
 struct jobStartAcceptLog {
-    int    jobId;
-    int    jobPid;
-    int    jobPGid;
-    int    idx;
+    int jobId;
+    int jobPid;
+    int jobPGid;
+    int idx;
+    int jflags;
 };
 
 
@@ -1155,6 +1261,7 @@ struct hostCtrlLog {
     char   host[MAXHOSTNAMELEN];
     int    userId;
     char   userName[MAX_LSB_NAME_LEN];
+    char   message[MAXLINELEN];
 };
 
 struct mbdStartLog {
@@ -1260,6 +1367,44 @@ struct endStream {
     int numRecords;
 };
 
+/* job group data structure
+ */
+struct jgrpLog {
+    char name[MAXLSFNAMELEN];
+    char path[PATH_MAX];
+    int uid;
+    char user[MAXLSFNAMELEN];
+    int status;
+    time_t submit_time;
+    int max_jobs;
+};
+
+/* Modify the max_job limit in a job group
+ */
+struct jgrpModLog {
+    char path[PATH_MAX];
+    int max_jobs;
+};
+
+/* Log the hosts a job is going to preempt
+ */
+struct jobPreemptingLog {
+    int jobid;
+    int idx;
+    int numHosts;
+    char **hosts;
+};
+
+/* Log the jobid and index of a job
+ * that preempted jobid
+ */
+struct jobPreemptedLog {
+    int jobid;
+    int idx;
+    int preempted_by;
+    int preempted_by_idx;
+};
+
 union  eventLog {
     struct jobNewLog jobNewLog;
     struct jobStartLog jobStartLog;
@@ -1290,6 +1435,10 @@ union  eventLog {
     struct jobModLog jobModLog;
     struct jobAttrSetLog jobAttrSetLog;
     struct endStream eos;
+    struct jgrpLog jgrpLog;
+    struct jgrpModLog jgrpMod;
+    struct jobPreemptingLog jobPreempting;
+    struct jobPreemptedLog jobPreempted;
 };
 
 
@@ -1395,6 +1544,50 @@ struct queueConf {
     struct queueInfoEnt *queues;
 };
 
+typedef enum limitConsumerType {
+    LIMIT_CONSUMER_QUEUES = 0,
+    LIMIT_CONSUMER_PER_QUEUE = 1,
+    LIMIT_CONSUMER_PROJECTS = 2,
+    LIMIT_CONSUMER_PER_PROJECT = 3,
+    LIMIT_CONSUMER_HOSTS = 4,
+    LIMIT_CONSUMER_PER_HOST = 5,
+    LIMIT_CONSUMER_USERS = 6,
+    LIMIT_CONSUMER_PER_USER = 7,
+    LIMIT_CONSUMER_TYPE_NUM = 8    /* how many consumer types */
+} limitConsumerType_t;
+
+struct limitConsumer {
+    limitConsumerType_t consumer;
+    char* def;
+    char* value;
+};
+
+typedef enum limitResType {
+    LIMIT_RESOURCE_SLOTS = 0,
+    LIMIT_RESOURCE_JOBS = 1,
+    LIMIT_RESOURCE_TYPE_NUM = 2  /* how many resource types */
+} limitResType_t;
+
+struct limitRes {
+    limitResType_t res;
+    float value;
+    char  *windows;
+    windows_t *week[8];
+    time_t    windEdge;
+};
+
+struct resLimit {
+    char*   name;
+    int     nConsumer;
+    struct limitConsumer *consumers;
+    int     nRes;
+    struct limitRes *res;
+};
+
+struct resLimitConf {
+    int       nLimit;
+    struct resLimit* limits;
+};
 
 #define  IS_PEND(s)  (((s) & JOB_STAT_PEND) || ((s) & JOB_STAT_PSUSP))
 
@@ -1440,6 +1633,8 @@ extern struct hostConf *lsb_readhost(struct lsConf *, struct lsInfo *, int,
                                      struct clusterConf *);
 extern struct queueConf *lsb_readqueue(struct lsConf *, struct lsInfo *,
                                        int, struct sharedConf *);
+extern struct resLimitConf *lsb_readres(struct lsConf *);
+
 extern void updateClusterConf(struct clusterConf *);
 
 
@@ -1454,7 +1649,7 @@ extern LS_LONG_INT lsb_submit(struct submit  *, struct submitReply *);
 
 extern void lsb_closejobinfo(void);
 
-extern int  lsb_hostcontrol(char *, int);
+extern int  lsb_hostcontrol(char *, int, char *);
 extern struct queueInfoEnt *lsb_queueinfo(char **,
                                           int *,
                                           char *,
@@ -1469,7 +1664,7 @@ extern int  lsb_deletejob(LS_LONG_INT, int, int);
 extern int  lsb_forcekilljob(LS_LONG_INT);
 extern int  lsb_requeuejob(struct jobrequeue *);
 extern char *lsb_sysmsg(void);
-extern void lsb_perror(char *);
+extern void lsb_perror(const char *);
 extern char *lsb_sperror(char *);
 extern char *lsb_peekjob(LS_LONG_INT);
 
@@ -1491,6 +1686,7 @@ extern char *lsb_pendreason(int, int *, struct jobInfoHead *,
                             struct loadIndexLog *);
 extern int lsb_puteventrec(FILE *, struct eventRec *);
 extern struct eventRec *lsb_geteventrec(FILE *, int *);
+extern struct eventRec *lsb_geteventrecord(FILE *, int *);
 extern int getJobIdIndexFromEventFile(char *, struct sortIntList *, time_t *);
 extern int getJobIdFromEvent(char *, int);
 extern int writeJobIdIndexToIndexFile(FILE *, struct sortIntList *, time_t);
@@ -1528,5 +1724,16 @@ int getMinSortIntList(struct sortIntList *, int *);
 int getMaxSortIntList(struct sortIntList *, int *);
 int getTotalSortIntList(struct sortIntList *);
 int updateJobIdIndexFile (char *, char *, int);
+extern struct job_dep *lsb_jobdep(LS_LONG_INT, int *);
+extern void free_jobdep(int, struct job_dep *);
+extern int lsb_addjgrp(struct job_group *);
+extern int lsb_deljgrp(struct job_group *);
+extern int lsb_modjgrp(struct job_group *);
+extern struct jobGroupInfo *lsb_getjgrp(int *);
+extern void free_jobgroupinfo(int, struct jobGroupInfo *);
+extern struct resLimitReply *lsb_getlimits();
+extern void free_resLimits(struct resLimitReply *);
+extern void freeWeek (windows_t **);
+extern int lsb_launch(char **, char **, int, char **);
 
 #endif

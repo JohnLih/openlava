@@ -38,8 +38,12 @@ if SOLARIS
 mbatchd_LDADD += -lsocket -lnsl
 sbatchd_LDADD += -lsocket -lnsl
 endif
+if HWLOC
+sbatchd_LDADD += -lhwloc -lnuma
+sbatchd_SOURCES += sbd.numa.c
+endif
 
-lib_LTLIBRARIES = libfairshare.la libpreempt.la
+lib_LTLIBRARIES = libfairshare.la libpreempt.la 
 libfairshare_la_SOURCES = libfairshare.c fairshare.h 
 libfairshare_la_LDFLAGS = -no-undefined -version-info 0:1
 libfairshare_la_LIBADD = $(top_builddir)/lsf/intlib/libtools.la \
@@ -49,4 +53,3 @@ libpreempt_la_SOURCES = libpreempt.c preempt.h
 libpreempt_la_LDFLAGS = -no-undefined -version-info 0:1
 libpreempt_la_LIBADD =  $(top_builddir)/lsf/intlib/libtools.la \
 	$(top_builddir)/lsf/lib/liblsf.la $(top_builddir)/lsbatch/lib/liblsbatch.la
-

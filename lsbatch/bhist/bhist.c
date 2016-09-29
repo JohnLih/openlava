@@ -43,7 +43,7 @@ static void printEvent(struct bhistReq *, struct jobRecord *, struct jobInfoEnt 
 static void printChronicleEventLog(struct eventRec *, struct bhistReq *);
 static char * lowFirstChar(char *);
 
-static void prtModifiedJob(struct jobModLog *, struct bhistReq *, char *);
+static void prtModifiedJob(struct jobModLog *, struct bhistReq *, char *, char *);
 static int initJobIdIndexS( struct jobIdIndexS *indexS, char *fileName );
 
 static int hspecf=0;
@@ -1379,7 +1379,7 @@ initLoadIndexNames(void)
 
 
 void prtModifiedJob(struct jobModLog *jobModLog, struct bhistReq *bhistReq,
-		    char *timestamp)
+		    char *timestamp, char *tBuff)
 {
     char prline[MSGSIZE];
     int  i;
@@ -1390,9 +1390,13 @@ void prtModifiedJob(struct jobModLog *jobModLog, struct bhistReq *bhistReq,
         prtLine(i18nstr);                       \
     }
 
-    sprintf(prline,
-	    I18N(3357, "%-12.19s: Parameters of Job are changed:") /* catgets 3357 */,
-	    timestamp);
+    if (strlen(tBuff) > 0) {
+        sprintf(prline, "\
+%-12.19s:%s, parameters of the job are changed:", timestamp, tBuff);
+    } else {
+        sprintf(prline, "\
+%-12.19s%s: Parameters of the job are changed:", timestamp, tBuff);
+    }
     prtLine(prline);
 
 
@@ -1621,6 +1625,10 @@ void prtModifiedJob(struct jobModLog *jobModLog, struct bhistReq *bhistReq,
         PRT_FMTSTR(prline);
     }
 
+    if (jobModLog->options2 & SUB2_JOB_DESC) {
+        sprintf(prline, "Job description changes to: %s", jobModLog->job_description);
+        PRT_FMTSTR(prline);
+    }
 
 
     if (jobModLog->delOptions & SUB_QUEUE) {
@@ -1790,6 +1798,11 @@ void prtModifiedJob(struct jobModLog *jobModLog, struct bhistReq *bhistReq,
         sprintf(prline, I18N(3175, "Job priority changes to default")); /* catgets 3175 */
         PRT_FMTSTR(prline);
     }
+
+    if (jobModLog->delOptions2 & SUB2_JOB_DESC) {
+        sprintf(prline, "Job description is removed");
+        PRT_FMTSTR(prline);
+    }
 }
 
 
@@ -1838,8 +1851,8 @@ prtParameters(struct jobInfoEnt *params, struct bhistReq *bhistReq, char *timest
     }
 
     if (params->submit.userGroup && params->submit.userGroup[0] != '\0') {
-      sprintf(prline, " User Group <%s>, ", params->submit.userGroup);
-      prtLine(prline);
+        sprintf(prline, " User Group <%s>, ", params->submit.userGroup);
+        prtLine(prline);
     }
 
     if (params->submit.options & SUB_MAIL_USER) {
@@ -2114,7 +2127,7 @@ printEvent(struct bhistReq *bhistReq, struct jobRecord *jobRecord,
                         (_i18n_msg_get(ls_catd,NL_SETN,3252, "Starting")), /* catgets  3252  */
                         event->jobPid);
             else
-                sprintf(prline,"%-12.19s:%s %s (Pid %d)",
+                sprintf(prline,"%-12.19s: %s %s (Pid %d)",
                         timeStampStr,
                         tBuff,
                         (_i18n_msg_get(ls_catd,NL_SETN,3253, "starting")), /* catgets  3253  */
@@ -2386,8 +2399,7 @@ printEvent(struct bhistReq *bhistReq, struct jobRecord *jobRecord,
             break;
 
         case EVENT_JOB_MODIFY2: {
-            prtModifiedJob(&(event->eventRecUnion.jobModLog), bhistReq, timeStampStr);
-
+            prtModifiedJob(&(event->eventRecUnion.jobModLog), bhistReq, timeStampStr, tBuff);
         }
             break;
 
@@ -2521,12 +2533,12 @@ printChronicleEventLog(struct eventRec *log, struct bhistReq *req)
                      lsb_jobid2str(jobId));
 
             if (log->type == EVENT_PRE_EXEC_START)
-                sprintf(prline, "%-12.19s:%s, %s",
+                sprintf(prline, "%-12.19s: %s, %s",
                         timeStampStr,
                         tBuff,
                         (_i18n_msg_get(ls_catd,NL_SETN,3298, "the pre-exec command is started on"))); /* catgets  3298  */
             else
-                sprintf(prline, "%-12.19s:%s, %s",
+                sprintf(prline, "%-12.19s: %s, %s",
                         timeStampStr,
                         tBuff,
                         (_i18n_msg_get(ls_catd,NL_SETN,3299, "the batch job command is started on"))); /* catgets  3299  */
@@ -2752,6 +2764,12 @@ printChronicleEventLog(struct eventRec *log, struct bhistReq *req)
             freeJobInfoEnt(job);
             break;
 
+        case EVENT_JOB_MODIFY2:
+            sprintf (tBuff, " %s <%s>", I18N_Job, log->eventLog.jobModLog.jobIdStr);
+            prtModifiedJob(&(log->eventLog.jobModLog), req, timeStampStr, tBuff);
+            prtLine(";\n");
+            break;
+
         case EVENT_JOB_SIGNAL:
             jobId = LSB_JOBID(log->eventLog.signalLog.jobId,
                               log->eventLog.signalLog.idx);
@@ -2899,7 +2917,7 @@ printChronicleEventLog(struct eventRec *log, struct bhistReq *req)
                      I18N_Job,
                      lsb_jobid2str(jobId));
             sprintf(prline,
-                    (_i18n_msg_get(ls_catd,NL_SETN,3347, "%-12.19s:%s, starting (Pid %d)")), /* catgets  3347  */
+                    (_i18n_msg_get(ls_catd,NL_SETN,3347, "%-12.19s: %s starting (Pid %d)")), /* catgets  3347  */
                     timeStampStr,
                     tBuff,
                     log->eventLog.jobStartAcceptLog.jobPid);
@@ -2913,7 +2931,7 @@ printChronicleEventLog(struct eventRec *log, struct bhistReq *req)
             sprintf (tBuff, "%s <%s>",
                      I18N_Job,
                      lsb_jobid2str(jobId));
-            sprintf(prline, "%-12.19s:%s %s",
+            sprintf(prline, "%-12.19s: %s %s",
                     timeStampStr,
                     tBuff,
                     I18N(3349, "has been cleaned") /* catgets 3349 */ );

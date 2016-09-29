@@ -1,4 +1,5 @@
-/* $Id: lim.cluster.c 397 2007-11-26 19:04:00Z mblack $
+/*
+ * Copyright (C) 2011 - 2015 David Bigagli
  * Copyright (C) 2007 Platform Computing Inc
  *
  * This program is free software; you can redistribute it and/or modify
@@ -31,13 +32,13 @@ struct clientNode  *clientMap[MAXCLIENTS];
 
 extern int chanIndex;
 
-static void processMsg(int);
+static void lim_process_msg(int);
 static void clientReq(XDR *, struct LSFHeader *, int );
 
 static void shutDownChan(int);
 
 void
-clientIO(struct Masks *chanmasks)
+lim_client_io(struct Masks *chanmasks)
 {
     int  i;
 
@@ -58,7 +59,7 @@ clientIO(struct Masks *chanmasks)
         }
 
         if (FD_ISSET(i, &chanmasks->rmask)) {
-            processMsg(i);
+            lim_process_msg(i);
         }
     }
 }
@@ -66,19 +67,19 @@ clientIO(struct Masks *chanmasks)
 /* processMsg()
  */
 static void
-processMsg(int chanfd)
+lim_process_msg(int chanfd)
 {
     struct Buffer *buf;
     struct LSFHeader hdr;
     XDR xdrs;
-    struct sockaddr_in from;
 
     if (clientMap[chanfd] && clientMap[chanfd]->inprogress)
         return;
 
     if (chanDequeue_(chanfd, &buf) < 0) {
         ls_syslog(LOG_ERR, "\
-%s: failed to dequeue from channel %d %M", __func__, chanfd);
+%s: failed to dequeue from channel %d from %s %M",
+		  __func__, chanfd, sockAdd2Str_(&clientMap[chanfd]->from));
         shutDownChan(chanfd);
         return;
     }
@@ -91,7 +92,7 @@ processMsg(int chanfd)
     if (!xdr_LSFHeader(&xdrs, &hdr)) {
         ls_syslog(LOG_ERR, "\
 %s: Bad header received chanfd %d from %s",
-                  __func__, chanfd, sockAdd2Str_(&from));
+                  __func__, chanfd, sockAdd2Str_(&clientMap[chanfd]->from));
         xdr_destroy(&xdrs);
         shutDownChan(chanfd);
         chanFreeBuf_(buf);
@@ -102,7 +103,7 @@ processMsg(int chanfd)
         || (!clientMap[chanfd] && hdr.opCode < FIRST_INTER_CLUS)) {
         ls_syslog(LOG_ERR, "\
 %s: Invalid opCode %d from client %s",
-                  __func__, hdr.opCode, sockAdd2Str_(&from));
+                  __func__, hdr.opCode, sockAdd2Str_(&clientMap[chanfd]->from));
         xdr_destroy(&xdrs);
         shutDownChan(chanfd);
         chanFreeBuf_(buf);
@@ -112,7 +113,7 @@ processMsg(int chanfd)
     if (hdr.opCode >= FIRST_INTER_CLUS && !masterMe) {
         ls_syslog(LOG_ERR, "\
 %s: Intercluster request received from %s, but I'm not master",
-                  __func__, sockAdd2Str_(&from));
+                  __func__, sockAdd2Str_(&clientMap[chanfd]->from));
         xdr_destroy(&xdrs);
         shutDownChan(chanfd);
         chanFreeBuf_(buf);
@@ -123,6 +124,7 @@ processMsg(int chanfd)
 
         if (hdr.opCode != LIM_CLUST_INFO) {
             socklen_t L = sizeof(struct sockaddr_in);
+	    struct sockaddr_in from;
 
             if (getpeername(chanSock_(chanfd),
                             (struct sockaddr *)&from,
@@ -142,12 +144,27 @@ processMsg(int chanfd)
         }
     }
 
+    /* Don't go ahead unless the operation is LIM_ADD_HOST
+     * since the fromhost pointer is NULL.
+     */
+    if (hdr.opCode != LIM_ADD_HOST
+	&& clientMap[chanfd]->fromHost == NULL) {
+	ls_syslog(LOG_ERR, "\
+%s: receive message %d not LIM_ADD_HOST from unknown host %s",
+		  __func__, hdr.opCode,
+		  sockAdd2Str_(&clientMap[chanfd]->from));
+	xdr_destroy(&xdrs);
+	shutDownChan(chanfd);
+	chanFreeBuf_(buf);
+	return;
+    }
+
     ls_syslog(LOG_DEBUG, "\
 %s: Received request %d from %s chan %d len %d",
-              __func__, hdr.opCode, sockAdd2Str_(&from),
+              __func__, hdr.opCode, sockAdd2Str_(&clientMap[chanfd]->from),
               chanfd, buf->len);
 
-    switch(hdr.opCode) {
+    switch (hdr.opCode) {
 
         case LIM_LOAD_REQ:
         case LIM_GET_HOSTINFO:
@@ -170,13 +187,13 @@ processMsg(int chanfd)
             chanFreeBuf_(buf);
             break;
         case LIM_ADD_HOST:
-            addMigrantHost(&xdrs, &clientMap[chanfd]->from, &hdr, chanfd);
+            lim_add_migrant_host(&xdrs, &clientMap[chanfd]->from, &hdr, chanfd);
             xdr_destroy(&xdrs);
             shutDownChan(chanfd);
             chanFreeBuf_(buf);
             break;
         case LIM_RM_HOST:
-            rmMigrantHost(&xdrs, &clientMap[chanfd]->from, &hdr, chanfd);
+            lim_rm_migrant_host(&xdrs, &clientMap[chanfd]->from, &hdr, chanfd);
             xdr_destroy(&xdrs);
             shutDownChan(chanfd);
             chanFreeBuf_(buf);
@@ -184,7 +201,7 @@ processMsg(int chanfd)
         default:
             ls_syslog(LOG_ERR, "\
 %s: Invalid opCode %d from %s", __func__, hdr.opCode,
-                      sockAdd2Str_(&from));
+                      sockAdd2Str_(&clientMap[chanfd]->from));
             xdr_destroy(&xdrs);
             chanFreeBuf_(buf);
             break;

@@ -1,5 +1,5 @@
 #
-# Copyright (C) 2011-2015 David Bigagli
+# Copyright (C) 2011-2016 David Bigagli
 #
 
 include $(top_srcdir)/common.mk
@@ -9,7 +9,8 @@ AM_CPPFLAGS += -I$(top_srcdir)/lsf  -I$(top_srcdir)/lsf/lib \
 
 bin_PROGRAMS = badmin bkill bparams brestart btop bbot bmgroup \
 bpeek brun busers bhosts bmig bqueues bsub bjobs bmod \
-brequeue bswitch bpost bread
+brequeue bswitch bpost bread bjdep bgadd bgdel bjgroup bgmod bresources \
+blaunch
 
 badmin_SOURCES = badmin.c cmd.bqc.c cmd.hist.c \
 	cmd.bhc.c cmd.misc.c cmd.job.c cmd.prt.c \
@@ -252,8 +253,73 @@ if SOLARIS
 bread_LDADD += -lsocket -lnsl
 endif
 
+bjdep_SOURCES = bjdep.c cmd.jobid.c cmd.err.c cmd.h
+bjdep_LDADD = \
+        ../lib/.libs/liblsbatch.a \
+        ../../lsf/lib/.libs/liblsf.a \
+        ../../lsf/intlib/.libs/liblsfint.a -lm -lnsl
+if SOLARIS
+bjdep_LDADD += -lsocket -lnsl
+endif
+
+bgadd_SOURCES = bgadd.c cmd.jobid.c cmd.err.c cmd.h
+bgadd_LDADD = \
+        ../lib/.libs/liblsbatch.a \
+        ../../lsf/lib/.libs/liblsf.a \
+        ../../lsf/intlib/.libs/liblsfint.a -lm -lnsl
+if SOLARIS
+bgadd_LDADD += -lsocket -lnsl
+endif
+
+bgdel_SOURCES = bgdel.c cmd.jobid.c cmd.err.c cmd.h
+bgdel_LDADD = \
+        ../lib/.libs/liblsbatch.a \
+        ../../lsf/lib/.libs/liblsf.a \
+        ../../lsf/intlib/.libs/liblsfint.a -lm -lnsl
+if SOLARIS
+bgdel_LDADD += -lsocket -lnsl
+endif
+
+bjgroup_SOURCES = bjgroup.c cmd.jobid.c cmd.err.c cmd.h
+bjgroup_LDADD = \
+        ../lib/.libs/liblsbatch.a \
+        ../../lsf/lib/.libs/liblsf.a \
+        ../../lsf/intlib/.libs/liblsfint.a -lm -lnsl
+if SOLARIS
+bjgroup_LDADD += -lsocket -lnsl
+endif
+
+bgmod_SOURCES = bgmod.c cmd.jobid.c cmd.err.c cmd.h
+bgmod_LDADD = \
+        ../lib/.libs/liblsbatch.a \
+        ../../lsf/lib/.libs/liblsf.a \
+        ../../lsf/intlib/.libs/liblsfint.a -lm -lnsl
+if SOLARIS
+bgmod_LDADD += -lsocket -lnsl
+endif
+
+bresources_SOURCES = bresources.c cmd.jobid.c cmd.err.c cmd.h
+bresources_LDADD = \
+        ../lib/.libs/liblsbatch.a \
+        ../../lsf/lib/.libs/liblsf.a \
+        ../../lsf/intlib/.libs/liblsfint.a -lm -lnsl
+if SOLARIS
+bresources_LDADD += -lsocket -lnsl
+endif
+
+blaunch_SOURCES = blaunch.c cmd.jobid.c cmd.err.c cmd.h
+blaunch_LDADD = \
+        ../lib/.libs/liblsbatch.a \
+        ../../lsf/lib/.libs/liblsf.a \
+        ../../lsf/intlib/.libs/liblsfint.a -lm -lnsl
+if SOLARIS
+blaunch_LDADD += -lsocket -lnsl
+endif
+
+install-data-local:
 install-data-local:
 	cd "$(DESTDIR)$(bindir)" && ln -sf bkill bstop
 	cd "$(DESTDIR)$(bindir)" && ln -sf bkill bresume
 	cd "$(DESTDIR)$(bindir)" && ln -sf bkill bchkpnt
 	cd "$(DESTDIR)$(bindir)" && ln -sf bmgroup bugroup
+

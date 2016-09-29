@@ -151,8 +151,15 @@
 #define LSB_SBD_FINISH_SLEEP   51
 #define LSB_VIRTUAL_SLOT       52
 #define LSB_STDOUT_DIRECT      53
-#define MBD_DONT_FORK          54
+#define MBD_DONT_FORK          54   /* for dev only */
 #define LIM_NO_MIGRANT_HOSTS   55
+#define SBD_BIND_CPU           56
+#define MBD_MAX_JOBS_SCHED     57
+#define MBD_NO_QSORT_JOBS      58
+#define LIM_ACCEPT_FLOAT_CLIENT 59
+#define MBD_SWITCH_NOFORK       60  /* for dev only */
+#define MBD_DEDICATED_RESOURCES 61
+
 #define NOT_LOG  INFINIT_INT
 
 #define JOB_SAVE_OUTPUT   0x10000000
@@ -286,6 +293,7 @@ struct jobSpecs {
     char  commandSpool[MAXFILENAMELEN];
     int   userPriority;
     char  execUsername[MAX_LSB_NAME_LEN];
+    float hostShares;
 };
 
 struct statusReq {
@@ -337,6 +345,7 @@ struct sbdPackage {
     int    jobTerminateInterval;
     int    nAdmins;
     char   **admins;
+    int    affinity;
 };
 
 struct jobSig {
@@ -384,6 +393,13 @@ struct bucket {
     enum _bufstat  bufstat;
     proto_t proto;
     XDR   xdrs;
+};
+
+/* Generic name_list value
+ */
+struct name_list {
+    char *name;
+    int value;
 };
 
 #define NEW_BUCKET(BUCKET,chanBuf) \
@@ -537,7 +553,6 @@ int initTcl(struct tclLsInfo *);
 
 
 extern int fileExist(char *file, int uid, struct hostent *);
-extern void freeWeek (windows_t **);
 extern void errorBack(int, int, struct sockaddr_in *);
 
 extern int init_ServSock(u_short port);

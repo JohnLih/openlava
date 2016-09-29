@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2011 - 2015 David Bigagli
+ * Copyright (C) 2011 - 2016 David Bigagli
  * Copyright (C) 2007 Platform Computing Inc
  *
  * This program is free software; you can redistribute it and/or modify
@@ -25,6 +25,7 @@
 #include "daemons.h"
 #include "../../lsf/intlib/bitset.h"
 #include "../../lsf/intlib/link.h"
+#include "../../lsf/intlib/dlink.h"
 #include "jgrp.h"
 #include "../lib/lsb.sig.h"
 
@@ -41,13 +42,15 @@
 #define  DEF_EXCLUSIVE        FALSE
 #define  DEF_EVENT_WATCH_TIME 60
 #define  DEF_COND_CHECK_TIME  600
-#define DEF_MAX_SBD_CONNS     774
+#define DEF_MAX_SBD_CONNS     4096  /* Increase in lsb.params for high performance */
 #define DEF_SCHED_STAY        3
 #define DEF_FRESH_PERIOD     15
 #define DEF_PEND_EXIT       512
 #define DEF_JOB_ARRAY_SIZE  1000
-
 #define DEF_LONG_JOB_TIME  1800
+/* Default decay of the accumulated ran time of share accounts.
+ */
+#define DEF_HIST_MINUTES 120;
 
 #define MAX_JOB_PRIORITY   INFINIT_INT
 
@@ -89,15 +92,21 @@ typedef enum {
 #define JFLAG_DEPCOND_REJECT    0x8000
 #define JFLAG_SEND_SIG          0x10000
 #define JFLAG_BTOP              0x20000
-#define JFLAG_ADM_BTOP          0x40000
+#define JFLAG_SLOT_PREEMPTED    0x40000  /* MBD preempted for slots */
 #define JFLAG_READY1            0x100000
 #define JFLAG_READY2            0x200000
 #define JFLAG_URGENT            0x400000
 #define JFLAG_URGENT_NOSTOP     0x800000
 #define JFLAG_REQUEUE           0x1000000
 #define JFLAG_HAS_BEEN_REQUEUED 0x2000000
-#define JFLAG_JOB_PREEMPTED     0x20000000
-#define JFLAG_WILL_BE_PREEMPTED 0x40000000
+#define JFLAG_RES_PREEMPTED     0x20000000 /* MBD preempted for resources */
+#define JFLAG_BORROWED_SLOTS    0x40000000
+
+/* this does not fit an int
+ * 0x80000000 = 2147483648
+ * INT32_MAX = 2147483647
+ * 2147483647-2147483648 = -1
+ */
 #define JFLAG_WAIT_SWITCH       0x80000000
 
 
@@ -120,6 +129,13 @@ typedef enum {
 extern int mSchedStage;
 extern int freshPeriod;
 extern int maxSchedStay;
+extern int max_job_sched;
+extern int qsort_jobs;
+
+/* Table of dedicated resources as specific
+ * in lsf.conf MBD_DEDICATED_RESOURCES
+ */
+extern hTab *d_res_tab;
 
 #define DEL_ACTION_KILL      0x01
 #define DEL_ACTION_REQUEUE   0x02
@@ -170,8 +186,6 @@ extern struct objPRMO *pRMOPtr;
 #define PRMO_PREEMPTINGRUNJOB           0x0008
 
 #define  JOB_PREEMPT_WAIT(s)  ((s)->jStatus & JOB_STAT_RSRC_PREEMPT_WAIT)
-
-#define  MARKED_WILL_BE_PREEMPTED(s)  ((s)->jFlags & JFLAG_WILL_BE_PREEMPTED)
 
 #define FORALL_PRMPT_RSRCS(resn) if (pRMOPtr != NULL) { \
     int _pRMOindex;                                     \
@@ -254,7 +268,7 @@ struct jData {
     char    *userName;
     struct  uData *uPtr;
     LS_LONG_INT jobId;
-    float   priority;
+    int64_t   priority; /* fairshare in 2.2 used for btop/bbot now */
     int     jStatus;
     time_t  updStateTime;
     int     jFlags;
@@ -265,6 +279,9 @@ struct jData {
     int     numReasons;
     struct  qData *qPtr;
     struct  hData **hPtr;
+    struct  resData *pqPtr;  /* res account of project on queue */
+    struct  resData *uqPtr;  /* res account of user on queue */
+    struct  resData *hqPtr;  /* res account of host on queue */
     int     numHostPtr;
     struct  askedHost *askedPtr;
     int     numAskedPtr;
@@ -329,7 +346,7 @@ struct jData {
     int    sigValue;
     struct jShared  *shared;
     int     numRef;
-    struct  jgTreeNode*   jgrpNode;
+    struct  jgTreeNode *jgrpNode;
     int     nodeType;
     struct  jData *nextJob;
     int     restartPid;
@@ -344,11 +361,15 @@ struct jData {
     int    numOfGroups;
     int    reservedGrp;
     int    currentGrp;
-    int*   inEligibleGroups;
+    int *inEligibleGroups;
     int numSlotsReserve;
     int numAvailSlotsReserve;
     int numMsg;
     struct lsbMsg **msgs;
+    char *run_rusage;   /* "rusage[x=1:y=2||z=3:w=4]" */
+    int abs_run_limit; /* absolute run limit in seconds */
+    link_t *preempted_hosts;
+    LS_LONG_INT preempted_by;
 };
 
 
@@ -402,7 +423,7 @@ struct jShared {
     (JP)->jStatus &= ~JOB_STAT_RESERVE; \
 }
 
-struct       hostAcct {
+struct hostAcct {
     struct   hData *hPtr;
     int      numRUN;
     int      numSSUSP;
@@ -434,61 +455,12 @@ struct uData {
     LS_BITSET_T *descendants;
     LS_BITSET_T *parents;
     LS_BITSET_T *ancestors;
-    LIST_T *pxySJL;
+    struct dlink *jobs;
 };
 
 #define USER_GROUP_IS_ALL_USERS(UserGroup) \
      ((UserGroup)->numGroups == 0 && \
       (UserGroup)->memberTab.numEnts == 0) \
-
-#define FOR_EACH_UGRP_CHILD_USER(User, Grp) \
-    if ((User)->children != NULL) { \
-        struct uData *Grp; \
-        LS_BITSET_ITERATOR_T __iter__; \
-        BITSET_ITERATOR_ZERO_OUT(&__iter__); \
-        setIteratorAttach(&__iter__, (User)->children, "FOR_EACH_UGRP_CHILD_USER"); \
-        for (Grp = (struct uData *)setIteratorBegin(&__iter__); \
-             Grp != NULL; \
-             Grp = (struct uData *)setIteratorGetNextElement(&__iter__)) \
-        {
-
-#define END_FOR_EACH_UGRP_CHILD_USER }}
-
-#define FOR_EACH_UGRP_DESCENDANT_USER(Grp, User) \
-    if ((User)->children != NULL) { \
-        struct uData *User; \
-        LS_BITSET_ITERATOR_T __iter__; \
-        BITSET_ITERATOR_ZERO_OUT(&__iter__); \
-        setIteratorAttach(&__iter__, (Grp)->descendants, "FOR_EACH_UGRP_CHILD_USER"); \
-        for (User = (struct uData *)setIteratorBegin(&__iter__); \
-             User != NULL; \
-             User = (struct uData *)setIteratorGetNextElement(&__iter__)) \
-        {
-
-#define END_FOR_EACH_UGRP_DESCENDANT_USER }}
-
-#define FOR_EACH_USER_ANCESTOR_UGRP(User, Grp) \
-    if ((User)->ancestors != NULL) { \
-        struct uData *Grp; \
-        LS_BITSET_ITERATOR_T __iter__; \
-        BITSET_ITERATOR_ZERO_OUT(&__iter__); \
-        setIteratorAttach(&__iter__, (User)->ancestors, "FOR_EACH_USER_ANCESTOR_UGRP"); \
-        for (Grp = (struct uData *)setIteratorBegin(&__iter__); \
-             Grp != NULL; \
-             Grp = (struct uData *)setIteratorGetNextElement(&__iter__)) \
-        {
-
-#define END_FOR_EACH_USER_ANCESTOR_UGRP }}
-
-struct uDataTable {
-    struct uData **_base_;
-    int            _cur_;
-    int            _size_;
-};
-
-typedef struct uDataTable UDATA_TABLE_T;
-
-#define UDATA_TABLE_NUM_ELEMENTS(Table) ( (Table)->_cur_ )
 
 struct userAcct {
     struct   uData *uData;
@@ -586,13 +558,17 @@ struct qData {
     char   *chkpntDir;
     int    minProcLimit;
     int    defProcLimit;
-    char   *fairshare;
-    uint32_t numFairSlots;
-    struct fair_sched *fsSched;
-    struct jData *lastJob;
-    char *preemption;
-    link_t *preemptable;
-    struct prm_sched *prmSched;
+    char   *fairshare;            /* fairshare description */
+    uint32_t numFairSlots;        /* total number of slots to fairshare */
+    struct fair_sched *fsSched;   /* fairshare scheduler interface */
+    struct jData *lastJob;        /* queue's last job */
+    char *preemption;             /* preemption description */
+    link_t *preemptable;          /* list of preemtable queues */
+    struct prm_sched *prmSched;   /* preemption scheduler interface */
+    char *ownership;              /* ownership description */
+    uint32_t num_owned_slots;     /* number of owned slots */
+    struct fair_sched *own_sched; /* ownership scheduler interface */
+    int loan_duration;            /* resource loan max duration */
 };
 
 #define HOST_STAT_REMOTE       0x80000000
@@ -645,6 +621,9 @@ struct hData {
     LIST_T    *pxySJL;
     LIST_T    *pxyRsvJL;
     float     leftRusageMem;
+    char      message[MAXLINELEN];
+    int       affinity;
+    hTab *dres_tab; /* host dedicated resources */
 };
 
 
@@ -664,10 +643,57 @@ extern struct sbdNode sbdNodeList;
 extern struct parameterInfo *mbdParams;
 
 struct gData {
-    char     *group;
-    hTab     memberTab;
-    int      numGroups;
-    struct   gData *gPtr[MAX_GROUPS];
+    char *group;
+    hTab memberTab;
+    int  numGroups;
+    struct gData *gPtr[MAX_GROUPS];
+    char *group_slots;
+    int max_slots;
+};
+
+/* resource account for limits */
+struct resData {
+    char      *project;
+    char      *user;
+    char      *queue;
+    char      *host;
+    int       maxJobs;
+    int       numJobs;
+    int       numPENDJobs;
+    int       numRUNJobs;
+    int       numSSUSPJobs;
+    int       numUSUSPJobs;
+    int       numRESERVEJobs;
+    int       maxSlots;
+    int       numSlots;
+    int       numPENDSlots;
+    int       numRUNSlots;
+    int       numSSUSPSlots;
+    int       numUSUSPSlots;
+    int       numRESERVESlots;
+};
+
+/* consumer account for limits */
+struct consumerData {
+    limitConsumerType_t type;
+    char                *consumer;
+    struct hTab         *rAcct;
+};
+
+/* share account of each queue
+ */
+struct qShareData {
+    char    *queue;    /* queue name */
+    int     shares;    /* shares as configured */
+    double  dshares;   /* computed share ratio */
+};
+
+/* host share for cpu binding
+*/
+struct hShareData {
+    char    *host;     /* host name */
+    int     total;     /* total number of shares */
+    struct hTab *qAcct; /* account of shares per queue */
 };
 
 typedef enum {
@@ -782,6 +808,15 @@ struct resourceInstance {
     char      *value;
 };
 
+/* Information about the child switching
+ * the lsb.events
+ */
+struct switch_child {
+    pid_t  pid;
+    bool_t child_gone;
+    int status;
+};
+
 struct profileCounters {
     int cntVal;
     char *cntDescr;
@@ -857,11 +892,14 @@ typedef enum profCounterType {
 
 
 extern LIST_T *hostList;
+/* Build in getLsbUsable() as proxy link of usable hosts.
+ */
+extern link_t *hosts_link;
+extern int num_finish;
 extern struct hTab            hostTab;
 extern struct jData           *jDataList[];
 extern struct migJob          *migJobList;
 extern struct qData           *qDataList;
-extern UDATA_TABLE_T          *uDataPtrTb;
 extern struct hTab            uDataList;
 extern struct hTab            calDataList;
 extern struct jData           *chkJList;
@@ -950,7 +988,13 @@ extern float                   maxCpuFactor;
 extern int                     freedSomeReserveSlot;
 
 extern long                    schedSeqNo;
+extern struct switch_child     *swchild;
 
+extern struct resLimitConf     *limitConf;
+extern struct hTab             pDataTab;
+extern struct hTab             uDataTab;
+extern struct hTab             hDataTab;
+extern struct hTab             hShareTab;
 
 extern void                 pollSbatchds(int);
 extern void                 hStatChange(struct hData *, int status);
@@ -979,6 +1023,7 @@ extern void                 adjLsbLoad(struct jData *, int, bool_t);
 extern int                  countHostJobs(struct hData *);
 extern void                 getLsbResourceInfo(void);
 extern struct resVal *      getReserveValues(struct resVal *,struct resVal *);
+extern int                  hasResSpanHosts(struct resVal *);
 extern void                 getLsfHostInfo(int);
 extern struct hData *       getHostByType(char *);
 
@@ -1047,7 +1092,9 @@ extern void                 jStatusChange(struct jData *,
 extern int                  findLastJob(int, struct jData *, struct jData **);
 extern void                 initJobIdHT(void);
 extern struct jData *       getJobData(LS_LONG_INT jobId);
-extern void                 inPendJobList(struct jData *, int list, time_t);
+extern void                 inPendJobList(struct jData *, int, time_t);
+extern void                 _inPendJobList_(struct jData *, int, time_t);
+extern void                 sort_job_list(int);
 extern void                 inStartJobList (struct jData *);
 extern void                 inFinishJobList(struct jData *);
 extern void                 jobInQueueEnd (struct jData *, struct qData *);
@@ -1091,7 +1138,6 @@ extern void                 jobStatusSignal(sbdReplyType reply,
                                             struct jData *jData,
                                             int sigValue, int chkFlags,
                                             struct jobReply *jobReply);
-extern void                 tryResume (void);
 extern void                 freeSubmitReq (struct submitReq *);
 extern int                  shouldLockJob (struct jData *, int);
 extern int                  sigPFjob (struct jData *, int, time_t, int);
@@ -1254,19 +1300,10 @@ extern int                  sumMembers (struct gData *,
 extern void                 createGroupuData();
 extern void                 createGroupTbPtr();
 extern void                 createGroupSet();
-extern int                  getIndexByuData(void *);
-extern void *               getuDataByIndex(int);
-extern UDATA_TABLE_T *      uDataTableCreate(void);
-extern void                 uDataPtrTbInitialize(void);
-extern void                 uDataTableAddEntry(UDATA_TABLE_T *,
-                                               struct uData *);
-extern int                  uDataTableGetNumEntries(UDATA_TABLE_T *);
-extern struct uData *       uDataTableGetNextEntry(UDATA_TABLE_T *);
-extern void                 setuDataCreate(void);
 extern void                 updHostList(void);
 extern void                 uDataGroupCreate(void);
 extern int                  sizeofGroupInfoReply(struct groupInfoReply *);
-extern void                 child_handler(int);
+extern void                 mbd_child_handler(int);
 extern void                 terminate_handler(int);
 extern void                 announce_master(void);
 extern void                 shutDownClient(struct clientNode *);
@@ -1280,6 +1317,12 @@ extern void                 updUserData (struct jData *, int, int, int, int,
                                          int, int);
 extern void                 updQaccount(struct jData *jData, int, int, int,
                                         int, int, int);
+extern void                 updLimitSlotData(struct jData *,
+                                        int, int, int, int, int, int);
+extern void                 updLimitJobData(struct jData *, int, int,
+                                        int, int, int, int);
+extern struct resData *     getLimitUsageData(limitConsumerType_t, char *, char *);
+extern struct limitRes     *getActiveLimit(struct limitRes *, int);
 extern struct uData *       getUserData(char *user);
 extern struct userAcct *    getUAcct(struct hTab *, struct uData *);
 extern struct hostAcct *    getHAcct(struct hTab  *, struct hData *);
@@ -1288,6 +1331,7 @@ extern int                  checkUsers(struct infoReq *,
                                        struct userInfoReply *);
 extern void                 checkParams (struct infoReq *,
                                          struct parameterInfo *);
+extern double               get_host_shares(char *, char *);
 extern void                 mbdDie(int);
 extern int                  isManager (char *);
 extern int                  isAuthManager (struct lsfAuth *);
@@ -1296,6 +1340,8 @@ extern char *               getDefaultProject(void);
 extern void                 updResCounters(struct jData *, int);
 extern struct hostAcct *    addHAcct(struct hTab **, struct hData *,
                                       int, int, int, int);
+extern void                 addHost(struct hostInfo *,
+                                    struct hData *);
 extern void                 checkQusable(struct qData *, int, int);
 extern void                 updHostLeftRusageMem(struct jData *, int);
 extern int                  minit(int);
@@ -1313,7 +1359,7 @@ extern void                 mbdReConf(int);
 extern int                  log_newjob(struct jData *);
 extern void                 log_switchjob(struct jobSwitchReq *,
                                           int, char *);
-extern void                 log_movejob(struct jobMoveReq *, int , char *);
+extern void                 log_movejob(struct jobMoveReq *, struct lsfAuth *);
 extern void                 log_startjob(struct jData *, int);
 extern void                 log_startjobaccept(struct jData *);
 extern void                 log_newstatus(struct jData *);
@@ -1322,7 +1368,7 @@ extern void                 log_mig(struct jData *, int, char *);
 extern void                 log_route(struct jData *);
 extern int                  log_modifyjob(struct modifyReq *, struct lsfAuth *);
 extern void                 log_queuestatus(struct qData *, int, int, char*);
-extern void                 log_hoststatus(struct hData *, int, int, char*);
+extern void                 log_hoststatus(struct hData *, int, int, char*, char*);
 extern void                 log_mbdStart(void);
 extern void                 log_mbdDie(int);
 extern void                 log_unfulfill(struct jData *);
@@ -1332,6 +1378,9 @@ extern void                 log_jobforward(struct jData *);
 extern void                 log_statusack(struct jData *);
 extern void                 log_logSwitch(int);
 extern void                 log_jobmsg(struct jData *, struct lsbMsg *);
+extern void                 log_newjgrp(struct jgTreeNode *);
+extern void                 log_deljgrp(struct jgTreeNode *);
+extern void                 log_modjgrp(struct jgTreeNode *);
 extern void                 replay_requeuejob(struct jData *);
 extern int                  init_log(void);
 extern void                 switchELog(void);
@@ -1362,19 +1411,21 @@ extern int                  stripJobStarter(char *, int *, char *);
 
 extern sbdReplyType         start_job(struct jData *, struct qData *,
                                       struct jobReply *);
-extern sbdReplyType         signal_job(struct jData *jobPtr, struct jobSig *,
-                                       struct jobReply *jobReply);
-extern sbdReplyType         switch_job(struct jData *, int options);
+extern sbdReplyType         signal_job(struct jData *, struct jobSig *,
+                                       struct jobReply *);
+extern sbdReplyType         switch_job(struct jData *, int);
 extern sbdReplyType         msg_job(struct jData *, struct Buffer *,
                                     struct jobReply *);
-extern sbdReplyType         probe_slave(struct hData *, char sendJobs);
-extern sbdReplyType         rebootSbd(char *host);
-extern sbdReplyType         shutdownSbd(char *host);
+extern sbdReplyType         probe_slave(struct hData *, char);
+extern sbdReplyType         rebootSbd(char *);
+extern sbdReplyType         shutdownSbd(char *);
 extern struct dptNode       *parseDepCond(char *, struct lsfAuth * ,
                                           int *, char **,int *, int);
-extern int                  evalDepCond (struct dptNode *, struct jData *);
-extern void                 freeDepCond (struct dptNode *);
-extern void                 resetDepCond (struct dptNode *);
+extern int                  evalDepCond(struct dptNode *,
+                                        struct jData *,
+                                        link_t *);
+extern void                 freeDepCond(struct dptNode *);
+extern void                 resetDepCond(struct dptNode *);
 extern bool_t               autoAdjustIsEnabled(void);
 extern int                  getAutoAdjustAtNumPend(void);
 extern float                  getAutoAdjustAtPercent(void);
@@ -1506,5 +1557,35 @@ extern void freeTimeWindow(struct timeWindow *);
 extern void updateTimeWindow(struct timeWindow *);
 extern inline int numofhosts(void);
 extern int postMsg2Job(char **, struct jData *);
+extern int fork_mbd(void);
+extern int do_jobDepInfo(XDR *, int,
+                         struct sockaddr_in *,
+                         char *, struct LSFHeader *);
+extern int do_jobGroupAdd(XDR *, int,
+                          struct sockaddr_in *,
+                          char *, struct LSFHeader *, struct lsfAuth *);
+extern int do_jobGroupDel(XDR *, int,
+                          struct sockaddr_in *,
+                          char *, struct LSFHeader *, struct lsfAuth *);
+extern int do_jobGroupInfo(XDR *, int,
+                           struct sockaddr_in *,
+                           char *, struct LSFHeader *);
+extern int do_jobGroupModify(XDR *, int,
+                             struct sockaddr_in *,
+                             char *, struct LSFHeader *, struct lsfAuth *);
+extern int add_job_group(struct job_group *, struct lsfAuth *);
+extern int del_job_group(struct job_group *, struct lsfAuth *);
+extern int modify_job_group(struct job_group *, struct lsfAuth *);
+extern int tree_size(int *);
+extern int encode_nodes(XDR *, int *, int, struct LSFHeader *);
+extern int can_switch_jgrp(struct jgrpLog *);
+extern int check_job_group(struct jData *, struct lsfAuth *);
+extern bool_t jobgroup_limit_ok(struct jData *);
+extern int do_resLimitInfo(XDR *, int, struct sockaddr_in *, struct LSFHeader *);
+extern int stop_job(struct jData *, int);
+extern char *str_flags(int);
+extern void tryResume(struct qData *);
+extern inline bool_t has_slot_preemption(void);
+extern void log_job_preemption(struct jData *, link_t *);
 
 #endif /* _MBD_HEADER_ */

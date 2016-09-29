@@ -1,6 +1,6 @@
 /*
+ * Copyright (C) 2014-2016 David Bigagli
  * Copyright (C) 2007 Platform Computing Inc
- * Copyright (C) 2014-2015 David Bigagli
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of version 2 of the GNU General Public License as
@@ -31,10 +31,20 @@
 
 struct listSet  *voidJobList = NULL;
 
+/* Save the pririty of the bbot job
+ * in the queue which it is in.
+ */
+struct last_bbot_queue {
+    int64_t last_bbot;
+    struct qData *qPtr;
+};
+static link_t *bbot_queue;
+
+static void set_job_last_bbot_priority(struct jData *);
+
 void                 freeNewJob(struct jData *);
 extern void          initResVal(struct resVal* );
 extern int           userJobLimitOk (struct jData *, int, int *);
-extern void          reorderSJL(void);
 static int checkSubHost(struct jData *);
 static bool_t  checkUserPriority(struct jData *, int, int *);
 static int           queueOk(char *, struct jData *, int *, struct submitReq *,
@@ -42,10 +52,8 @@ static int           queueOk(char *, struct jData *, int *, struct submitReq *,
 static int           acceptJob(struct qData *, struct jData *,
                                int *, struct lsfAuth *);
 static int           getCpuLimit(struct jData *, struct submitReq *);
-static void          insertAndShift(struct jData *, struct jData *, int, int);
 static int           resigJobs1(struct jData *, int *);
 static sbdReplyType  sigStartedJob(struct jData *, int, time_t, int);
-static void          reorderSJL1(struct jData *);
 static int           matchJobStatus(int, struct jData *);
 static double        acumulateValue(double, double);
 static void          accumulateRU(struct jData *, struct statusReq *);
@@ -97,6 +105,8 @@ static int    mbdRcvJobFile(int, struct lenData *);
 static void closeSbdConnect4ZombieJob(struct jData *);
 static int set_queue_last_job(LIST_T *, struct jData *);
 static void rmMessageFile(struct jData *);
+static void ssusp_job(struct jData *);
+static int resume_job(struct jData *);
 
 extern int glMigToPendFlag;
 extern int requeueToBottom;
@@ -107,7 +117,7 @@ extern int statusChanged;
 #define DEFAULT_LISTSIZE    200
 
 int  numRemoveJobs = 0;
-int  eventPending = FALSE;
+int  eventPending = false;
 
 extern int     rusageUpdateRate;
 extern int     rusageUpdatePercent;
@@ -134,13 +144,16 @@ static void inPendJobList2(struct jData *,
                            int,
                            struct jData *,
                            struct jData **);
+static int jcompare(const void *, const void *);
+
+static struct hData *handle_float_client(struct submitReq *);
+static bool_t should_resume_by_job(struct jData *);
 
 int
 newJob(struct submitReq *subReq, struct submitMbdReply *Reply, int chan,
        struct lsfAuth *auth, int *schedule, int dispatch,
        struct jData **jobData)
 {
-    static char fname[] = "newJob";
     static struct jData *newjob;
     int returnErr;
     LS_LONG_INT nextId;
@@ -149,29 +162,31 @@ newJob(struct submitReq *subReq, struct submitMbdReply *Reply, int chan,
     struct hData *hData;
     struct hostInfo *hinfo;
     char hostType[MAXHOSTNAMELEN];
-
     struct idxList *idxList;
     int    maxJLimit = 0;
 
     if (logclass & (LC_TRACE | LC_EXEC))
-        ls_syslog(LOG_DEBUG1, "%s: Entering this routine...", fname);
+        ls_syslog(LOG_DEBUG1, "%s: Entering this routine...", __func__);
 
     if ((nextId = getNextJobId()) < 0)
-        return (LSBE_NO_JOBID);
+        return LSBE_NO_JOBID;
 
-    hData = getHostData (subReq->fromHost);
+    hData = getHostData(subReq->fromHost);
+    if (hData == NULL
+        && daemonParams[LIM_ACCEPT_FLOAT_CLIENT].paramValue) {
+        hData = handle_float_client(subReq);
+    }
     if (hData == NULL) {
 
         if ((hinfo = getLsfHostData (subReq->fromHost)) == NULL) {
-            getLsfHostInfo(FALSE);
+            getLsfHostInfo(false);
             hinfo = getLsfHostData (subReq->fromHost);
         }
         if (hinfo == NULL) {
             if (!(subReq->options & SUB_RESTART)) {
-                ls_syslog(LOG_ERR, _i18n_msg_get(ls_catd , NL_SETN, 6500,
-                                                 "%s: Host <%s> is not used by LSF"), /* catgets 6500 */
-                          fname, subReq->fromHost);
-                return (LSBE_MBATCHD);
+                ls_syslog(LOG_ERR, "\
+%s: Host <%s> is not used by LSF", __func__, subReq->fromHost);
+                return LSBE_BAD_SUBMISSION_HOST;
             }
             if (getHostByType (subReq->schedHostType) == NULL) {
                 ls_syslog(LOG_ERR, "\
@@ -195,15 +210,17 @@ newJob(struct submitReq *subReq, struct submitMbdReply *Reply, int chan,
     else if (auth->options == AUTH_HOST_UX)
         subReq->options2 |= SUB2_HOST_UX;
 
-    newjob = initJData((struct jShared *) my_calloc(1, sizeof(struct jShared), "newJob"));
+    newjob = initJData((struct jShared *)my_calloc(1,
+                                                   sizeof(struct jShared),
+                                                   "newJob"));
     newjob->jobId = nextId;
     returnErr = checkJobParams(newjob, subReq, Reply, auth);
 
     if (returnErr == LSBE_NO_ERROR) {
 
-        if ( !(subReq->options & SUB_CHKPNT_DIR) ){
+        if (! (subReq->options & SUB_CHKPNT_DIR)){
             struct qData  *qp = getQueueData(subReq->queue);
-            if ( qp && (qp->qAttrib & Q_ATTRIB_CHKPNT) ) {
+            if (qp && (qp->qAttrib & Q_ATTRIB_CHKPNT)) {
                 subReq->options  |= SUB_CHKPNTABLE;
                 subReq->options2 |= SUB2_QUEUE_CHKPNT;
                 FREEUP(subReq->chkpntDir);
@@ -212,9 +229,9 @@ newJob(struct submitReq *subReq, struct submitMbdReply *Reply, int chan,
             }
         }
 
-        if ( !(subReq->options & SUB_RERUNNABLE ) ) {
+        if (! (subReq->options & SUB_RERUNNABLE)) {
             struct qData  *qp = getQueueData(subReq->queue);
-            if ( qp && (qp->qAttrib & Q_ATTRIB_RERUNNABLE )) {
+            if ( qp && (qp->qAttrib & Q_ATTRIB_RERUNNABLE)) {
                 subReq->options  |= SUB_RERUNNABLE;
                 subReq->options2 |= SUB2_QUEUE_RERUNNABLE;
             }
@@ -230,51 +247,49 @@ newJob(struct submitReq *subReq, struct submitMbdReply *Reply, int chan,
             FREEUP(subReq->chkpntDir);
             subReq->chkpntDir = safeSave(dir);
         }
-
     }
 
-
+    /* Get the job file from the library before we
+     * close the connection with it
+     */
     if ((mbdRcvJobFile(chan, &jf)) == -1) {
-        ls_syslog(LOG_ERR, _i18n_msg_get(ls_catd , NL_SETN, 6502,
-                                         "%s: %s() failed for user ID <%d>: %M"), /* catgets 6502 */
-                  fname, "mbdRcvJobFile", auth->uid);
+        ls_syslog(LOG_ERR, "\
+%s: failed receiving job file for userid %d: %M",
+                  __func__, auth->uid);
         freeNewJob (newjob);
         if (returnErr != LSBE_NO_ERROR)
-            return (returnErr);
+            return returnErr;
         else
-            return (LSBE_MBATCHD);
+            return LSBE_MBATCHD;
     }
 
     if (returnErr != LSBE_NO_ERROR) {
         freeNewJob (newjob);
         FREEUP (jf.data);
-        return (returnErr);
+        return returnErr;
     }
 
-
-    copyJobBill (subReq, &newjob->shared->jobBill, newjob->jobId);
+    copyJobBill(subReq, &newjob->shared->jobBill, newjob->jobId);
     newjob->restartPid = newjob->shared->jobBill.restartPid;
     newjob->chkpntPeriod = newjob->shared->jobBill.chkpntPeriod;
-
 
     logJobInfo(subReq, newjob, &jf);
     FREEUP (jf.data);
 
     newjob->schedHost = safeSave (hostType);
 
-
     if ((newjob->shared->jobBill.options & SUB_RESTART) ||
         (idxList = parseJobArrayIndex(newjob->shared->jobBill.jobName,
                                       &returnErr, &maxJLimit)) == NULL) {
         if (returnErr == LSBE_NO_ERROR) {
-            handleNewJob (newjob, JOB_NEW, LOG_IT);
+            handleNewJob(newjob, JOB_NEW, LOG_IT);
         }
         else {
             FREEUP (jf.data);
             FREEUP(Reply->badJobName);
             Reply->badJobName = safeSave(newjob->shared->jobBill.jobName);
             freeJData(newjob);
-            return(returnErr);
+            return returnErr;
         }
     }
     else {
@@ -285,11 +300,12 @@ newJob(struct submitReq *subReq, struct submitMbdReply *Reply, int chan,
     *jobData = newjob;
 
     if (logclass & (LC_TRACE | LC_EXEC | LC_SCHED))
-        ls_syslog(LOG_DEBUG1, "%s: New job <%s> submitted to queue <%s>",
-                  fname, lsb_jobid2str(newjob->jobId), newjob->qPtr->queue);
+        ls_syslog(LOG_DEBUG1, "\
+%s: New job <%s> submitted to queue <%s>",
+                  __func__, lsb_jobid2str(newjob->jobId),
+                  newjob->qPtr->queue);
 
-    return(LSBE_NO_ERROR);
-
+    return LSBE_NO_ERROR;
 }
 
 struct hData *
@@ -340,8 +356,7 @@ getNextJobId (void)
     nextJobId++;
     if (nextJobId >= maxJobId)
         nextJobId = 1;
-    return (freeJobId);
-
+    return freeJobId;
 }
 
 
@@ -377,6 +392,19 @@ handleNewJob(struct jData *jpbw, int job, int eventTime)
     jpbw->nextJob = NULL;
 
     jpbw->uPtr = getUserData(jpbw->userName);
+    if (!jpbw->pqPtr)
+        jpbw->pqPtr = getLimitUsageData(LIMIT_CONSUMER_PER_PROJECT,
+                                        jpbw->shared->jobBill.projectName,
+                                        jpbw->qPtr->queue);
+    if (!jpbw->uqPtr)
+        jpbw->uqPtr = getLimitUsageData(LIMIT_CONSUMER_PER_USER,
+                                        jpbw->userName,
+                                        jpbw->qPtr->queue);
+
+    if (!jpbw->hqPtr && jpbw->numHostPtr > 0)
+        jpbw->hqPtr = getLimitUsageData(LIMIT_CONSUMER_PER_HOST,
+                                        jpbw->hPtr[0]->host,
+                                        jpbw->qPtr->queue);
 
     putOntoTree(jpbw, job);
 
@@ -385,7 +413,14 @@ handleNewJob(struct jData *jpbw, int job, int eventTime)
                     jpbw->shared->jobBill.maxNumProcessors, 0, 0, 0, 0);
         updUserData(jpbw, jpbw->shared->jobBill.maxNumProcessors,
                     jpbw->shared->jobBill.maxNumProcessors, 0, 0, 0, 0);
+        updLimitSlotData(jpbw, jpbw->shared->jobBill.maxNumProcessors,
+                         jpbw->shared->jobBill.maxNumProcessors, 0, 0, 0, 0);
+        updLimitJobData(jpbw, 1, 1, 0, 0, 0, 0);
     }
+
+    /* set_job_bbot_last_priority()
+     */
+    set_job_last_bbot_priority(jpbw);
 
     if (job == JOB_NEW && eventTime == LOG_IT) {
         log_newjob(jpbw);
@@ -423,7 +458,7 @@ chkAskedHosts(int inNumAskedHosts, char **inAskedHosts, int numProcessors,
     char hName[MAXHOSTNAMELEN];
     int len, priority;
     struct hostent *hp;
-    int allSpecified = FALSE;
+    int allSpecified = false;
     int firstHostIndex = -1;
 #define FIRST_HOST_PRIORITY (unsigned)-1/2
 
@@ -441,7 +476,7 @@ chkAskedHosts(int inNumAskedHosts, char **inAskedHosts, int numProcessors,
     for (j = 0; j < inNumAskedHosts; j++) {
         struct gData *gp;
         char *sp;
-        int needCheck = TRUE;
+        int needCheck = true;
 
         strcpy (hName, inAskedHosts[j]);
         len = strlen (hName);
@@ -465,7 +500,8 @@ chkAskedHosts(int inNumAskedHosts, char **inAskedHosts, int numProcessors,
                 if (firstHostIndex != -1) {
                     *badHostIndx = j;
 
-                    if ( returnBadHost ) return (LSBE_MULTI_FIRST_HOST);
+                    if (returnBadHost)
+                        return LSBE_MULTI_FIRST_HOST;
                     continue;
                 }
                 firstHostIndex = j;
@@ -480,12 +516,13 @@ chkAskedHosts(int inNumAskedHosts, char **inAskedHosts, int numProcessors,
             if (*askedOthPrio >= 0 && returnBadHost) {
                 *badHostIndx = j;
                 FREEUP(askedHosts);
-                return (LSBE_BAD_HOST);
+                return LSBE_BAD_HOST;
             }
             if ( firstHostIndex == j ) {
                 *badHostIndx = j;
 
-                if ( returnBadHost ) return (LSBE_OTHERS_FIRST_HOST);
+                if (returnBadHost)
+                    return LSBE_OTHERS_FIRST_HOST;
                 continue;
             }
             *askedOthPrio = priority;
@@ -503,8 +540,8 @@ chkAskedHosts(int inNumAskedHosts, char **inAskedHosts, int numProcessors,
 
             if ( firstHostIndex == j ) {
                 *badHostIndx = j;
-                if (returnBadHost ) {
-                    return (LSBE_HG_FIRST_HOST);
+                if (returnBadHost) {
+                    return LSBE_HG_FIRST_HOST;
                 }
                 continue;
             }
@@ -512,11 +549,11 @@ chkAskedHosts(int inNumAskedHosts, char **inAskedHosts, int numProcessors,
                 if (*askedOthPrio >= 0 && returnBadHost) {
                     *badHostIndx = j;
                     FREEUP(askedHosts);
-                    return (LSBE_BAD_HOST);
+                    return LSBE_BAD_HOST;
                 }
                 *askedOthPrio = priority;
                 numAskProcessors = numofprocs;
-                allSpecified = TRUE;
+                allSpecified = true;
                 continue;
             } else {
                 gHosts = expandGrp(gp, hName, &numh);
@@ -526,11 +563,11 @@ chkAskedHosts(int inNumAskedHosts, char **inAskedHosts, int numProcessors,
                         if (*askedOthPrio >= 0 && returnBadHost) {
                             *badHostIndx = j;
                             FREEUP(askedHosts);
-                            return (LSBE_BAD_HOST);
+                            return LSBE_BAD_HOST;
                         }
                         *askedOthPrio = priority;
                         numAskProcessors = numofprocs;
-                        allSpecified = TRUE;
+                        allSpecified = true;
                         continue;
                     }
                     if ((hData = getHostData (gHosts[i])) == NULL)
@@ -565,7 +602,7 @@ chkAskedHosts(int inNumAskedHosts, char **inAskedHosts, int numProcessors,
                     continue;
                 *badHostIndx = j;
                 FREEUP(askedHosts);
-                return (LSBE_BAD_HOST);
+                return LSBE_BAD_HOST;
             }
 
             for (k = 0; k < numAskedHosts; k++)
@@ -590,15 +627,15 @@ chkAskedHosts(int inNumAskedHosts, char **inAskedHosts, int numProcessors,
     }
 
 
-    if (numAskedHosts == 0 && *askedOthPrio >= 0 && allSpecified == FALSE) {
+    if (numAskedHosts == 0 && *askedOthPrio >= 0 && allSpecified == false) {
         FREEUP(askedHosts);
         return LSBE_BAD_HOST;
     }
 
-    if ((returnBadHost  && numProcessors > numAskProcessors)
-        || (!returnBadHost && numAskedHosts == 0 && allSpecified == FALSE)) {
+    if ((returnBadHost && numProcessors > numAskProcessors)
+        || (!returnBadHost && numAskedHosts == 0 && allSpecified == false)) {
         FREEUP(askedHosts);
-        return (LSBE_PROC_NUM);
+        return LSBE_PROC_NUM;
     }
 
 
@@ -648,7 +685,7 @@ chkAskedHosts(int inNumAskedHosts, char **inAskedHosts, int numProcessors,
                        askedHosts[i].hData->host, askedHosts[i].priority);
     }
 
-    return (LSBE_NO_ERROR);
+    return LSBE_NO_ERROR;
 }
 
 static int
@@ -659,21 +696,22 @@ queueOk (char *queuename, struct jData *job, int *errReqIndx,
     int retVal;
 
     if ((qp = getQueueData (queuename)) == NULL)
-        return (LSBE_BAD_QUEUE);
+        return LSBE_BAD_QUEUE;
     if (qp->pJobLimit <= 0.0)
-        return (LSBE_PJOB_LIMIT);
+        return LSBE_PJOB_LIMIT;
     if (qp->hJobLimit <= 0)
-        return (LSBE_HJOB_LIMIT);
+        return LSBE_HJOB_LIMIT;
     if (qp->maxJobs <= 0)
-        return (LSBE_QJOB_LIMIT);
+        return LSBE_QJOB_LIMIT;
 
-
+    /* Set the queue pointer in the job pointer.
+     */
     job->qPtr = qp;
 
     job->slotHoldTime = qp->slotHoldTime;
 
-    if ((retVal = getCpuLimit (job, subReq)) != LSBE_NO_ERROR) {
-        return (retVal);
+    if ((retVal = getCpuLimit(job, subReq)) != LSBE_NO_ERROR) {
+        return retVal;
     }
 
 
@@ -687,15 +725,15 @@ queueOk (char *queuename, struct jData *job, int *errReqIndx,
     if (!userJobLimitOk (job, 0, errReqIndx)) {
         if (job->newReason == PEND_QUE_USR_JLIMIT
             || job->newReason == PEND_QUE_USR_PJLIMIT)
-            return (LSBE_UJOB_LIMIT);
+            return LSBE_UJOB_LIMIT;
         else
-            return (LSBE_USER_JLIMIT);
+            return LSBE_USER_JLIMIT;
     }
 
     if ((retVal = acceptJob (qp, job, errReqIndx, auth)) != LSBE_NO_ERROR) {
-        return (retVal);
+        return retVal;
     }
-    return (LSBE_NO_ERROR);
+    return LSBE_NO_ERROR;
 }
 
 static int
@@ -707,10 +745,10 @@ acceptJob(struct qData *qp,
     int j;
 
     if (!(qp->qStatus & QUEUE_STAT_OPEN))
-        return (LSBE_QUEUE_CLOSED);
+        return LSBE_QUEUE_CLOSED;
     if ((jp->shared->jobBill.options & SUB_EXCLUSIVE)
         && !(qp->qAttrib & Q_ATTRIB_EXCLUSIVE))
-        return (LSBE_EXCLUSIVE);
+        return LSBE_EXCLUSIVE;
 
 
     if (jp->shared->jobBill.options2 & SUB2_USE_DEF_PROCLIMIT) {
@@ -727,32 +765,32 @@ acceptJob(struct qData *qp,
 
     if ((jp->shared->jobBill.options & SUB_INTERACTIVE)
         && (qp->qAttrib & Q_ATTRIB_NO_INTERACTIVE))
-        return (LSBE_NO_INTERACTIVE);
+        return LSBE_NO_INTERACTIVE;
     if (!(jp->shared->jobBill.options & SUB_INTERACTIVE)
         && (qp->qAttrib & Q_ATTRIB_ONLY_INTERACTIVE))
-        return (LSBE_ONLY_INTERACTIVE);
+        return LSBE_ONLY_INTERACTIVE;
 
 
     if (auth->uid != 0  && !isAuthManager(auth)
         && !requestByClusterAdmin( )
         && !userQMember (jp->userName, qp))
-        return (LSBE_QUEUE_USE);
+        return LSBE_QUEUE_USE;
 
     if (qp->procLimit > 0
         && jp->shared->jobBill.numProcessors > qp->procLimit)
-        return (LSBE_PROC_NUM);
+        return LSBE_PROC_NUM;
     if (qp->minProcLimit > 0
         && jp->shared->jobBill.maxNumProcessors < qp->minProcLimit)
-        return (LSBE_PROC_LESS);
+        return LSBE_PROC_LESS;
     if (qp->maxJobs != INFINIT_INT
         && jp->shared->jobBill.numProcessors > qp->maxJobs)
-        return (LSBE_PROC_NUM);
+        return LSBE_PROC_NUM;
 
     for (j = 0; j < LSF_RLIM_NLIMITS; j++) {
         if (jp->shared->jobBill.rLimits[j] >= 0 &&  qp->rLimits[j] >= 0
             && jp->shared->jobBill.rLimits[j] > qp->rLimits[j]) {
             *errReqIndx = j;
-            return (LSBE_OVER_LIMIT);
+            return LSBE_OVER_LIMIT;
         }
     }
 
@@ -768,7 +806,7 @@ acceptJob(struct qData *qp,
             ls_syslog(LOG_DEBUG3,"acceptJob Host %s IS NOT member queue=%s",
                       jp->askedPtr[j].hData->host, qp->queue);
 
-            return (LSBE_QUEUE_HOST);
+            return LSBE_QUEUE_HOST;
 
         }
 
@@ -788,24 +826,25 @@ acceptJob(struct qData *qp,
                 ls_syslog(LOG_DEBUG3,"acceptJob: Host %s IS NOT member",
                           jp->hPtr[j]->host);
 
-                return (LSBE_QUEUE_HOST);
+                return LSBE_QUEUE_HOST;
             }
 
             ls_syslog(LOG_DEBUG3,"acceptJob: Host %s IS member",
                       jp->hPtr[j]->host);
-
         }
     }
 
     if (jp->shared->resValPtr && qp->resValPtr)
-        if (rUsagesOk (jp->shared->resValPtr, qp->resValPtr) == FALSE)
-            return (LSBE_BAD_RESREQ);
+        if (rUsagesOk(jp->shared->resValPtr, qp->resValPtr) == false)
+            return LSBE_BAD_RESREQ;
 
-    return (LSBE_NO_ERROR);
+    return LSBE_NO_ERROR;
 }
 
+/* getCpuLimit()
+ */
 static int
-getCpuLimit (struct jData *job, struct submitReq *subReq)
+getCpuLimit(struct jData *job, struct submitReq *subReq)
 {
     float *cpuFactor, cpuLimit, runLimit;
     char  *spec;
@@ -814,7 +853,7 @@ getCpuLimit (struct jData *job, struct submitReq *subReq)
     runLimit = subReq->rLimits[LSF_RLIMIT_RUN];
 
     if (cpuLimit <= 0 && runLimit <= 0)
-        return (LSBE_NO_ERROR);
+        return LSBE_NO_ERROR;
 
     if (subReq->options & SUB_HOST_SPEC)
         spec = subReq->hostSpec;
@@ -827,14 +866,14 @@ getCpuLimit (struct jData *job, struct submitReq *subReq)
 
     if ((cpuFactor = getModelFactor (spec)) == NULL)
         if ((cpuFactor = getHostFactor (spec)) == NULL)
-            return (LSBE_BAD_HOST_SPEC);
+            return LSBE_BAD_HOST_SPEC;
 
     if (cpuLimit > 0) {
         if (*cpuFactor <= 0) {
-            return (LSBE_BAD_LIMIT);
+            return LSBE_BAD_LIMIT;
         }
         if (cpuLimit > (INFINIT_INT /(*cpuFactor))) {
-            return (LSBE_BAD_LIMIT);
+            return LSBE_BAD_LIMIT;
         }
 
         if ((cpuLimit *= *cpuFactor) < 1)
@@ -845,14 +884,24 @@ getCpuLimit (struct jData *job, struct submitReq *subReq)
         subReq->rLimits[LSF_RLIMIT_CPU] = cpuLimit;
         job->shared->jobBill.rLimits[LSF_RLIMIT_CPU] = cpuLimit;
     }
+
     if (runLimit > 0) {
-        if (*cpuFactor <= 0) {
-            return (LSBE_BAD_LIMIT);
+        /* Save the absolute, unscaled run limit
+         */
+        job->abs_run_limit = job->shared->jobBill.rLimits[LSF_RLIMIT_RUN];
+        /* If we are not supposed to scale the run limit
+         * the just return.
+         */
+        if (mbdParams->run_abs_limit == true) {
+            return LSBE_NO_ERROR;
         }
 
+        if (*cpuFactor <= 0) {
+            return LSBE_BAD_LIMIT;
+        }
 
         if (runLimit > (INFINIT_INT /(*cpuFactor))) {
-            return (LSBE_BAD_LIMIT);
+            return LSBE_BAD_LIMIT;
         }
         if ((runLimit *= *cpuFactor) < 1)
             runLimit = 1;
@@ -863,13 +912,12 @@ getCpuLimit (struct jData *job, struct submitReq *subReq)
     }
 
     if (!(subReq->options & SUB_HOST_SPEC)) {
-
-        FREEUP (subReq->hostSpec);
-        subReq->hostSpec = (char *) my_malloc (MAXHOSTNAMELEN, "getCpuLimit");
-        strcpy (subReq->hostSpec, spec);
+        FREEUP(subReq->hostSpec);
+        subReq->hostSpec = my_malloc (MAXHOSTNAMELEN, "getCpuLimit");
+        strcpy(subReq->hostSpec, spec);
         subReq->options |= SUB_HOST_SPEC;
     }
-    return (LSBE_NO_ERROR);
+    return LSBE_NO_ERROR;
 
 }
 
@@ -885,14 +933,14 @@ freeNewJob (struct jData *newjob)
 }
 
 int
-selectJobs (struct jobInfoReq *jobInfoReq, struct jData ***jobDataList,
-            int *listSize)
+selectJobs(struct jobInfoReq *jobInfoReq,
+           struct jData ***jobDataList,
+           int *listSize)
 {
-    static char fname[] = "selectJobs()";
-    char allqueues = FALSE;
-    char allusers = FALSE;
-    char allhosts = FALSE;
-    char searchJobName = FALSE;
+    char allqueues = false;
+    char allusers = false;
+    char allhosts = false;
+    char searchJobName = false;
     struct jData *jpbw, **joblist = NULL, *recentJob = NULL;
     struct gData *uGrp = NULL;
     int  list = 0;
@@ -901,17 +949,17 @@ selectJobs (struct jobInfoReq *jobInfoReq, struct jData ***jobDataList,
     struct  uData *uPtr;
 
     if (jobInfoReq->queue[0] == '\0')
-        allqueues = TRUE;
+        allqueues = true;
     if (strcmp(jobInfoReq->userName, ALL_USERS) == 0)
-        allusers = TRUE;
+        allusers = true;
     else
         uGrp = getUGrpData (jobInfoReq->userName);
 
     if (jobInfoReq->host[0] == '\0')
-        allhosts = TRUE;
+        allhosts = true;
     if (jobInfoReq->jobName[0] != '\0' &&
         jobInfoReq->jobName[strlen(jobInfoReq->jobName) - 1] == '*') {
-        searchJobName = TRUE;
+        searchJobName = true;
         jobInfoReq->jobName[strlen(jobInfoReq->jobName) - 1] = '\0';
     }
 
@@ -921,11 +969,8 @@ selectJobs (struct jobInfoReq *jobInfoReq, struct jData ***jobDataList,
 
     for (list = 0; list < NJLIST; list++) {
         struct jData *jp;
-        if (skipJobListByReq (jobInfoReq->options, list)  == TRUE)
+        if (skipJobListByReq(jobInfoReq->options, list)  == true)
             continue;
-
-        if (list == SJL && jDataList[list]->back != jDataList[list])
-            reorderSJL ();
 
         for (jp = jDataList[list]->back;
              (jp!= jDataList[list]); jp = jp->back) {
@@ -952,9 +997,9 @@ selectJobs (struct jobInfoReq *jobInfoReq, struct jData ***jobDataList,
             if (jobInfoReq->jobName[0] != '\0') {
                 char  fullName[MAXPATHLEN];
                 fullJobName_r(jpbw, fullName);
-                if ((searchJobName == FALSE &&
+                if ((searchJobName == false &&
                      strcmp(jobInfoReq->jobName, fullName) != 0) ||
-                    (searchJobName == TRUE &&
+                    (searchJobName == true &&
                      strncmp(fullName, jobInfoReq->jobName,
                              strlen (jobInfoReq->jobName)) != 0))
                     continue;
@@ -971,16 +1016,14 @@ selectJobs (struct jobInfoReq *jobInfoReq, struct jData ***jobDataList,
                 continue;
             }
 
-            {
-                if (jpbw->jStatus & JOB_STAT_PEND) {
-                    if (!(jpbw->qPtr->qStatus & QUEUE_STAT_RUN))
-                        jpbw->newReason = PEND_QUE_WINDOW;
-                    if (!(jpbw->qPtr->qStatus & QUEUE_STAT_ACTIVE))
-                        jpbw->newReason = PEND_QUE_INACT;
-                }
-                else if (jpbw->jStatus & JOB_STAT_ZOMBIE)
-                    jpbw->newReason |= EXIT_ZOMBIE;
-            }
+            if (jpbw->jStatus & JOB_STAT_PEND) {
+                if (!(jpbw->qPtr->qStatus & QUEUE_STAT_RUN))
+                    jpbw->newReason = PEND_QUE_WINDOW;
+                if (!(jpbw->qPtr->qStatus & QUEUE_STAT_ACTIVE))
+                    jpbw->newReason = PEND_QUE_INACT;
+            } else if (jpbw->jStatus & JOB_STAT_ZOMBIE)
+                jpbw->newReason |= EXIT_ZOMBIE;
+
 
             if (! matchJobStatus(jobInfoReq->options, jpbw)) {
                 continue;
@@ -995,13 +1038,12 @@ selectJobs (struct jobInfoReq *jobInfoReq, struct jData ***jobDataList,
 
                 if (jpbw->hPtr == NULL) {
                     if (!(jpbw->jStatus & JOB_STAT_EXIT))
-                        ls_syslog(LOG_ERR, _i18n_msg_get(ls_catd , NL_SETN, 6510,
-                                                         "%s: Execution host for job <%s> is null"), /* catgets 6510 */
-                                  fname, lsb_jobid2str(jpbw->jobId));
+                        ls_syslog(LOG_ERR, "\
+%s: Execution host for job %s is null", __func__, lsb_jobid2str(jpbw->jobId));
                     continue;
                 }
 
-                gp = getHGrpData (jobInfoReq->host);
+                gp = getHGrpData(jobInfoReq->host);
                 if (gp != NULL) {
                     for (i = 0; i < jpbw->numHostPtr; i++) {
                         if (jpbw->hPtr[i] == NULL)
@@ -1024,7 +1066,7 @@ selectJobs (struct jobInfoReq *jobInfoReq, struct jData ***jobDataList,
             }
 
 
-            if (findLastJob(jobInfoReq->options, jpbw, &recentJob) == FALSE)
+            if (findLastJob(jobInfoReq->options, jpbw, &recentJob) == false)
                 continue;
 
             if (arraysize == 0) {
@@ -1073,74 +1115,21 @@ static int
 skipJobListByReq (int options, int joblist)
 {
     if (options & (ALL_JOB|JOBID_ONLY_ALL)) {
-        return FALSE;
+        return false;
     } else if ((options & (CUR_JOB | LAST_JOB))
                && (joblist == SJL || joblist == PJL || joblist == MJL)) {
-        return FALSE;
+        return false;
     } else if ((options & PEND_JOB) && (joblist == PJL || joblist == MJL)) {
-        return FALSE;
+        return false;
     } else if ((options & (SUSP_JOB | RUN_JOB)) && (joblist == SJL)) {
-        return FALSE;
+        return false;
     } else if ((options & DONE_JOB) && joblist == FJL) {
-        return FALSE;
+        return false;
     } else if ((options & ZOMBIE_JOB) && (joblist == FJL)) {
-        return FALSE;
+        return false;
     }
 
     return true;
-
-}
-
-void
-reorderSJL (void)
-{
-    struct jData *tmpSJL, *jp, *next;
-
-
-    tmpSJL = (struct jData *)
-        tmpListHeader ((struct listEntry *) jDataList[SJL]);
-
-
-    for (jp = tmpSJL->back; jp != tmpSJL; jp = next) {
-        next = jp->back;
-        reorderSJL1 (jp);
-    }
-}
-
-static void
-reorderSJL1 (struct jData *job)
-{
-    struct jData *jp;
-    int found = FALSE;
-
-    for (jp = jDataList[SJL]->forw; jp != jDataList[SJL]; jp = jp->forw) {
-        if (!equalHost_(jp->hPtr[0]->host, job->hPtr[0]->host)) {
-            if (found == TRUE)
-                break;
-            continue;
-        }
-        found = TRUE;
-        if (job->qPtr->priority < jp->qPtr->priority)
-            break;
-        else if (job->qPtr->priority == jp->qPtr->priority) {
-            if (job->startTime > jp->startTime)
-                break;
-            else if ((job->startTime == jp->startTime || job->startTime == 0)
-                     && (job->jobId > jp->jobId))
-                break;
-        }
-    }
-
-
-
-    offList((struct listEntry *)job);
-
-    if (found) {
-        inList ((struct listEntry *)jp, (struct listEntry *)job);
-    } else {
-        inList ((struct listEntry *)jDataList[SJL]->forw,
-                (struct listEntry *)job);
-    }
 
 }
 
@@ -1148,24 +1137,24 @@ static int
 matchJobStatus(int options, struct jData *jobPtr)
 {
     if (options & (ALL_JOB|JOBID_ONLY_ALL))
-        return TRUE;
+        return true;
 
     if (((options & CUR_JOB) || (options & LAST_JOB))
         && !(IS_FINISH (jobPtr->jStatus)))
-        return TRUE;
+        return true;
     if ((options & DONE_JOB) && IS_FINISH (jobPtr->jStatus))
-        return TRUE;
+        return true;
     if ((options & PEND_JOB) && IS_PEND (jobPtr->jStatus))
-        return TRUE;
+        return true;
     if ((options & SUSP_JOB) && IS_SUSP (jobPtr->jStatus)
         && !(jobPtr->jStatus & JOB_STAT_UNKWN))
-        return TRUE;
+        return true;
     if ((options & RUN_JOB) && (jobPtr->jStatus & JOB_STAT_RUN))
-        return TRUE;
+        return true;
     if ((options & ZOMBIE_JOB) && (jobPtr->jStatus & JOB_STAT_ZOMBIE)) {
-        return TRUE;
+        return true;
     }
-    return FALSE;
+    return false;
 
 }
 
@@ -1193,7 +1182,7 @@ findLastJob(int options, struct jData *jobPtr, struct jData **recentJob)
 
     }
     *recentJob = jobPtr;
-    return FALSE;
+    return false;
 
 }
 
@@ -1211,24 +1200,24 @@ peekJob (struct jobPeekReq *jpeekReq, struct jobPeekReply *jpeekReply,
     }
 
     if ((job = getJobData (jpeekReq->jobId)) == NULL)
-        return (LSBE_NO_JOB);
+        return LSBE_NO_JOB;
 
     if (job->nodeType != JGRP_NODE_JOB) {
-        return(LSBE_JOB_ARRAY);
+        return LSBE_JOB_ARRAY;
     }
 
 
     if (!isJobOwner(auth, job))
-        return(LSBE_PERMISSION);
+        return LSBE_PERMISSION;
 
     if (IS_FINISH (job->jStatus))
-        return (LSBE_JOB_FINISH);
+        return LSBE_JOB_FINISH;
 
     if (IS_PEND (job->jStatus))
-        return (LSBE_NOT_STARTED);
+        return LSBE_NOT_STARTED;
 
     if (job->jStatus & JOB_STAT_PRE_EXEC)
-        return (LSBE_NO_OUTPUT);
+        return LSBE_NO_OUTPUT;
 
     if (LSB_ARRAY_IDX(job->jobId))
         sprintf(jobFile, "%s.%d", job->shared->jobBill.jobFile,
@@ -1256,7 +1245,7 @@ peekJob (struct jobPeekReq *jpeekReq, struct jobPeekReply *jpeekReply,
     }
     jpeekReply->pSpoolDir = safeSave(job->jobSpoolDir);
 
-    return(LSBE_NO_ERROR);
+    return LSBE_NO_ERROR;
 }
 
 int
@@ -1267,29 +1256,29 @@ migJob (struct migReq *req, struct submitMbdReply *reply, struct lsfAuth *auth)
     int replyStatus, i, askedOthPrio;
 
     if ((job = getJobData (req->jobId)) == NULL)
-        return (LSBE_NO_JOB);
+        return LSBE_NO_JOB;
 
 
     if (job->nodeType != JGRP_NODE_JOB) {
-        return(LSBE_JOB_ARRAY);
+        return LSBE_JOB_ARRAY;
     }
 
     if ((auth->uid != 0) && !jgrpPermitOk(auth, job->jgrpNode) &&
         !isAuthQueAd (job->qPtr, auth))
-        return (LSBE_PERMISSION);
+        return LSBE_PERMISSION;
 
     if (IS_FINISH (job->jStatus))
-        return (LSBE_JOB_FINISH);
+        return LSBE_JOB_FINISH;
 
     if (IS_PEND (job->jStatus) || (job->jStatus & JOB_STAT_PRE_EXEC))
-        return (LSBE_NOT_STARTED);
+        return LSBE_NOT_STARTED;
 
 
     if (!(job->shared->jobBill.options & (SUB_CHKPNTABLE | SUB_RERUNNABLE)))
-        return (LSBE_J_UNCHKPNTABLE);
+        return LSBE_J_UNCHKPNTABLE;
 
     if (job->jStatus & JOB_STAT_MIG)
-        return (LSBE_MIGRATION);
+        return LSBE_MIGRATION;
 
     if (LSB_ARRAY_IDX(job->jobId) != 0) {
 
@@ -1306,7 +1295,7 @@ migJob (struct migReq *req, struct submitMbdReply *reply, struct lsfAuth *auth)
                                      &askedOthPrio, 1);
 
         if (replyStatus != LSBE_NO_ERROR) {
-            return (replyStatus);
+            return replyStatus;
         } else if ( realNumHosts <= 0 ) {
             return LSBE_BAD_HOST;
         }
@@ -1317,23 +1306,23 @@ migJob (struct migReq *req, struct submitMbdReply *reply, struct lsfAuth *auth)
         job->numAskedPtr = realNumHosts;
         job->askedPtr = realAskedHosts;
 
-        if ((replyStatus = acceptJob (job->qPtr, job, &reply->badReqIndx,
-                                      auth)) != LSBE_NO_ERROR) {
-            FREEUP (realAskedHosts);
+        if ((replyStatus = acceptJob(job->qPtr, job, &reply->badReqIndx,
+                                     auth)) != LSBE_NO_ERROR) {
+            FREEUP(realAskedHosts);
 
             job->numAskedPtr = saveNumAskedPtr;
             job->askedPtr = saveAskedPtr;
-            return (replyStatus);
+            return replyStatus;
         }
 
 
         if (job->shared->jobBill.numAskedHosts) {
             for (i = 0; i < job->shared->jobBill.numAskedHosts; i++)
-                FREEUP (job->shared->jobBill.askedHosts[i]);
-            FREEUP (job->shared->jobBill.askedHosts);
+                FREEUP(job->shared->jobBill.askedHosts[i]);
+            FREEUP(job->shared->jobBill.askedHosts);
         }
-        job->shared->jobBill.askedHosts = my_calloc (req->numAskedHosts,
-                                                     sizeof (char *), fname);
+        job->shared->jobBill.askedHosts = my_calloc(req->numAskedHosts,
+                                                    sizeof (char *), fname);
         for (i = 0; i < req->numAskedHosts; i++)
             job->shared->jobBill.askedHosts[i] = safeSave (req->askedHosts[i]);
         job->shared->jobBill.numAskedHosts = req->numAskedHosts;
@@ -1344,15 +1333,15 @@ migJob (struct migReq *req, struct submitMbdReply *reply, struct lsfAuth *auth)
             job->numAskedPtr = 0;
         }
         if (realNumHosts) {
-            job->askedPtr = my_calloc (realNumHosts,
-                                       sizeof(struct askedHost), fname);
+            job->askedPtr = my_calloc(realNumHosts,
+                                      sizeof(struct askedHost), fname);
             job->numAskedPtr = realNumHosts;
             for (i = 0; i < realNumHosts; i++) {
                 job->askedPtr[i].hData = realAskedHosts[i].hData;
                 job->askedPtr[i].priority = realAskedHosts[i].priority;
             }
             job->askedOthPrio = askedOthPrio;
-            FREEUP (realAskedHosts);
+            FREEUP(realAskedHosts);
         }
         job->shared->jobBill.options |= SUB_HOST;
     }
@@ -1370,11 +1359,11 @@ migJob (struct migReq *req, struct submitMbdReply *reply, struct lsfAuth *auth)
 
     job->restartPid = job->jobPid;
 
-    eventPending = TRUE;
+    eventPending = true;
     log_mig(job, auth->uid, auth->lsfUserName);
 
 
-    return (LSBE_NO_ERROR);
+    return LSBE_NO_ERROR;
 
 }
 
@@ -1449,9 +1438,9 @@ signalJob(struct signalReq *signalReq, struct lsfAuth *auth)
             }
 
             jPtr->pendEvent.sig = signalReq->sigValue;
-            eventPending = TRUE;
+            eventPending = true;
             if (signalReq->sigValue == SIG_DELETE_JOB) {
-                jPtr->pendEvent.sigDel = TRUE;
+                jPtr->pendEvent.sigDel = true;
             }
         }
 
@@ -1464,7 +1453,7 @@ signalJob(struct signalReq *signalReq, struct lsfAuth *auth)
             && signalReq->sigValue != SIG_TERM_FORCE
             && signalReq->sigValue != SIG_KILL_REQUEUE) {
             jpbw->pendEvent.sig = signalReq->sigValue;
-            eventPending = TRUE;
+            eventPending = true;
             return LSBE_OP_RETRY;
         }
     }
@@ -1487,7 +1476,7 @@ signalJob(struct signalReq *signalReq, struct lsfAuth *auth)
     }
 
     if (signalReq->sigValue == SIG_DELETE_JOB)
-        jpbw->pendEvent.sigDel = TRUE;
+        jpbw->pendEvent.sigDel = true;
 
     if (signalReq->sigValue == SIG_KILL_REQUEUE &&
         !IS_START(MASK_STATUS(jpbw->jStatus))) {
@@ -1566,7 +1555,7 @@ signalJob(struct signalReq *signalReq, struct lsfAuth *auth)
                     jpbw->chkpntPeriod = signalReq->chkPeriod;
                 jpbw->pendEvent.sig1 = jpbw->hPtr[0]->chkSig;
                 jpbw->pendEvent.sig1Flags = signalReq->actFlags;
-                eventPending = TRUE;
+                eventPending = true;
                 if (jpbw->hPtr
                     && (jpbw->hPtr[0]->hStatus & (HOST_STAT_UNREACH
                                                   | HOST_STAT_UNAVAIL)))
@@ -1614,7 +1603,7 @@ sigPFjob (struct jData *jData, int sigValue, time_t chkPeriod, int logIt)
                 else
                     jData->runCount = MAX(0, jData->runCount-1);
             }
-            return (LSBE_NO_ERROR);
+            return LSBE_NO_ERROR;
 
         case SIG_CHKPNT:
         case SIG_CHKPNT_COPY:
@@ -1622,13 +1611,11 @@ sigPFjob (struct jData *jData, int sigValue, time_t chkPeriod, int logIt)
             if (chkPeriod != LSB_CHKPERIOD_NOCHNG &&
                 chkPeriod != jData->chkpntPeriod) {
 
-
-
                 jData->chkpntPeriod = chkPeriod;
                 log_jobsigact (jData, NULL, 0);
             }
 
-            return (LSBE_NOT_STARTED);
+            return LSBE_NOT_STARTED;
 
         case SIG_SUSP_USER:
             if ((jData->jStatus & JOB_STAT_PEND)) {
@@ -1636,9 +1623,9 @@ sigPFjob (struct jData *jData, int sigValue, time_t chkPeriod, int logIt)
                 jStatusChange(jData, JOB_STAT_PSUSP, logIt, fname);
             }
             else if (IS_FINISH(jData->jStatus)) {
-                return(LSBE_JOB_FINISH);
+                return LSBE_JOB_FINISH;
             }
-            return (LSBE_NO_ERROR);
+            return LSBE_NO_ERROR;
 
         case SIG_TERM_FORCE:
             if ((zombieData = getZombieJob (jData->jobId)) != NULL) {
@@ -1654,29 +1641,29 @@ sigPFjob (struct jData *jData, int sigValue, time_t chkPeriod, int logIt)
                         jData->newReason = EXIT_REMOVE;
                     }
                 }
-                return (LSBE_NO_ERROR);
+                return LSBE_NO_ERROR;
             }
         case SIG_TERM_USER:
         case SIGTERM:
         case SIGINT:
             if (!IS_PEND(jData->jStatus))
-                return(LSBE_JOB_FINISH);
+                return LSBE_JOB_FINISH;
             jData->newReason = EXIT_NORMAL;
             jStatusChange(jData, JOB_STAT_EXIT, logIt, fname);
-            return (LSBE_NO_ERROR);
+            return LSBE_NO_ERROR;
 
         case SIG_RESUME_USER:
             if (!IS_PEND(jData->jStatus))
-                return(LSBE_JOB_FINISH);
+                return LSBE_JOB_FINISH;
             if (jData->jStatus & JOB_STAT_PSUSP) {
 
                 setJobPendReason(jData, PEND_USER_RESUME);
                 jStatusChange(jData, JOB_STAT_PEND, logIt, fname);
             }
-            return (LSBE_NO_ERROR);
+            return LSBE_NO_ERROR;
 
         default:
-            return (LSBE_NOT_STARTED);
+            return LSBE_NOT_STARTED;
     }
 
 }
@@ -1701,14 +1688,14 @@ sigStartedJob (struct jData *jData, int sigValue, time_t chkPeriod,
             jData->shared->jobBill.options &= ~(SUB_RESTART | SUB_RESTART_FORCE);
             jData->newReason &= ~( SUB_RESTART | SUB_RESTART_FORCE);
             jStatusChange(jData, JOB_STAT_EXIT, LOG_IT, fname);
-            return (ERR_NO_ERROR);
+            return ERR_NO_ERROR;
 
         } else if ((sigValue >= 0)
                    || (sigValue == SIG_RESUME_USER) || (sigValue == SIG_SUSP_USER)) {
             jData->pendEvent.sig = sigValue;
-            eventPending = TRUE;
+            eventPending = true;
         }
-        return(ERR_SIG_RETRY);
+        return ERR_SIG_RETRY;
     }
 
     if (sigValue == SIG_DELETE_JOB || sigValue == SIG_KILL_REQUEUE) {
@@ -1718,11 +1705,11 @@ sigStartedJob (struct jData *jData, int sigValue, time_t chkPeriod,
                 sigValue = SIG_TERM_USER;
         } else {
             jData->runCount = chkPeriod + 1;
-            return (ERR_NO_ERROR);
+            return ERR_NO_ERROR;
         }
     }
-    initJobSig (jData, &jobSig, sigValue, chkPeriod, actFlags);
 
+    initJobSig(jData, &jobSig, sigValue, chkPeriod, actFlags);
 
     switch (sigValue) {
         case SIG_SUSP_USER:
@@ -1736,7 +1723,7 @@ sigStartedJob (struct jData *jData, int sigValue, time_t chkPeriod,
             if (sigValue == SIG_RESUME_USER
                 && (jData->newReason & SUSP_MBD_LOCK)) {
                 if (jData->jStatus & JOB_STAT_RESERVE) {
-                    updResCounters (jData, ~JOB_STAT_RESERVE & jData->jStatus);
+                    updResCounters(jData, ~JOB_STAT_RESERVE & jData->jStatus);
                     jData->jStatus &= ~JOB_STAT_RESERVE;
                 }
                 resumeSig = SIG_RESUME_USER;
@@ -1744,18 +1731,18 @@ sigStartedJob (struct jData *jData, int sigValue, time_t chkPeriod,
                     != CANNOT_RESUME) {
 
                     if (!(jData->jStatus & JOB_STAT_RESERVE)) {
-                        updResCounters (jData,
-                                        JOB_STAT_RESERVE | jData->jStatus);
+                        updResCounters(jData,
+                                       JOB_STAT_RESERVE | jData->jStatus);
                         jData->jStatus |= JOB_STAT_RESERVE;
                     }
                     if (returnCode == RESERVE_SLOTS) {
                         jData->pendEvent.sig = sigValue;
-                        eventPending = TRUE;
-                        return (ERR_SIG_RETRY);
+                        eventPending = true;
+                        return ERR_SIG_RETRY;
 
                     } else if (returnCode == RESUME_JOB) {
 
-                        adjLsbLoad (jData, TRUE, TRUE);
+                        adjLsbLoad(jData, true, true);
                     }
                 }
             }
@@ -1773,11 +1760,10 @@ sigStartedJob (struct jData *jData, int sigValue, time_t chkPeriod,
     jobSig.reasons = jData->newReason;
     jobSig.subReasons = jData->subreasons;
 
-    reply = signal_job (jData, &jobSig, &jobReply);
+    reply = signal_job(jData, &jobSig, &jobReply);
     signalReplyCode(reply, jData, sigValue, actFlags);
 
     return reply;
-
 }
 
 
@@ -1810,23 +1796,23 @@ signalReplyCode (sbdReplyType reply, struct jData *jData, int sigValue,
                 || (sigValue == SIG_TERM_USER)
                 || (sigValue == SIG_TERM_FORCE)) {
                 jData->pendEvent.sig = sigValue;
-                eventPending = TRUE;
+                eventPending = true;
             }
             break;
         default:
 
             if ((isSigTerm(sigValue))
                 && !(jData->jStatus & JOB_STAT_ZOMBIE)
-                && (UNREACHABLE (jData->hPtr[0]->hStatus))) {
+                && (UNREACHABLE(jData->hPtr[0]->hStatus))) {
                 if (sigValue != SIG_TERM_FORCE) {
                     jData->newReason = EXIT_KILL_ZOMBIE;
                     jData->jStatus |= JOB_STAT_ZOMBIE;
-                    inZomJobList (jData, FALSE);
+                    inZomJobList(jData, false);
                 } else {
 
                     jData->newReason = EXIT_REMOVE;
                 }
-                jStatusChange (jData, JOB_STAT_EXIT, LOG_IT, fname);
+                jStatusChange(jData, JOB_STAT_EXIT, LOG_IT, fname);
             }
 
 
@@ -1836,7 +1822,7 @@ signalReplyCode (sbdReplyType reply, struct jData *jData, int sigValue,
                 || (sigValue == SIG_RESUME_USER)
                 || (sigValue == SIG_SUSP_USER)
                 || (sigValue == SIG_TERM_USER)) {
-                eventPending = TRUE;
+                eventPending = true;
                 jData->pendEvent.sig = sigValue;
             }
     }
@@ -1906,6 +1892,10 @@ jobStatusSignal(sbdReplyType reply, struct jData *jData, int sigValue,
             }
             jData->jStatus &= ~JOB_STAT_SIGNAL;
             jData->pendEvent.sig = SIG_NULL;
+            /* try to resume a job that has been preempted
+             * either by glb or by queue preemption.
+             */
+            ssusp_job(jData);
             break;
 
         case SIG_RESUME_USER:
@@ -1966,7 +1956,7 @@ jobStatusSignal(sbdReplyType reply, struct jData *jData, int sigValue,
 }
 
 int
-sbatchdJobs (struct sbdPackage *sbdPackage, struct hData *hData)
+sbatchdJobs(struct sbdPackage *sbdPackage, struct hData *hData)
 {
     static char fname[] = "sbatchdJobs";
     struct jData *jpbw, *next;
@@ -1984,20 +1974,19 @@ sbatchdJobs (struct sbdPackage *sbdPackage, struct hData *hData)
             next= jpbw->back;
 
 
-            if ( (list == FJL) &&
-                 !( (jpbw->jStatus & JOB_STAT_DONE)
-                    && !IS_POST_FINISH(jpbw->jStatus) ) ) {
+            if ((list == FJL) &&
+                 ! ((jpbw->jStatus & JOB_STAT_DONE)
+                    && !IS_POST_FINISH(jpbw->jStatus))) {
                 continue;
             }
 
-            if (!IS_START(jpbw->jStatus) &&
-                !(jpbw->jStatus & JOB_STAT_ZOMBIE) &&
-                (list != FJL) ) {
+            if (!IS_START(jpbw->jStatus)
+                && !(jpbw->jStatus & JOB_STAT_ZOMBIE)
+                && (list != FJL)) {
                 continue;
             }
             if (jpbw->hPtr == NULL || jpbw->hPtr[0] != hData)
                 continue;
-
 
             if (jpbw->jobPid == 0 && !IS_FINISH(jpbw->jStatus)) {
 
@@ -2009,15 +1998,14 @@ sbatchdJobs (struct sbdPackage *sbdPackage, struct hData *hData)
 
 
             if (num >= sbdPackage->numJobs) {
-                ls_syslog(LOG_ERR, I18N(6541,
-                                        "%s: Cannot add job<%s>, package full."), /* catgets 6541 */
-                          fname, lsb_jobid2str(jpbw->jobId));
+                ls_syslog(LOG_ERR, "\
+%s: Cannot add job<%s>, package full.", __func__, lsb_jobid2str(jpbw->jobId));
                 continue;
             }
 
             jpbw->nextSeq = 1;
             jobSpecs = &(sbdPackage->jobs[num]);
-            packJobSpecs (jpbw, jobSpecs);
+            packJobSpecs(jpbw, jobSpecs);
 
             size += sizeof(struct jobSpecs)
                 + jobSpecs->thresholds.nThresholds *
@@ -2026,6 +2014,7 @@ sbatchdJobs (struct sbdPackage *sbdPackage, struct hData *hData)
                 + strlen (jobSpecs->loginShell)
                 + strlen (jobSpecs->schedHostType)
                 + strlen (jobSpecs->execHosts)
+                + sizeof(float)
                 + 10;
 
             for (i = 0; i < jobSpecs->numToHosts; i++) {
@@ -2061,17 +2050,18 @@ sbatchdJobs (struct sbdPackage *sbdPackage, struct hData *hData)
     sbdPackage->rusageUpdateRate = rusageUpdateRate;
     sbdPackage->rusageUpdatePercent = rusageUpdatePercent;
     sbdPackage->jobTerminateInterval = jobTerminateInterval;
+    sbdPackage->affinity = hData->affinity;
     sbdPackage->nAdmins = nManagers;
-    if ((sbdPackage->admins = (char **)my_calloc(
-             nManagers, sizeof(char *), fname)) != NULL) {
+
+    if ((sbdPackage->admins = my_calloc(nManagers,
+                                        sizeof(char *), fname)) != NULL) {
         for (i = 0; i < nManagers; i++) {
             sbdPackage->admins[i] = safeSave(lsbManagers[i]);
             size += getXdrStrlen(lsbManagers[i]);
         }
     }
 
-    return (size);
-
+    return size;
 }
 
 int
@@ -2104,11 +2094,10 @@ countNumSpecs (struct hData *hData)
     }
 
     return numSpecs;
-
 }
 
 void
-packJobSpecs (struct jData *jDataPtr, struct jobSpecs *jobSpecs)
+packJobSpecs(struct jData *jDataPtr, struct jobSpecs *jobSpecs)
 {
     static char fname[] = "packJobSpecs";
     struct hData *hp = jDataPtr->hPtr[0];
@@ -2160,8 +2149,8 @@ packJobSpecs (struct jData *jDataPtr, struct jobSpecs *jobSpecs)
 
     jobSpecs->numToHosts = jDataPtr->numHostPtr;
     jobSpecs->maxNumProcessors = jDataPtr->shared->jobBill.maxNumProcessors;
-    jobSpecs->toHosts = (char **) my_calloc (jDataPtr->numHostPtr,
-                                             sizeof(char *), fname);
+    jobSpecs->toHosts = my_calloc(jDataPtr->numHostPtr,
+                                  sizeof(char *), fname);
     for (i = 0; i < jDataPtr->numHostPtr; i++)
         jobSpecs->toHosts[i] = jDataPtr->hPtr[i]->host;
 
@@ -2348,14 +2337,14 @@ packJobSpecs (struct jData *jDataPtr, struct jobSpecs *jobSpecs)
         }
     }
 
-    strcpy (jobSpecs->mailUser, jDataPtr->shared->jobBill.mailUser);
-    strcpy (jobSpecs->preExecCmd, jDataPtr->shared->jobBill.preExecCmd);
-    strcpy (jobSpecs->projectName, jDataPtr->shared->jobBill.projectName);
+    strcpy(jobSpecs->mailUser, jDataPtr->shared->jobBill.mailUser);
+    strcpy(jobSpecs->preExecCmd, jDataPtr->shared->jobBill.preExecCmd);
+    strcpy(jobSpecs->projectName, jDataPtr->shared->jobBill.projectName);
     jobSpecs->niosPort = jDataPtr->shared->jobBill.niosPort;
     jobSpecs->loginShell = jDataPtr->shared->jobBill.loginShell;
     jobSpecs->schedHostType = jDataPtr->schedHost;
 
-    strcpy (jobSpecs->clusterName, clusterName);
+    strcpy(jobSpecs->clusterName, clusterName);
 
     for(i = 0; i < LSF_RLIM_NLIMITS; i++) {
 
@@ -2378,9 +2367,10 @@ packJobSpecs (struct jData *jDataPtr, struct jobSpecs *jobSpecs)
                     if (qp->defLimits[i] > 0) {
                         rLimits2lsfLimits(qp->defLimits, jobSpecs->lsfLimits, i, 1);
                     } else {
-
-                        jobSpecs->lsfLimits[i].rlim_curl = jobSpecs->lsfLimits[i].rlim_maxl;
-                        jobSpecs->lsfLimits[i].rlim_curh = jobSpecs->lsfLimits[i].rlim_maxh;
+                        jobSpecs->lsfLimits[i].rlim_curl
+                            = jobSpecs->lsfLimits[i].rlim_maxl;
+                        jobSpecs->lsfLimits[i].rlim_curh
+                            = jobSpecs->lsfLimits[i].rlim_maxh;
                     }
                     break;
                 default:
@@ -2391,7 +2381,8 @@ packJobSpecs (struct jData *jDataPtr, struct jobSpecs *jobSpecs)
         } else {
             if (qp->rLimits[i] >= jDataPtr->shared->jobBill.rLimits[i]
                 || qp->rLimits[i] < 0) {
-                rLimits2lsfLimits(jDataPtr->shared->jobBill.rLimits, jobSpecs->lsfLimits, i, 1);
+                rLimits2lsfLimits(jDataPtr->shared->jobBill.rLimits,
+                                  jobSpecs->lsfLimits, i, 1);
             } else {
 
                 if (logclass & LC_EXEC) {
@@ -2406,20 +2397,22 @@ packJobSpecs (struct jData *jDataPtr, struct jobSpecs *jobSpecs)
         }
     }
 
-
     scaleByFactor(&jobSpecs->lsfLimits[LSF_RLIMIT_CPU].rlim_curh,
                   &jobSpecs->lsfLimits[LSF_RLIMIT_CPU].rlim_curl,
                   hp->cpuFactor);
     scaleByFactor(&jobSpecs->lsfLimits[LSF_RLIMIT_CPU].rlim_maxh,
                   &jobSpecs->lsfLimits[LSF_RLIMIT_CPU].rlim_maxl,
                   hp->cpuFactor);
-
-    scaleByFactor(&jobSpecs->lsfLimits[LSF_RLIMIT_RUN].rlim_curh,
-                  &jobSpecs->lsfLimits[LSF_RLIMIT_RUN].rlim_curl,
-                  hp->cpuFactor);
-    scaleByFactor(&jobSpecs->lsfLimits[LSF_RLIMIT_RUN].rlim_maxh,
-                  &jobSpecs->lsfLimits[LSF_RLIMIT_RUN].rlim_maxl,
-                  hp->cpuFactor);
+    /* Don't scale if run_abs_limit is true
+     */
+    if (mbdParams->run_abs_limit == false) {
+        scaleByFactor(&jobSpecs->lsfLimits[LSF_RLIMIT_RUN].rlim_curh,
+                      &jobSpecs->lsfLimits[LSF_RLIMIT_RUN].rlim_curl,
+                      hp->cpuFactor);
+        scaleByFactor(&jobSpecs->lsfLimits[LSF_RLIMIT_RUN].rlim_maxh,
+                      &jobSpecs->lsfLimits[LSF_RLIMIT_RUN].rlim_maxl,
+                      hp->cpuFactor);
+    }
 
     jobSpecs->execHosts = safeSave(jDataPtr->execHosts);
 
@@ -2443,6 +2436,7 @@ packJobSpecs (struct jData *jDataPtr, struct jobSpecs *jobSpecs)
         jobSpecs->commandSpool[0] = '\0';
     }
     jobSpecs->userPriority = jDataPtr->shared->jobBill.userPriority;
+    jobSpecs->hostShares = get_host_shares(jDataPtr->hPtr[0]->host, jDataPtr->qPtr->queue);
 }
 
 void
@@ -2492,9 +2486,9 @@ statusJob(struct statusReq *statusReq, struct hostent *hp, int *schedule)
     struct jData *jpbw;
     struct jData *jData;
     struct hData *hData;
-    char stopit = FALSE;
+    char stopit = false;
     int oldStatus;
-    int lockJob = FALSE;
+    int lockJob = false;
     char *host;
 
     if (logclass & LC_TRACE)
@@ -2503,7 +2497,7 @@ statusJob(struct statusReq *statusReq, struct hostent *hp, int *schedule)
     if ((jpbw = getJobData (statusReq->jobId)) == NULL) {
         ls_syslog(LOG_ERR, I18N_JOB_FAIL_S,
                   fname, lsb_jobid2str(statusReq->jobId), "getJobData");
-        return(LSBE_NO_JOB);
+        return LSBE_NO_JOB;
     }
 
     if (IS_PEND(jpbw->jStatus) &&
@@ -2512,20 +2506,20 @@ statusJob(struct statusReq *statusReq, struct hostent *hp, int *schedule)
 
             jpbw->jFlags &= ~JFLAG_WAIT_SWITCH;
         }
-        return (LSBE_NO_ERROR);
+        return LSBE_NO_ERROR;
     }
 
     if (hp == NULL) {
         ls_syslog(LOG_ERR, "%s: Received job %s status has no host information.",
                   __func__, lsb_jobid2str(statusReq->jobId));
-        return (LSBE_NO_JOB);
+        return LSBE_NO_JOB;
     }
 
     hData = getHostData (hp->h_name);
     if (hData == NULL) {
         ls_syslog(LOG_ERR, "\
 %s: Received job %s status update from host <%s> that is not configured as a batch server", __func__, lsb_jobid2str(statusReq->jobId), hp->h_name);
-        return (LSBE_SBATCHD);
+        return LSBE_SBATCHD;
     }
 
     hStatChange (hData, 0);
@@ -2545,7 +2539,7 @@ statusJob(struct statusReq *statusReq, struct hostent *hp, int *schedule)
                           jpbw->jStatus, statusReq->newStatus);
             }
         }
-        return (LSBE_NO_ERROR);
+        return LSBE_NO_ERROR;
     }
 
     oldStatus = jpbw->jStatus;
@@ -2560,16 +2554,16 @@ statusJob(struct statusReq *statusReq, struct hostent *hp, int *schedule)
                   statusReq->newStatus,
                   lsb_jobid2str(jpbw->jobId),
                   host);
-        return (LSBE_SBATCHD);
+        return LSBE_SBATCHD;
     }
 
     if ((statusReq->newStatus & JOB_STAT_MIG) && (statusReq->actPid == 0)) {
         ls_syslog(LOG_ERR, "\
-%s: Job <%s> is in migration status, but chkpid is 0; illegal status reported from host/cluster <%s>",
-                  fname,
+%s: Job %s is in migration status, but chkpid is 0; illegal status reported from host %s",
+                  __func__,
                   lsb_jobid2str(jpbw->jobId),
                   host);
-        return (LSBE_SBATCHD);
+        return LSBE_SBATCHD;
     }
 
     if ((statusReq->newStatus & JOB_STAT_PEND)
@@ -2586,28 +2580,43 @@ statusJob(struct statusReq *statusReq, struct hostent *hp, int *schedule)
 
                 if (jpbw->hPtr[0] == hData)
                     jStatusChange(jpbw, JOB_STAT_PEND, LOG_IT, fname);
-
             }
         }
 
-
-        if ((jData = isInZomJobList (hData, statusReq)) != NULL) {
+        if ((jData = isInZomJobList(hData, statusReq)) != NULL) {
             statusReq->newStatus = JOB_STAT_EXIT;
         } else {
-            return (LSBE_NO_ERROR);
+            return LSBE_NO_ERROR;
         }
     }
 
-
-
+    /* If the jStatus is still PEND, it means there was a communication
+     * problem in dispatch_it() and MBD assumed the job not started.
+     */
     if (IS_PEND (jpbw->jStatus) && IS_START(statusReq->newStatus)) {
-
+        /* The job is JOB_STAT_PEND and has a slot in the Zombie
+         * Job List. This Zombie job ran previously on the host
+         * which is now reporting its status.
+         *
+         * This handles the following situation:
+         *
+         * o A rerunnable job is requeued and it is in PEND status
+         * o The sbatchd of the previous execution host restarts and
+         *   is updating the mbatchd about the job status
+         * o The job's queue has a Job Configurable Control Action (JCCA)
+         *   defined.
+         *
+         * In this situation the sbatchd is reporting JOB_STAT_RUN
+         * together with the action status. We don't want to make
+         * the transition PEND ---> RUN but we want the JCCA to
+         * complete.
+         */
         if (isInZomJobList(hData, statusReq) != NULL) {
 
             if (logclass & LC_SCHED) {
                 ls_syslog(LOG_DEBUG,"\
-%s: jobId=<%s> is in Zombie State and action=%x running/done/failed",
-                          fname, lsb_jobid2str(jpbw->jobId),
+%s: jobId %s is in Zombie State and action=%x running/done/failed",
+                          __func__, lsb_jobid2str(jpbw->jobId),
                           statusReq->actStatus);
             }
 
@@ -2615,26 +2624,27 @@ statusJob(struct statusReq *statusReq, struct hostent *hp, int *schedule)
         }
 
 
-        ls_syslog (LOG_DEBUG, "%s: sbatchd on host/cluster <%s> is reporting started job <%s> that is still in PEND status;", fname, host, lsb_jobid2str(jpbw->jobId));
+        ls_syslog (LOG_DEBUG, "\
+%s: sbatchd on host %s is reporting started job %s that is still in PEND status",
+                   __func__, host, lsb_jobid2str(jpbw->jobId));
 
         if (jpbw->hPtr == NULL) {
             jpbw->numHostPtr = 1;
-            jpbw->hPtr = (struct hData **) my_malloc
-                (sizeof (struct hData *), fname);
+            jpbw->hPtr = my_calloc(1, sizeof(struct hData *), fname);
             jpbw->hPtr[0] = hData;
-            ls_syslog(LOG_DEBUG, "statusJob: Assume it is a sequential job");
         }
+
         jpbw->jobPid = statusReq->jobPid;
         jpbw->jobPGid = statusReq->jobPGid;
-        if (jpbw->shared->jobBill.options & SUB_PRE_EXEC &&
-            !(jpbw->jStatus & JOB_STAT_PRE_EXEC))
+
+        if (jpbw->shared->jobBill.options & SUB_PRE_EXEC
+            && !(jpbw->jStatus & JOB_STAT_PRE_EXEC))
             jpbw->jStatus |= JOB_STAT_PRE_EXEC;
+
         jStatusChange(jpbw, JOB_STAT_RUN, LOG_IT, fname);
         if (oldStatus & JOB_STAT_PSUSP && !IS_FINISH(statusReq->newStatus))
-            stopit = TRUE;
+            stopit = true;
     }
-
-
 
     if (IS_START(jpbw->jStatus) && IS_START(statusReq->newStatus)) {
 
@@ -2666,7 +2676,7 @@ statusJob(struct statusReq *statusReq, struct hostent *hp, int *schedule)
             jpbw->jobPGid = statusReq->jobPGid;
             log_executejob (jpbw);
             if (oldStatus == statusReq->newStatus)
-                return (LSBE_NO_ERROR);
+                return LSBE_NO_ERROR;
         }
     }
 
@@ -2710,7 +2720,7 @@ statusJob(struct statusReq *statusReq, struct hostent *hp, int *schedule)
                     jpbw->newReason = 0;
                 }
             }
-            return (LSBE_NO_ERROR);
+            return LSBE_NO_ERROR;
         }
     }
 
@@ -2719,8 +2729,10 @@ statusJob(struct statusReq *statusReq, struct hostent *hp, int *schedule)
         || (statusReq->seq < jpbw->nextSeq
             && (jpbw->nextSeq - statusReq->seq) < MAX_SEQ_NUM/2) ) {
 
-        ls_syslog(LOG_DEBUG, "%s: Obsolete status of job <%s>; status <%d> discarded", fname, lsb_jobid2str(jpbw->jobId), statusReq->newStatus);
-        return (LSBE_NO_ERROR);
+        ls_syslog(LOG_DEBUG, "%\
+s: Obsolete status of job %s; status %d discarded",
+                  __func__, lsb_jobid2str(jpbw->jobId), statusReq->newStatus);
+        return LSBE_NO_ERROR;
     }
     jpbw->nextSeq = statusReq->seq++;
     if (jpbw->nextSeq >= MAX_SEQ_NUM || (statusReq->newStatus & JOB_STAT_PEND))
@@ -2730,14 +2742,14 @@ statusJob(struct statusReq *statusReq, struct hostent *hp, int *schedule)
     if (jpbw->jStatus & (JOB_STAT_DONE | JOB_STAT_EXIT) ) {
 
         if (debug)
-            ls_syslog(LOG_ERR, _i18n_msg_get(ls_catd , NL_SETN, 6518,
-                                             "%s: Obsolete status report of job <%s> from sbatchd on host <%s>: %x-->%x, discarded"), /* catgets 6518 */
-                      fname,
+            ls_syslog(LOG_ERR, "\
+%s: Obsolete status report job %s from sbatchd on host %s: %x-->%x discarded",
+                      __func__,
                       lsb_jobid2str(jpbw->jobId),
                       host,
                       jpbw->jStatus,
                       statusReq->newStatus);
-        return (LSBE_NO_ERROR);
+        return LSBE_NO_ERROR;
     }
 
 handleJobJCCA:
@@ -2835,7 +2847,11 @@ handleJobJCCA:
                 jpbw->sigValue = SIG_NULL;
             } else {
                 if (logclass & LC_TRACE)
-                    ls_syslog (LOG_DEBUG1, "%s: Bad signal action status <%d> reported by <%s> for job <%s>", fname, statusReq->actStatus, hp? hp->h_name : jpbw->hPtr[0]->host, lsb_jobid2str(jpbw->jobId));
+                    ls_syslog (LOG_INFO, "\
+%s: Bad signal action status %d reported by %s for job %s", __func__,
+                               statusReq->actStatus,
+                               hp ? hp->h_name : jpbw->hPtr[0]->host,
+                               lsb_jobid2str(jpbw->jobId));
             }
         }
 
@@ -2846,14 +2862,14 @@ handleJobJCCA:
             IS_START(statusReq->newStatus)) {
 
             if (logclass & LC_SCHED) {
-                ls_syslog(LOG_DEBUG,"\
-%s: jobId/status=<%s/%x> is PEND and has ZJL image, sbatchd is now running JCCA(%d) newStatus=%x no status update has to be performed until the action ends",
-                          fname, lsb_jobid2str(jpbw->jobId),
+                ls_syslog(LOG_INFO,"\
+%s: jobId/status %s/%x is PEND and has ZJL image, sbatchd is now running JCCA %d newStatus %x no status update has to be performed until the action ends",
+                          __func__, lsb_jobid2str(jpbw->jobId),
                           jpbw->jStatus, statusReq->actStatus,
                           statusReq->newStatus);
             }
 
-            return(LSBE_NO_ERROR);
+            return LSBE_NO_ERROR;
         }
 
     }
@@ -2868,8 +2884,8 @@ handleJobJCCA:
         if (! (statusReq->reason & SUSP_MBD_LOCK)
             && !(jpbw->newReason & SUSP_MBD_LOCK)) {
 
-            if ((lockJob = shouldLockJob (jpbw,
-                                          statusReq->newStatus)) == TRUE) {
+            if ((lockJob = shouldLockJob(jpbw,
+                                         statusReq->newStatus)) == true) {
                 jpbw->newReason = statusReq->reason | SUSP_MBD_LOCK;
                 jpbw->subreasons = statusReq->subreasons;
             } else {
@@ -2899,18 +2915,18 @@ handleJobJCCA:
         && !((jpbw->jStatus & JOB_STAT_PRE_EXEC)
              && IS_RUN_JOB_CMD(statusReq->newStatus))) {
         if (jpbw->newReason & SUSP_MBD_LOCK)
-            return(LSBE_LOCK_JOB);
+            return LSBE_LOCK_JOB;
         else {
-            return(LSBE_NO_ERROR);
+            return LSBE_NO_ERROR;
         }
     }
 
     if (statusReq->newStatus & JOB_STAT_PEND) {
         if (IS_START(jpbw->jStatus)) {
             if (!jpbw->lsfRusage) {
-                jpbw->lsfRusage = my_malloc (sizeof(struct lsfRusage),
-                                             fname);
-                cleanLsfRusage (jpbw->lsfRusage);
+                jpbw->lsfRusage = my_calloc(1, sizeof(struct lsfRusage),
+                                           __func__);
+                cleanLsfRusage(jpbw->lsfRusage);
             }
             accumulateRU(jpbw, statusReq);
         }
@@ -2933,7 +2949,7 @@ handleJobJCCA:
             jpbw->newReason = PEND_JOB_MIG;
 
         } else if (jpbw->jStatus & JOB_STAT_PSUSP) {
-            return (LSBE_NO_ERROR);
+            return LSBE_NO_ERROR;
         } else {
 
             jpbw->newReason = statusReq->reason;
@@ -3058,15 +3074,15 @@ handleJobJCCA:
             jpbw->execUsername = NULL;
         }
 
-        log_startjob(jpbw, FALSE);
+        log_startjob(jpbw, false);
     }
 
     if (stopit)
-        return (LSBE_STOP_JOB);
+        return LSBE_STOP_JOB;
     if (jpbw->newReason & SUSP_MBD_LOCK)
-        return(LSBE_LOCK_JOB);
+        return LSBE_LOCK_JOB;
     else
-        return(LSBE_NO_ERROR);
+        return LSBE_NO_ERROR;
 
 }
 
@@ -3076,14 +3092,14 @@ ususpPendingEvent(struct jData *jpbw)
     struct sbdNode *sbdPtr, *nextSbdPtr;
 
     if (jpbw->pendEvent.sig == SIG_SUSP_USER)
-        return TRUE;
+        return true;
 
     for (sbdPtr = sbdNodeList.forw; sbdPtr != &sbdNodeList;
          sbdPtr = nextSbdPtr) {
         nextSbdPtr = sbdPtr->forw;
         if (sbdPtr->jData == jpbw && sbdPtr->reqCode == MBD_SIG_JOB &&
             sbdPtr->sigVal == SIG_SUSP_USER)
-            return TRUE;
+            return true;
     }
 
     return false;
@@ -3096,17 +3112,17 @@ terminatePendingEvent(struct jData *jpbw)
     struct sbdNode *sbdPtr, *nextSbdPtr;
 
     if (isSigTerm(jpbw->pendEvent.sig))
-        return TRUE;
+        return true;
 
     for (sbdPtr = sbdNodeList.forw; sbdPtr != &sbdNodeList;
          sbdPtr = nextSbdPtr) {
         nextSbdPtr = sbdPtr->forw;
         if (sbdPtr->jData == jpbw && sbdPtr->reqCode == MBD_SIG_JOB &&
             isSigTerm(sbdPtr->sigVal))
-            return TRUE;
+            return true;
     }
 
-    return FALSE;
+    return false;
 }
 
 int
@@ -3148,12 +3164,18 @@ jStatusChange(struct jData *jData,
               const char *fname)
 {
     int oldStatus = jData->jStatus;
-    int freeExec = FALSE;
+    int freeExec = false;
     time_t  now = time(NULL);
 
     if (MASK_STATUS (newStatus & ~JOB_STAT_UNKWN)
         == MASK_STATUS (oldStatus & ~JOB_STAT_UNKWN))
         return;
+
+    if (logclass & (LC_TRACE |LC_PREEMPT)) {
+        ls_syslog(LOG_INFO, "\
+%s: job %s oldStatus 0x%x newStatus 0x%x", __func__, lsb_jobid2str(jData->jobId),
+                  jData->jStatus, newStatus);
+    }
 
     newStatus = MASK_STATUS(newStatus);
     if (eventTime == LOG_IT && (jData->jStatus & JOB_STAT_RESERVE))
@@ -3197,9 +3219,9 @@ jStatusChange(struct jData *jData,
         jData->reserveTime = 0;
         if (eventTime == LOG_IT) {
             if ((jData->jStatus & JOB_STAT_PRE_EXEC))
-                log_startjob(jData, TRUE);
+                log_startjob(jData, true);
             else
-                log_startjob(jData, FALSE);
+                log_startjob(jData, false);
         }
         jData->jStatus &= ~JOB_STAT_MIG;
         offJobList(jData, PJLorMJL(jData));
@@ -3207,6 +3229,11 @@ jStatusChange(struct jData *jData,
 
     } else if (IS_FINISH (newStatus)) {
         int i;
+        /* Count the finished job between scheduling sessions
+         */
+        if (num_finish > INFINIT_INT - 1)
+            num_finish = 0;
+        ++num_finish;
 
         if (!(jData->jStatus & JOB_STAT_ZOMBIE)) {
             if (jData->newReason != EXIT_INIT_ENVIRON &&
@@ -3262,7 +3289,7 @@ jStatusChange(struct jData *jData,
             if (jData->shared->jobBill.options & SUB_CHKPNTABLE)
                 jData->shared->jobBill.options |= SUB_RESTART | SUB_RESTART_FORCE;
 
-            if (glMigToPendFlag == TRUE) {
+            if (glMigToPendFlag == true) {
                 inPendJobList(jData, PJL, now);
                 jData->jStatus &= ~JOB_STAT_MIG;
             } else {
@@ -3277,7 +3304,7 @@ jStatusChange(struct jData *jData,
         }
         jData->jStatus &= ~JOB_STAT_PRE_EXEC;
         setJobPendReason(jData, jData->newReason);
-        freeExec = TRUE;
+        freeExec = true;
 
     } else {
 
@@ -3289,16 +3316,20 @@ jStatusChange(struct jData *jData,
             jData->subreasons = 0;
             jData->reserveTime = 0;
             jData->jFlags &= ~JFLAG_SEND_SIG;
+            /* If the job is starting or re-starting clean the
+             * eventual preempted_by.
+             */
+            jData->preempted_by = 0;
         }
     }
 
 
     if (mSchedStage != M_STAGE_REPLAY) {
-        updCounters (jData, oldStatus, eventTime);
+        updCounters(jData, oldStatus, eventTime);
     } else {
 
         if (eventTime == LOG_IT) {
-            updCounters (jData, oldStatus, eventTime);
+            updCounters(jData, oldStatus, eventTime);
         } else if (oldStatus & JOB_STAT_RUN
                    && oldStatus & JOB_STAT_WAIT
                    && newStatus & (JOB_STAT_SSUSP | JOB_STAT_USUSP)) {
@@ -3314,8 +3345,8 @@ jStatusChange(struct jData *jData,
         }
     }
 
-    if (freeExec == TRUE) {
-        freeExecParams (jData);
+    if (freeExec == true) {
+        freeExecParams(jData);
     }
 }
 
@@ -3340,33 +3371,17 @@ cleanSbdNode(struct jData *jpbw)
 static void
 updateStopJobPreemptResources(struct jData *jp)
 {
-    int resn;
 
-    if (MARKED_WILL_BE_PREEMPTED(jp)) {
-        jp->jFlags &= ~JFLAG_WILL_BE_PREEMPTED;
-        return;
-    }
-
-    FORALL_PRMPT_RSRCS(resn) {
-        int hostn;
-        float val;
-        GET_RES_RSRC_USAGE(resn, val, jp->shared->resValPtr,
-                           jp->qPtr->resValPtr);
-        if (val <= 0.0)
-            continue;
-
-        for (hostn = 0;
-             hostn == 0 || (slotResourceReserve && hostn < jp->numHostPtr);
-             hostn++) {
-            addAvailableByPreemptPRHQValue(resn, val, jp->hPtr[hostn], jp->qPtr);
-        }
-    } ENDFORALL_PRMPT_RSRCS;
-
-    return;
 }
 
+/* resetReserve()
+ *
+ *  Get rid of slots reservation for a started job. When a job has
+ *  reserved slots and the job's new status is RUN, DONE, EXIT or
+ *  PSUSUP, reserved slots should be removed.
+ */
 static void
-resetReserve (struct jData *jData, int newStatus)
+resetReserve(struct jData *jData, int newStatus)
 {
     if (!(jData->jStatus & JOB_STAT_RESERVE))
         return;
@@ -3374,10 +3389,9 @@ resetReserve (struct jData *jData, int newStatus)
     if (((newStatus & JOB_STAT_PSUSP) || IS_FINISH(newStatus))
         && (jData->jStatus & JOB_STAT_PEND)) {
 
-
-
         if (logclass & LC_TRACE )
-            ls_syslog(LOG_DEBUG3, "resetReserve: job <%s> freeing <%d> reserved slots <%s:%d>",
+            ls_syslog(LOG_INFO, "\
+%s: job %s freeing %d reserved slots %s:%d", __func__,
                       lsb_jobid2str(jData->jobId),
                       jData->numHostPtr, __FILE__,__LINE__);
         freeReserveSlots(jData);
@@ -3387,12 +3401,14 @@ resetReserve (struct jData *jData, int newStatus)
     if (IS_START(jData->jStatus) &&
         ((newStatus & JOB_STAT_RUN) || IS_FINISH(newStatus) ||
          (newStatus & JOB_STAT_USUSP) || (newStatus & JOB_STAT_PEND))) {
+
         if (logclass & (LC_TRACE| LC_SCHED ))
-            ls_syslog(LOG_DEBUG3, "resetReserve: job <%s> updRes - <%d> slots <%s:%d>",
+            ls_syslog(LOG_INFO, "\
+%s: job %s updRes - %d slots %s:%d", __func__,
                       lsb_jobid2str(jData->jobId), jData->numHostPtr,
                       __FILE__,  __LINE__);
 
-        updResCounters (jData, ~JOB_STAT_RESERVE  & jData->jStatus);
+        updResCounters(jData, ~JOB_STAT_RESERVE  & jData->jStatus);
         jData->jStatus &= ~JOB_STAT_RESERVE;
     }
 
@@ -3416,8 +3432,8 @@ handleFinishJob(struct jData *jData, int oldStatus, int eventTime)
     jData->pendEvent.sig1 = SIG_NULL;
     jData->pendEvent.sig = SIG_NULL;
     jData->pendEvent.sigDel = 0;
-    jData->pendEvent.notSwitched = FALSE;
-    jData->pendEvent.notModified = FALSE;
+    jData->pendEvent.notSwitched = false;
+    jData->pendEvent.notModified = false;
 
     if (IS_START(oldStatus)) {
         listno = SJL;
@@ -3507,10 +3523,28 @@ handleRequeueJob(struct jData *jData, time_t requeueTime)
     if (mSchedStage != M_STAGE_REPLAY) {
         if (!jData->uPtr)
             jData->uPtr = getUserData(jData->userName);
+
+        if (!jData->pqPtr)
+            jData->pqPtr = getLimitUsageData(LIMIT_CONSUMER_PER_PROJECT,
+                                             jData->shared->jobBill.projectName,
+                                             jData->qPtr->queue);
+        if (!jData->uqPtr)
+            jData->uqPtr = getLimitUsageData(LIMIT_CONSUMER_PER_USER,
+                                             jData->userName,
+                                             jData->qPtr->queue);
+
+        if (!jData->hqPtr && jData->numHostPtr > 0)
+            jData->hqPtr = getLimitUsageData(LIMIT_CONSUMER_PER_HOST,
+                                             jData->hPtr[0]->host,
+                                             jData->qPtr->queue);
+
         updQaccount(jData, jData->shared->jobBill.maxNumProcessors,
                     jData->shared->jobBill.maxNumProcessors, 0, 0, 0, 0);
         updUserData(jData, jData->shared->jobBill.maxNumProcessors,
                     jData->shared->jobBill.maxNumProcessors, 0, 0, 0, 0);
+        updLimitSlotData(jData, jData->shared->jobBill.maxNumProcessors,
+                         jData->shared->jobBill.maxNumProcessors, 0, 0, 0, 0);
+        updLimitJobData(jData, 1, 1, 0, 0, 0, 0);
     }
 
     if (jData->jFlags & JFLAG_HAS_BEEN_REQUEUED)
@@ -3522,7 +3556,6 @@ handleRequeueJob(struct jData *jData, time_t requeueTime)
 static void
 changeJobParams(struct jData *jData)
 {
-    static char fname[]="changeJobParams";
     struct submitReq *oldSub = NULL;
     struct qData *qPtr;
     int errcode, jFlags;
@@ -3536,42 +3569,44 @@ changeJobParams(struct jData *jData)
 
         jData->jStatus |= JOB_STAT_MODIFY_ONCE;
 
-        oldSub = saveOldParameters (jData);
+        oldSub = saveOldParameters(jData);
     } else {
 
         jData->jStatus &= ~JOB_STAT_MODIFY_ONCE;
     }
 
     freeSubmitReq (&jData->shared->jobBill);
-    copyJobBill (jData->newSub, &jData->shared->jobBill, FALSE);
-    freeSubmitReq (jData->newSub);
-    FREEUP (jData->newSub);
+    copyJobBill(jData->newSub, &jData->shared->jobBill, false);
+    freeSubmitReq(jData->newSub);
+    FREEUP(jData->newSub);
 
 
     if (jData->shared->jobBill.options & SUB_HOST) {
-        returnErr = chkAskedHosts (jData->shared->jobBill.numAskedHosts,
-                                   jData->shared->jobBill.askedHosts,
-                                   jData->shared->jobBill.numProcessors,
-                                   &numAskedHosts,
-                                   &askedHosts, &badReqIndx,
-                                   &askedOthPrio, 1);
+
+        returnErr = chkAskedHosts(jData->shared->jobBill.numAskedHosts,
+                                  jData->shared->jobBill.askedHosts,
+                                  jData->shared->jobBill.numProcessors,
+                                  &numAskedHosts,
+                                  &askedHosts, &badReqIndx,
+                                  &askedOthPrio, 1);
         if (returnErr != LSBE_NO_ERROR)
             return;
+
         if (numAskedHosts) {
             if (jData->askedPtr)
                 FREEUP(jData->askedPtr);
-            jData->askedPtr = (struct askedHost *) my_calloc (numAskedHosts,
-                                                              sizeof(struct askedHost), fname);
+            jData->askedPtr = my_calloc(numAskedHosts,
+                                        sizeof(struct askedHost),
+                                        __func__);
             for (i = 0; i < numAskedHosts; i++) {
                 jData->askedPtr[i].hData = askedHosts[i].hData;
                 jData->askedPtr[i].priority = askedHosts[i].priority;
             }
             jData->numAskedPtr = numAskedHosts;
             jData->askedOthPrio = askedOthPrio;
-            FREEUP (askedHosts);
+            FREEUP(askedHosts);
         }
-    }
-    else {
+    } else {
         FREEUP(jData->askedPtr);
         jData->numAskedPtr = 0;
         jData->askedOthPrio = 0;
@@ -3582,26 +3617,26 @@ changeJobParams(struct jData *jData)
     }
 
     lsbFreeResVal (&jData->shared->resValPtr);
-    if (jData->shared->jobBill.resReq && jData->shared->jobBill.resReq[0] != '\0') {
-        int useLocal = TRUE;
+    if (jData->shared->jobBill.resReq && jData->shared->jobBill.resReq[0] != 0) {
+        int useLocal = true;
         if (jData->numAskedPtr > 0 || jData->askedOthPrio >= 0)
-            useLocal = FALSE;
+            useLocal = false;
 
         useLocal = useLocal ? USE_LOCAL : 0;
-        if ((jData->shared->resValPtr = checkResReq (jData->shared->jobBill.resReq, useLocal| CHK_TCL_SYNTAX | PARSE_XOR)) == NULL)
+        if ((jData->shared->resValPtr
+             = checkResReq(jData->shared->jobBill.resReq,
+                           useLocal| CHK_TCL_SYNTAX | PARSE_XOR)) == NULL)
 
-            ls_syslog(LOG_ERR, _i18n_msg_get(ls_catd , NL_SETN, 6522,
-                                             "%s:Bad modified resource requirement<%s> for job<%s>"), /* catgets 6522 */
-                      fname,
+            ls_syslog(LOG_ERR, "\
+%s:Bad modified resource requirement %s for job %s", __func__,
                       jData->shared->jobBill.resReq,
                       lsb_jobid2str(jData->jobId));
     }
     auth.uid = jData->userId;
-    strcpy (auth.lsfUserName, jData->userName);
+    strcpy(auth.lsfUserName, jData->userName);
 
     jFlags = 0;
-    if (strcmp (jData->shared->jobBill.dependCond, "") != 0) {
-
+    if (strcmp(jData->shared->jobBill.dependCond, "") != 0) {
 
         setIdxListContext((*(*jData).shared).jobBill.jobName);
 
@@ -3640,7 +3675,6 @@ freeExecParams(struct jData *jData)
     FREEUP(jData->execHome);
     FREEUP(jData->queuePreCmd);
     FREEUP(jData->queuePostCmd);
-
 
     if (jData->execCwd != NULL
         && jData->hPtr != NULL) {
@@ -3687,7 +3721,7 @@ clean(time_t curTime)
          jPtr = nextJobPtr) {
 
         nextJobPtr = jPtr->back;
-        found = FALSE;
+        found = false;
 
         if (jPtr->jStatus & JOB_STAT_DONE) {
             if (!IS_POST_FINISH(jPtr->jStatus)) {
@@ -3713,10 +3747,10 @@ clean(time_t curTime)
                  sbdPtr = sbdPtr->forw) {
                 if (sbdPtr->jData != jPtr)
                     continue;
-                found = TRUE;
+                found = true;
                 break;
             }
-            if (found == TRUE)
+            if (found == true)
                 continue;
         }
 
@@ -3767,7 +3801,7 @@ job_abort(struct jData *jData, char reason)
                                 "User not recognizable"); /* catgets 1504 */
     else if (reason == MISS_DEADLINE) {
         char lmsg[1024], *timebuf;
-        int runLimit, isRunLimit = TRUE;
+        int runLimit, isRunLimit = true;
         time_t currentTime, finishTime;
         currentTime = time(NULL);
         sprintf(lmsg, _i18n_msg_get(ls_catd, NL_SETN, 1506,
@@ -3781,7 +3815,7 @@ job_abort(struct jData *jData, char reason)
         free(timebuf);
         if ((runLimit = RUN_LIMIT_OF_JOB(jData)) <= 0) {
             runLimit = CPU_LIMIT_OF_JOB(jData)/jData->shared->jobBill.maxNumProcessors;
-            isRunLimit = FALSE;
+            isRunLimit = false;
         }
         runLimit /= maxCpuFactor;
         finishTime = currentTime + runLimit;
@@ -3837,39 +3871,32 @@ job_abort(struct jData *jData, char reason)
     else
         merr_user(jData->userName, jData->shared->jobBill.fromHost, mailmsg,
                   I18N_error);
-
-    return;
-
 }
 
 int
 switchJobArray(struct jobSwitchReq *switchReq,
-               struct lsfAuth      *auth)
+               struct lsfAuth *auth)
 {
-    static char       fname[] = "switchJobArray";
-    struct jData      *jArrayPtr;
-    struct qData      *qPtr;
-    int               cc;
-
+    struct jData *jArrayPtr;
+    struct qData *qPtr;
+    int cc;
 
     jArrayPtr = getJobData(switchReq->jobId);
     if (jArrayPtr == NULL) {
-        return(LSBE_NO_JOB);
+        return LSBE_NO_JOB;
     }
-
 
     if (auth != NULL
         && (auth->uid != 0)
         && !jgrpPermitOk(auth, jArrayPtr->jgrpNode)
         && !isAuthQueAd (jArrayPtr->qPtr, auth)) {
 
-        return(LSBE_PERMISSION);
+        return LSBE_PERMISSION;
     }
-
 
     qPtr = getQueueData(switchReq->queue);
     if (qPtr == NULL) {
-        return(LSBE_BAD_QUEUE);
+        return LSBE_BAD_QUEUE;
     }
 
     if (auth != NULL
@@ -3877,7 +3904,7 @@ switchJobArray(struct jobSwitchReq *switchReq,
         && !jgrpPermitOk(auth, jArrayPtr->jgrpNode)
         && !isAuthQueAd (qPtr, auth)) {
 
-        return(LSBE_PERMISSION);
+        return LSBE_PERMISSION;
     }
 
 
@@ -3900,20 +3927,18 @@ switchJobArray(struct jobSwitchReq *switchReq,
 
                 if (logclass & LC_TRACE) {
                     ls_syslog(LOG_DEBUG,"\
-%s: failed to switch element <%s>, cc=%d",
-                              fname, lsb_jobid2str(jPtr->jobId), cc);
+%s: failed to switch element %s, cc %d",
+                              __func__, lsb_jobid2str(jPtr->jobId), cc);
                 }
             }
 
         }
-
 
         FREEUP(jArrayPtr->shared->jobBill.queue);
         jArrayPtr->shared->jobBill.queue = safeSave(qPtr->queue);
         jArrayPtr->qPtr = qPtr;
 
     } else {
-
 
         cc = switchAJob(switchReq, auth, qPtr);
 
@@ -3925,9 +3950,9 @@ switchJobArray(struct jobSwitchReq *switchReq,
 
 
 static int
-switchAJob (struct jobSwitchReq *switchReq,
-            struct lsfAuth *auth,
-            struct qData   *qtp)
+switchAJob(struct jobSwitchReq *switchReq,
+           struct lsfAuth *auth,
+           struct qData   *qtp)
 {
     static char fname[]="switchAJob";
     struct qData  *qfp;
@@ -3936,15 +3961,14 @@ switchAJob (struct jobSwitchReq *switchReq,
     struct submitReq *newSub;
 
     if (qtp == NULL) {
-        return(LSBE_BAD_QUEUE);
+        return LSBE_BAD_QUEUE;
     }
 
-
     if ((job = getJobData(switchReq->jobId)) == NULL)
-        return (LSBE_NO_JOB);
+        return LSBE_NO_JOB;
 
     if (job->nodeType != JGRP_NODE_JOB) {
-        return(LSBE_JOB_ARRAY);
+        return LSBE_JOB_ARRAY;
     }
 
 
@@ -3954,56 +3978,51 @@ switchAJob (struct jobSwitchReq *switchReq,
     }
 
     if (IS_FINISH (job->jStatus))
-        return (LSBE_JOB_FINISH);
-
-
+        return LSBE_JOB_FINISH;
 
     if (qtp->pJobLimit <= 0.0)
-        return (LSBE_PJOB_LIMIT);
+        return LSBE_PJOB_LIMIT;
     if (qtp->maxJobs <= 0)
-        return (LSBE_QJOB_LIMIT);
+        return LSBE_QJOB_LIMIT;
     if (qtp->hJobLimit <= 0)
-        return (LSBE_HJOB_LIMIT);
+        return LSBE_HJOB_LIMIT;
 
 
     if (IS_PEND(job->jStatus)) {
-        if (!uJobLimitOk (job, qtp->uAcct, qtp->uJobLimit, 0))
-            return (LSBE_UJOB_LIMIT);
+        if (!uJobLimitOk(job, qtp->uAcct, qtp->uJobLimit, 0))
+            return LSBE_UJOB_LIMIT;
     } else {
         if (!uJobLimitOk (job, qtp->uAcct, qtp->uJobLimit, 1))
-            return (LSBE_UJOB_LIMIT);
+            return LSBE_UJOB_LIMIT;
     }
 
     if (!IS_PEND (job->jStatus)) {
         if (qtp->maxJobs <= (qtp->numJobs - qtp->numPEND))
-            return (LSBE_QJOB_LIMIT);
+            return LSBE_QJOB_LIMIT;
 
         for (i = 0; i < job->numHostPtr; i++) {
             struct hostAcct *hAcct = getHAcct(qtp->hAcct, job->hPtr[i]);
-            if (!pJobLimitOk (job->hPtr[i], hAcct, qtp->pJobLimit))
-                return (LSBE_PJOB_LIMIT);
-            if (!hJobLimitOk (job->hPtr[i], hAcct, qtp->hJobLimit))
-                return (LSBE_HJOB_LIMIT);
+            if (!pJobLimitOk(job->hPtr[i], hAcct, qtp->pJobLimit))
+                return LSBE_PJOB_LIMIT;
+            if (!hJobLimitOk(job->hPtr[i], hAcct, qtp->hJobLimit))
+                return LSBE_HJOB_LIMIT;
         }
     }
-
 
     if (IS_START (job->jStatus)) {
         if (job->numHostPtr > 0 && qtp->procLimit > 0) {
             if (job->numHostPtr > qtp->procLimit)
-                return (LSBE_PROC_NUM);
+                return LSBE_PROC_NUM;
             else if (job->numHostPtr < qtp->minProcLimit)
-                return (LSBE_PROC_LESS);
+                return LSBE_PROC_LESS;
         }
     }
 
     if ((returnErr = acceptJob(qtp, job, &noUse, auth)) != LSBE_NO_ERROR)
-        return(returnErr);
-
+        return returnErr;
 
     qfp = job->qPtr;
     if (IS_PEND(job->jStatus) && (job->jStatus & JOB_STAT_RESERVE)) {
-
 
         if (logclass & (LC_TRACE| LC_SCHED ))
             ls_syslog(LOG_DEBUG3, "%s: job <%s> freeing <%d> slots <%s:%d>",
@@ -4029,8 +4048,8 @@ switchAJob (struct jobSwitchReq *switchReq,
     }
     if (!IS_PEND (job->jStatus)) {
 
-        job->pendEvent.notSwitched = TRUE;
-        eventPending = TRUE;
+        job->pendEvent.notSwitched = true;
+        eventPending = true;
     } else if (!(job->jStatus & JOB_STAT_PSUSP)) {
 
         if (qfp != qtp) {
@@ -4046,7 +4065,7 @@ switchAJob (struct jobSwitchReq *switchReq,
     }
     if (IS_START(job->jStatus)) {
         newSub = my_malloc(sizeof (struct submitReq), "switchAJob");
-        copyJobBill(&(job->shared->jobBill), newSub, FALSE);
+        copyJobBill(&(job->shared->jobBill), newSub, false);
         job->newSub = newSub;
     }
 
@@ -4055,11 +4074,9 @@ switchAJob (struct jobSwitchReq *switchReq,
         if ((job->shared->jobBill.options & SUB_CHKPNT_DIR )
             && !(job->shared->jobBill.options2 & SUB2_QUEUE_CHKPNT)) {
 
-
         } else {
 
             if (!IS_START (job->jStatus)) {
-
 
                 FREEUP(job->shared->jobBill.chkpntDir);
                 job->shared->jobBill.options  &= ~ SUB_CHKPNT_DIR;
@@ -4106,16 +4123,13 @@ switchAJob (struct jobSwitchReq *switchReq,
     }
 
 
-
-    if ( qfp != qtp ) {
+    if (qfp != qtp) {
         if ((job->shared->jobBill.options & SUB_RERUNNABLE )
-
             && !(job->shared->jobBill.options2 & SUB2_QUEUE_RERUNNABLE)) {
 
         } else {
 
-            if ( !IS_START (job->jStatus)) {
-
+            if (!IS_START (job->jStatus)) {
 
                 job->shared->jobBill.options  &= ~ SUB_RERUNNABLE;
                 job->shared->jobBill.options2  &= ~ SUB2_QUEUE_RERUNNABLE;
@@ -4138,7 +4152,7 @@ switchAJob (struct jobSwitchReq *switchReq,
         }
     }
 
-    return(LSBE_NO_ERROR);
+    return LSBE_NO_ERROR;
 
 }
 int
@@ -4153,7 +4167,7 @@ moveJobArray(struct jobMoveReq *moveReq,
 
     jArrayPtr = getJobData(moveReq->jobId);
     if (jArrayPtr == NULL) {
-        return(LSBE_NO_JOB);
+        return LSBE_NO_JOB;
     }
 
 
@@ -4163,7 +4177,7 @@ moveJobArray(struct jobMoveReq *moveReq,
     } else {
         if (!jgrpPermitOk(auth, jArrayPtr->jgrpNode)) {
 
-            return(LSBE_PERMISSION);
+            return LSBE_PERMISSION;
         }
     }
 
@@ -4174,17 +4188,11 @@ moveJobArray(struct jobMoveReq *moveReq,
 
 
         jgTreePtr = jArrayPtr->jgrpNode;
-
-
         jArray    = ARRAY_DATA(jgTreePtr);
-
-
         if (jArray->counts[JGRP_COUNT_NJOBS]
             ==  jArray->counts[JGRP_COUNT_NDONE]
             + jArray->counts[JGRP_COUNT_NEXIT]) {
-
-
-            return(LSBE_JOB_FINISH);
+            return LSBE_JOB_FINISH;
         }
 
 
@@ -4194,8 +4202,7 @@ moveJobArray(struct jobMoveReq *moveReq,
              jPtr != NULL;
              jPtr = jPtr->nextJob) {
 
-
-            if ( ! IS_PEND(jPtr->jStatus)) {
+            if (! IS_PEND(jPtr->jStatus)) {
                 continue;
             }
 
@@ -4230,190 +4237,105 @@ moveJobArray(struct jobMoveReq *moveReq,
 
 }
 
+/* moveAJob()
+ *
+ * While moving a job find the highest or the lowest priority one,
+ * then add or substract one the qsort() when ordering the PJl will
+ * do the rest.
+ */
 static int
-moveAJob (struct jobMoveReq *moveReq, int log, struct lsfAuth *auth)
+moveAJob(struct jobMoveReq *moveReq, int log, struct lsfAuth *auth)
 {
-    struct jData *jp, *next, *job, *froJob = NULL, *toJob = NULL;
-    int nowpos, list;
-    int moveJobNum = 0, backword = FALSE;
+    struct jData *jPtr;
+    struct jData *job;
+    struct jData **jarray;
+    struct last_bbot_queue *lqueue;
+    link_t *l;
+    int num;
+    int cc;
 
-    if ((job = getJobData (moveReq->jobId)) == NULL)
-        return (LSBE_NO_JOB);
+    if (bbot_queue == NULL)
+        bbot_queue = make_link();
 
-    if (job->nodeType != JGRP_NODE_JOB)
-        return(LSBE_JOB_ARRAY);
+    if ((jPtr = getJobData(moveReq->jobId)) == NULL)
+        return LSBE_NO_JOB;
 
+    if (jPtr->nodeType != JGRP_NODE_JOB)
+        return LSBE_JOB_ARRAY;
 
-    if (!IS_PEND (job->jStatus)) {
-        if (IS_FINISH (job->jStatus))
-            return (LSBE_JOB_FINISH);
-        else
-            return (LSBE_JOB_STARTED);
+    if (!IS_PEND(jPtr->jStatus)) {
+        if (IS_FINISH(jPtr->jStatus))
+            return LSBE_JOB_FINISH;
+        return LSBE_JOB_STARTED;
     }
 
-    job->jFlags |= JFLAG_BTOP;
+    l = make_link();
+    for (job = jDataList[PJL]->back; job != jDataList[PJL]; job = job->back) {
 
-    nowpos = 0;
+        /* Different queues skip the job
+         */
+        if (job->qPtr != jPtr->qPtr)
+            continue;
+
+        /* The mover does not own the job so it has to
+         * be an admin
+         */
+        if (auth->uid != 0
+            && !isAuthManager(auth)
+            && !isAuthQueAd (job->qPtr, auth)) {
+            if (jPtr->uPtr != job->uPtr) {
+                continue;
+            }
+        }
+        push_link(l, job);
+    }
+
+    num = LINK_NUM_ENTRIES(l);
+    jarray = calloc(num, sizeof(struct jData *));
+
+    cc = 0;
+    while ((job = pop_link(l))) {
+        jarray[cc] = job;
+        ++cc;
+    }
+
+    /* sort either by priority or jobid
+     */
+    qsort(jarray, num, sizeof(struct jData *), jcompare);
+
+    jPtr->jFlags |= JFLAG_BTOP;
+
     if (moveReq->opCode == TO_TOP) {
-
-        list = PJLorMJL(job);
-        for (jp = jDataList[list]->back; jp != jDataList[list]; jp = next) {
-            next = jp->back;
-            if (nowpos && jp->qPtr->priority != job->qPtr->priority) {
-                break;
-            }
-
-            if (jp->qPtr != job->qPtr)
-                continue;
-            if ( maxUserPriority > 0 ) {
-
-                if ( jp->jobPriority != job->jobPriority) {
-                    continue;
-                }
-            }
-            if (auth->uid != 0 && !isAuthManager(auth) &&
-                !isAuthQueAd (job->qPtr, auth)) {
-                if (jp->uPtr != job->uPtr) {
-
-                    continue;
-                }
-            }
-            nowpos++;
-            if (jp->jobId == moveReq->jobId) {
-                froJob = jp;
-                moveJobNum = nowpos;
-            }
-            if (nowpos ==  moveReq->position)
-                toJob = jp;
-        }
-        if (moveReq->position > nowpos) {
-
-            moveReq->position = nowpos;
-            return(moveAJob(moveReq, log, auth));
-        }
-        if (moveReq->position != moveJobNum) {
-            if (froJob == NULL || toJob == NULL)
-                return (LSBE_MBATCHD);
-            if (moveReq->position < moveJobNum)
-                backword = TRUE;
-            if (auth->uid == 0 || isAuthManager(auth) ||
-                isAuthQueAd (job->qPtr, auth))
-                insertAndShift(froJob, toJob, backword, FALSE);
-            else
-                insertAndShift(froJob, toJob, backword, TRUE);
-        }
+        jPtr->priority = jarray[num - 1]->priority + 1;
     } else {
-        list = PJLorMJL(job);
-        for (jp = jDataList[list]->forw; jp != jDataList[list]; jp = next) {
-            next = jp->forw;
-            if (nowpos && jp->qPtr->priority != job->qPtr->priority) {
-                break;
-            }
-
-            if (jp->qPtr != job->qPtr)
-                continue;
-            if ( maxUserPriority > 0 ) {
-
-                if ( jp->jobPriority != job->jobPriority) {
-                    continue;
-                }
-            }
-            if (auth->uid != 0 && !isAuthManager(auth) &&
-                !isAuthQueAd (job->qPtr, auth))
-                if (jp->uPtr != job->uPtr)
-                    continue;
-            nowpos++;
-            if (jp->jobId == moveReq->jobId) {
-                froJob = jp;
-                moveJobNum = nowpos;
-            }
-            if (nowpos ==  moveReq->position)
-                toJob = jp;
-        }
-
-        if (moveReq->position > nowpos) {
-
-            moveReq->position = nowpos;
-            return(moveAJob(moveReq, log, auth));
-        }
-        if (moveReq->position != moveJobNum) {
-            if (froJob == NULL || toJob == NULL)
-                return (LSBE_MBATCHD);
-            if (moveReq->position > moveJobNum)
-                backword = TRUE;
-            if (auth->uid == 0 || isAuthManager(auth) ||
-                isAuthQueAd (job->qPtr, auth))
-                insertAndShift(froJob, toJob, backword, FALSE);
-            else
-                insertAndShift(froJob, toJob, backword, TRUE);
-        }
+        jPtr->priority =  jarray[0]->priority - 1;
+        /* Save the lowest priority value for
+         * this queue. This is for a new job that
+         * will come the queue whose priority by default
+         * is -1 so it could be higher that a bbot job
+         * in the queue previously. If have to then make
+         * his priority lower so qsort() will put it
+         * in the right place.
+         */
+        lqueue = calloc(1, sizeof(struct last_bbot_queue));
+        lqueue->last_bbot = jPtr->priority;
+        lqueue->qPtr = jPtr->qPtr;
+        push_link(bbot_queue, lqueue);
     }
 
-    if (log ) {
-        log_movejob (moveReq, auth->uid, auth->lsfUserName);
-    }
-    return (LSBE_NO_ERROR);
+    if (log)
+        log_movejob(moveReq, auth);
 
-}
+    fin_link(l);
+    _free_(jarray);
 
-static void
-insertAndShift (struct jData *froJob, struct jData *toJob,
-                int backward, int ordUser)
-{
-    struct jData *tmpJobP, *oldJobP, *jobP;
-    int listno;
-
-    listno = PJLorMJL(froJob);
-    if (backward) {
-        oldJobP = toJob->forw;
-        tmpJobP = toJob;
-        for (jobP = toJob->back; jobP != froJob->back; jobP = jobP->back) {
-            if (jobP->qPtr != toJob->qPtr)
-                continue;
-            if ((ordUser == TRUE) && (jobP->uPtr != toJob->uPtr)) {
-
-                continue;
-            }
-            offJobList (tmpJobP, listno);
-
-            listInsertEntryAfter((LIST_T *)jDataList[listno],
-                                 (LIST_ENTRY_T *)jobP,
-                                 (LIST_ENTRY_T *)tmpJobP);
-            tmpJobP = jobP;
-        }
-        offJobList(froJob, listno);
-        listInsertEntryBefore((LIST_T *)jDataList[listno],
-                              (LIST_ENTRY_T *)oldJobP,
-                              (LIST_ENTRY_T *)froJob);
-    }
-    else {
-        oldJobP = toJob->back;
-        tmpJobP = toJob;
-        for (jobP = toJob->forw; (jobP != froJob->forw); jobP = jobP->forw) {
-            if (jobP->qPtr != toJob->qPtr)
-                continue;
-            if ((ordUser == TRUE) && (jobP->uPtr != toJob->uPtr))
-                continue;
-            offJobList (tmpJobP, listno);
-
-            listInsertEntryBefore((LIST_T *)jDataList[listno],
-                                  (LIST_ENTRY_T *)jobP,
-                                  (LIST_ENTRY_T *)tmpJobP);
-            tmpJobP = jobP;
-        }
-        offJobList(froJob, listno);
-        listInsertEntryAfter((LIST_T *)jDataList[listno],
-                             (LIST_ENTRY_T *)oldJobP,
-                             (LIST_ENTRY_T *)froJob);
-    }
-    return;
-
+    return 0;
 }
 
 void
 initJobIdHT(void)
 {
-    h_initTab_ (&jobIdHT, 50);
+    h_initTab_ (&jobIdHT, 2000003);
 }
 
 void
@@ -4447,16 +4369,16 @@ removeJob(LS_LONG_INT jobId)
                     remvMemb(&jobIdHT, ARRAY_DATA(node)->jobArray->jobId);
                     freeJData(ARRAY_DATA(node)->jobArray);
                     treeFree(treeClip(node));
-                    rmLogJobInfo(jp, TRUE);
+                    rmLogJobInfo(jp, true);
                 }
             }
             else {
-                rmLogJobInfo(jp, TRUE);
+                rmLogJobInfo(jp, true);
                 treeFree(treeClip(node));
             }
         }
         else
-            rmLogJobInfo(jp, TRUE);
+            rmLogJobInfo(jp, true);
         freeJData(jp);
     }
 }
@@ -4469,12 +4391,13 @@ inPendJobList(struct jData *job, int listno, time_t requeueTime)
 {
     struct jData *lastJob;
 
-    if (job->qPtr->lastJob)
-        inPendJobList2(job, listno, job->qPtr->lastJob, &lastJob);
-    else
+    if (qsort_jobs) {
+        _inPendJobList_(job, listno, requeueTime);
+    } else {
         inPendJobList2(job, listno, NULL, &lastJob);
+    }
 
-    job->qPtr->lastJob = lastJob;
+    job->qPtr->lastJob = NULL;
 }
 
 /* inPendJobList2()
@@ -4547,7 +4470,7 @@ inPendJobList2(struct jData *job,
     * it has be put before it AB. Logically the head is B.
     */
    listInsertEntryBefore((LIST_T *)jDataList[listno],
-			 (LIST_ENTRY_T *)jp,
+                         (LIST_ENTRY_T *)jp,
                          (LIST_ENTRY_T *)job);
 }
 
@@ -4557,14 +4480,16 @@ offJobList(struct jData *jp, int listno)
 {
     listRemoveEntry((LIST_T *)jDataList[listno], (LIST_ENTRY_T *)jp);
 
-    /* If leaving PJL adjust the queue's last job
-     * We have to check for the job status as well
-     * as we can get here from removeJob() while
-     * replying lsb.events. This is true for job arrays.
-     */
-    if (listno == PJL
-        || IS_PEND(jp->jStatus)) {
-        set_queue_last_job((LIST_T *)jDataList[PJL], jp);
+    if (0) {
+        /* If leaving PJL adjust the queue's last job
+         * We have to check for the job status as well
+         * as we can get here from removeJob() while
+         * replying lsb.events. This is true for job arrays.
+         */
+        if (listno == PJL
+            || IS_PEND(jp->jStatus)) {
+            set_queue_last_job((LIST_T *)jDataList[PJL], jp);
+        }
     }
 }
 
@@ -4614,7 +4539,7 @@ jobInQueueEnd(struct jData *job, struct qData *qp)
     job->shared->jobBill.queue = safeSave (qp->queue);
     if (IS_PEND (job->jStatus)) {
         if (job->jStatus & JOB_STAT_MIG) {
-            if (glMigToPendFlag == TRUE)  {
+            if (glMigToPendFlag == true)  {
                 inPendJobList (job, PJL, 0);
 
                 job->jStatus &= ~JOB_STAT_MIG;
@@ -4635,7 +4560,7 @@ getJobData (LS_LONG_INT jobId)
 
     if (jobId <= 0 || (ent = chekMemb(&jobIdHT, jobId)) == NULL)
         return NULL;
-    return (struct jData *) ent->hData;
+    return ent->hData;
 
 }
 
@@ -4645,7 +4570,7 @@ createSharedRef (struct jShared *shared)
     if (shared) {
         shared->numRef++;
     }
-    return(shared);
+    return shared;
 }
 
 void
@@ -4668,6 +4593,9 @@ initJData(struct jShared  *shared)
 {
     struct jData *job;
 
+    /* We initialize the fields even if we calloc() so
+     * to make sure we know all fields we work with.
+     */
     job = my_calloc(1, sizeof (struct jData), "initJData");
     job->shared = createSharedRef(shared);
     job->jobId = 0;
@@ -4680,9 +4608,12 @@ initJData(struct jShared  *shared)
     job->subreasons = 0;
     job->reasonTb = NULL;
     job->numReasons = 0;
-    job->priority = -1.0;
+    job->priority = -1;
     job->qPtr = NULL;
     job->hPtr = NULL;
+    job->pqPtr = NULL;
+    job->uqPtr = NULL;
+    job->hqPtr = NULL;
     job->numHostPtr = 0;
     job->numAskedPtr = 0;
     job->askedPtr = NULL;
@@ -4691,7 +4622,7 @@ initJData(struct jShared  *shared)
     job->candPtr = NULL;
     job->numExecCandPtr = 0;
     job->execCandPtr = NULL;
-    job->usePeerCand = FALSE;
+    job->usePeerCand = false;
     job->numSlots = 0;
     job->processed = 0;
     job->dispCount = 0;
@@ -4705,12 +4636,12 @@ initJData(struct jShared  *shared)
     job->endTime = 0;
     job->requeueTime = 0;
     job->retryHist = 0;
-    job->pendEvent.notSwitched = FALSE;
+    job->pendEvent.notSwitched = false;
     job->pendEvent.sig = SIG_NULL;
     job->pendEvent.sig1 = SIG_NULL;
     job->pendEvent.sig1Flags = 0;
-    job->pendEvent.sigDel = FALSE;
-    job->pendEvent.notModified = FALSE;
+    job->pendEvent.sigDel = false;
+    job->pendEvent.notModified = false;
     job->reqHistoryAlloc = 16;
     job->reqHistory = my_calloc(job->reqHistoryAlloc,
                                 sizeof(struct rqHistory),
@@ -4749,7 +4680,6 @@ initJData(struct jShared  *shared)
     job->sigValue = SIG_NULL;
     job->port = 0;
 
-
     if (pjobSpoolDir != NULL) {
         job->jobSpoolDir = safeSave(pjobSpoolDir);
     } else {
@@ -4766,8 +4696,12 @@ initJData(struct jShared  *shared)
     job->reservedGrp = -1;
     job->groupCands = NULL;
     job->inEligibleGroups = NULL;
+    job->run_rusage = NULL;
+    job->abs_run_limit = -1;
+    job->preempted_hosts = make_link();
+    job->preempted_by = 0;
 
-    return (job);
+    return job;
 }
 
 
@@ -4860,27 +4794,26 @@ accumulateRU (struct jData *job, struct statusReq *statusReq)
 
 
 static double
-acumulateValue (double statusValue, double jobValue)
+acumulateValue(double statusValue, double jobValue)
 {
 
     if (statusValue > 0.0 && jobValue > 0.0)
         jobValue += statusValue;
     else if (statusValue >= 0.0 && jobValue < 0.0)
         jobValue = statusValue;
-    return (jobValue);
-
+    return jobValue;
 }
 
 int
 resigJobs(int *resignal)
 {
     static char          fname[] = "resigJobs()";
-    static char          first = TRUE;
+    static char          first = true;
     int                  sigcnt = 0;
     int                  sVsigcnt;
     int                  mxsigcnt = 5;
     int                  list;
-    int                  retVal = TRUE;
+    int                  retVal = true;
     struct hData         *hPtr;
     struct jData         *jpbw;
     struct jData         *next;
@@ -4910,7 +4843,7 @@ resigJobs(int *resignal)
 
             next = jpbw->back;
 
-            resigJobs1 (jpbw, &sigcnt);
+            resigJobs1(jpbw, &sigcnt);
 
             if (sigcnt > 100)
                 return retVal;
@@ -4926,7 +4859,7 @@ resigJobs(int *resignal)
                       fname, setPerror(bitseterrno));
             mbdDie(MASTER_MEM);
         }
-        first = FALSE;
+        first = false;
     }
 
     sigcnt = 0;
@@ -4967,7 +4900,7 @@ resigJobs(int *resignal)
                 continue;
 
             sVsigcnt = sigcnt;
-            if (resigJobs1 (jpbw, &sigcnt) < 0) {
+            if (resigJobs1(jpbw, &sigcnt) < 0) {
                 if (logclass & (LC_TRACE | LC_SIGNAL))
                     ls_syslog (LOG_DEBUG2, "\
 %s: Signaling job %s failed; sigcnt= %d host=%s",
@@ -4982,8 +4915,8 @@ resigJobs(int *resignal)
     }
 
 
-    retVal = FALSE;
-    *resignal = FALSE;
+    retVal = false;
+    *resignal = false;
 
     if (sigcnt < mxsigcnt) {
         for (list = 0; list <= NJLIST; list++) {
@@ -5014,9 +4947,9 @@ resigJobs(int *resignal)
                 }
             }
         }
-        eventPending = FALSE;
-        retVal = FALSE;
-        *resignal = FALSE;
+        eventPending = false;
+        retVal = false;
+        *resignal = false;
         if (logclass & (LC_TRACE | LC_SIGNAL))
             ls_syslog (LOG_DEBUG1, "%s: no pending event now", fname);
     }
@@ -5025,7 +4958,7 @@ resigJobs(int *resignal)
 }
 
 static int
-resigJobs1 (struct jData *jpbw, int *sigcnt)
+resigJobs1(struct jData *jpbw, int *sigcnt)
 {
     static char fname[] = "resigJobs1";
     sbdReplyType reply;
@@ -5041,7 +4974,7 @@ resigJobs1 (struct jData *jpbw, int *sigcnt)
         if (IS_PEND (jpbw->jStatus))
             reply = ERR_NO_ERROR;
         else {
-            reply = switch_job (jpbw, TRUE);
+            reply = switch_job (jpbw, true);
         }
         (*sigcnt)++;
         if (reply == ERR_NO_ERROR || reply == ERR_NO_JOB
@@ -5060,7 +4993,7 @@ resigJobs1 (struct jData *jpbw, int *sigcnt)
             reply = ERR_NO_ERROR;
         }
         else {
-            reply = switch_job (jpbw, FALSE);
+            reply = switch_job (jpbw, false);
         }
         (*sigcnt)++;
         if (reply == ERR_NO_ERROR || reply == ERR_NO_JOB
@@ -5091,7 +5024,7 @@ resigJobs1 (struct jData *jpbw, int *sigcnt)
 
                 reply = ERR_NO_ERROR;
             } else {
-                reply = sigStartedJob (jpbw, jpbw->pendEvent.sig, 0, 0);
+                reply = sigStartedJob(jpbw, jpbw->pendEvent.sig, 0, 0);
             }
         }
         (*sigcnt)++;
@@ -5140,7 +5073,7 @@ modifyJob (struct modifyReq *req, struct submitMbdReply *reply,
     struct jData *jpbw, *jArray;
     int    numJobIds = 0;
     LS_LONG_INT *jobIdList = NULL;
-    int    returnErr, successfulOnce = FALSE;
+    int    returnErr, successfulOnce = false;
     int    i;
     int    uid=auth->uid;
     char   userName[MAXLSFNAMELEN];
@@ -5167,7 +5100,7 @@ modifyJob (struct modifyReq *req, struct submitMbdReply *reply,
 
             if ((returnErr = modifyAJob(req, reply, auth, jpbw)) ==
                 LSBE_NO_ERROR)
-                successfulOnce = TRUE;
+                successfulOnce = true;
             continue;
         }
 
@@ -5233,7 +5166,7 @@ modifyJob (struct modifyReq *req, struct submitMbdReply *reply,
             localizeJobElement(jpbw);
             if ((returnErr = modifyAJob(req, reply, auth, jpbw)) ==
                 LSBE_NO_ERROR)
-                successfulOnce = TRUE;
+                successfulOnce = true;
 
             auth->uid = uid;
             strcpy(auth->lsfUserName, userName);
@@ -5279,7 +5212,7 @@ modifyJob (struct modifyReq *req, struct submitMbdReply *reply,
         for (jpbw = jArray->nextJob; jpbw; jpbw = jpbw->nextJob) {
             if ((returnErr = modifyAJob(req, reply, auth, jpbw)) ==
                 LSBE_NO_ERROR)
-                successfulOnce = TRUE;
+                successfulOnce = true;
 
             auth->uid = uid;
             strcpy(auth->lsfUserName, userName);
@@ -5287,7 +5220,7 @@ modifyJob (struct modifyReq *req, struct submitMbdReply *reply,
 
 
         if (jArray->shared->numRef == 1
-            && successfulOnce == TRUE) {
+            && successfulOnce == true) {
             struct jData        *jPtr;
             struct jgTreeNode   *jnode;
             struct jarray       *jarray;
@@ -5321,7 +5254,7 @@ modifyJob (struct modifyReq *req, struct submitMbdReply *reply,
                 freeSubmitReq(&(jArray->shared->jobBill));
                 copyJobBill(&(jPtr->shared->jobBill),
                             &(jArray->shared->jobBill),
-                            FALSE);
+                            false);
 
 
                 if (req->submitReq.options & SUB_QUEUE) {
@@ -5333,7 +5266,7 @@ modifyJob (struct modifyReq *req, struct submitMbdReply *reply,
             }
 
         } else if (jArray->shared->numRef > 1
-                   && successfulOnce == TRUE) {
+                   && successfulOnce == true) {
 
             if (req->submitReq.options & SUB_QUEUE) {
                 jArray->qPtr = jArray->nextJob->qPtr;
@@ -5343,7 +5276,6 @@ modifyJob (struct modifyReq *req, struct submitMbdReply *reply,
 
         if (successfulOnce)
             returnErr = LSBE_NO_ERROR;
-
 
         if ((req->submitReq.options2 & SUB2_JOB_PRIORITY)
             && (returnErr == LSBE_NO_ERROR)) {
@@ -5355,11 +5287,11 @@ modifyJob (struct modifyReq *req, struct submitMbdReply *reply,
         log_modifyjob(req, auth);
     }
     FREEUP(jobIdList);
-    return (returnErr);
+    return returnErr;
 }
 
 static float
-normalCpuLimit (struct jData *job, struct submitReq subReq, int *retLimit)
+normalCpuLimit(struct jData *job, struct submitReq subReq, int *retLimit)
 {
     float *cpuFactor, cpuLimit;
     char  *spec;
@@ -5368,7 +5300,7 @@ normalCpuLimit (struct jData *job, struct submitReq subReq, int *retLimit)
 
     *retLimit = cpuLimit;
     if (cpuLimit <= 0)
-        return (LSBE_NO_ERROR);
+        return LSBE_NO_ERROR;
 
     if (subReq.options & SUB_HOST_SPEC)
         spec = subReq.hostSpec;
@@ -5381,13 +5313,13 @@ normalCpuLimit (struct jData *job, struct submitReq subReq, int *retLimit)
 
     if ((cpuFactor = getModelFactor (spec)) == NULL)
         if ((cpuFactor = getHostFactor (spec)) == NULL)
-            return (LSBE_BAD_HOST_SPEC);
+            return LSBE_BAD_HOST_SPEC;
 
     if (*cpuFactor <= 0) {
-        return (LSBE_BAD_LIMIT);
+        return LSBE_BAD_LIMIT;
     }
     if (cpuLimit > (INFINIT_INT /(*cpuFactor))) {
-        return (LSBE_BAD_LIMIT);
+        return LSBE_BAD_LIMIT;
     }
     if ((cpuLimit *= *cpuFactor) < 1)
         cpuLimit = 1;
@@ -5398,8 +5330,6 @@ normalCpuLimit (struct jData *job, struct submitReq subReq, int *retLimit)
     return LSBE_NO_ERROR;
 }
 
-
-
 static int
 modifyAJob (struct modifyReq *req, struct submitMbdReply *reply,
             struct lsfAuth *auth, struct jData *jpbw)
@@ -5408,19 +5338,17 @@ modifyAJob (struct modifyReq *req, struct submitMbdReply *reply,
     struct submitReq *newReq;
     int returnErr;
 
-
-
     if (IS_FINISH (jpbw->jStatus))
-        return (LSBE_JOB_FINISH);
+        return LSBE_JOB_FINISH;
 
     if ((auth->uid != 0) && !jgrpPermitOk(auth, jpbw->jgrpNode) &&
         !isAuthQueAd (jpbw->qPtr, auth))
-        return(LSBE_PERMISSION);
+        return LSBE_PERMISSION;
 
 
     if ((req->submitReq.options & SUB_JOB_NAME)
         && strchr(req->submitReq.jobName, '['))
-        return(LSBE_BAD_JOB);
+        return LSBE_BAD_JOB;
 
 
 
@@ -5429,52 +5357,49 @@ modifyAJob (struct modifyReq *req, struct submitMbdReply *reply,
                && (req->delOptions == 0))
               || ((req->delOptions == SUB_RES_REQ)
                   && (req->submitReq.options & ~SUB_MODIFY) == 0))
-            && (((lsbModifyAllJobs != TRUE)
+            && (((lsbModifyAllJobs != true)
                  && (mSchedStage != M_STAGE_REPLAY)
                  && (req->submitReq.options2 & SUB2_MODIFY_RUN_JOB))
                 || !(req->submitReq.options2 & SUB2_MODIFY_RUN_JOB)))) {
-        return (LSBE_JOB_MODIFY);
+        return LSBE_JOB_MODIFY;
     }
 
 
     if (IS_START(jpbw->jStatus)
         && (req->submitReq.options2 & SUB2_MODIFY_RUN_JOB)
         && (req->submitReq.options2 & SUB2_MODIFY_PEND_JOB)) {
-        return (LSBE_MOD_MIX_OPTS);
+        return LSBE_MOD_MIX_OPTS;
     }
 
     if (IS_START(jpbw->jStatus) && (jpbw->shared->jobBill.options & SUB_MODIFY_ONCE)
         && (req->submitReq.options & SUB_MODIFY_ONCE))
-        return (LSBE_JOB_MODIFY_USED);
+        return LSBE_JOB_MODIFY_USED;
 
     if (IS_START(jpbw->jStatus) && jpbw->newSub != NULL) {
 
         if ((req->submitReq.options & SUB_MODIFY_ONCE) &&
             !(jpbw->newSub->options & SUB_MODIFY_ONCE))
-            return (LSBE_JOB_MODIFY_ONCE);
+            return LSBE_JOB_MODIFY_ONCE;
         if (!(req->submitReq.options & SUB_MODIFY_ONCE) &&
             (jpbw->newSub->options & SUB_MODIFY_ONCE))
-            return (LSBE_JOB_MODIFY_ONCE);
+            return LSBE_JOB_MODIFY_ONCE;
     }
     if (IS_PEND (jpbw->jStatus) && (jpbw->shared->jobBill.options & SUB_MODIFY_ONCE)
         && !(req->submitReq.options & SUB_MODIFY_ONCE))
-        return (LSBE_JOB_MODIFY_ONCE);
+        return LSBE_JOB_MODIFY_ONCE;
 
     if (IS_START(jpbw->jStatus) &&
         (req->submitReq.rLimits[LSF_RLIMIT_CPU] != DEFAULT_RLIMIT) &&
         ((daemonParams[LSB_JOB_CPULIMIT].paramValue == NULL) ||
          strcasecmp(daemonParams[LSB_JOB_CPULIMIT].paramValue, "y"))) {
-
         int limit, ret;
 
-        ret=normalCpuLimit(jpbw, req->submitReq, &limit);
+        ret = normalCpuLimit(jpbw, req->submitReq, &limit);
         if (ret != LSBE_NO_ERROR)
             return ret;
         if (limit != jpbw->shared->jobBill.rLimits[LSF_RLIMIT_CPU])
-            return (LSBE_MOD_CPULIMIT);
+            return LSBE_MOD_CPULIMIT;
     }
-
-
 
     if (IS_START(jpbw->jStatus) &&
         (req->submitReq.rLimits[LSF_RLIMIT_RSS] != DEFAULT_RLIMIT ) &&
@@ -5482,36 +5407,34 @@ modifyAJob (struct modifyReq *req, struct submitMbdReply *reply,
          jpbw->shared->jobBill.rLimits[LSF_RLIMIT_RSS]) &&
         ((daemonParams[LSB_JOB_MEMLIMIT].paramValue == NULL) ||
          strcasecmp(daemonParams[LSB_JOB_MEMLIMIT].paramValue, "y"))){
-        return (LSBE_MOD_MEMLIMIT);
+        return LSBE_MOD_MEMLIMIT;
     }
 
     if (IS_START(jpbw->jStatus) && (req->submitReq.options & SUB_ERR_FILE)
-        && !(jpbw->shared->jobBill.options & SUB_ERR_FILE))
-    {
-        return (LSBE_MOD_ERRFILE);
+        && !(jpbw->shared->jobBill.options & SUB_ERR_FILE)) {
+        return LSBE_MOD_ERRFILE;
     }
 
     if ((mSchedStage != M_STAGE_REPLAY) &&
         (req->submitReq.options & SUB_CHKPNT_DIR)) {
-
         char buf[32];
         sprintf(buf, "/%s", lsb_jobidinstr(jpbw->jobId));
 
         strcat(req->submitReq.chkpntDir, buf);
     }
 
-    newReq = getMergeSubReq (jpbw, req, &returnErr);
+    newReq = getMergeSubReq(jpbw, req, &returnErr);
 
     if (newReq == NULL)
-        return (returnErr);
+        return returnErr;
 
     job = initJData((struct jShared *) my_calloc(1, sizeof(struct jShared),
                                                  "modifyJob"));
     job->jobId = jpbw->jobId;
     if ( isAuthManager(auth)) {
-        setClusterAdmin(TRUE);
+        setClusterAdmin(true);
     } else {
-        setClusterAdmin(FALSE);
+        setClusterAdmin(false);
     }
     auth->uid = jpbw->userId;
     strcpy (auth->lsfUserName, jpbw->userName);
@@ -5525,15 +5448,15 @@ modifyAJob (struct modifyReq *req, struct submitMbdReply *reply,
             jpbw->shared->dptRoot = NULL;
         }
         else {
-            freeNewJob (job);
-            freeSubmitReq (newReq);
-            FREEUP (newReq);
-            return (returnErr);
+            freeNewJob(job);
+            freeSubmitReq(newReq);
+            FREEUP(newReq);
+            return returnErr;
         }
     }
 
-    copyJobBill (newReq, &job->shared->jobBill, FALSE);
-    handleJParameters (jpbw, job, &(req->submitReq), FALSE, req->delOptions,
+    copyJobBill (newReq, &job->shared->jobBill, false);
+    handleJParameters (jpbw, job, &(req->submitReq), false, req->delOptions,
                        req->delOptions2);
 
     job->schedHost = safeSave (jpbw->schedHost);
@@ -5551,15 +5474,15 @@ modifyAJob (struct modifyReq *req, struct submitMbdReply *reply,
     }
 
     job->jobId = jpbw->jobId;
-    freeJData (job);
-    freeSubmitReq (newReq);
-    FREEUP (newReq);
+    freeJData(job);
+    freeSubmitReq(newReq);
+    FREEUP(newReq);
     if (reply)
         reply->jobId = jpbw->jobId;
 
     if (IS_PEND(jpbw->jStatus))
         setJobPendReason(jpbw, PEND_JOB_MODIFY);
-    return (LSBE_NO_ERROR);
+    return LSBE_NO_ERROR;
 }
 
 
@@ -5662,16 +5585,20 @@ cleanup:
 
     *errorCode = returnCode;
     if (returnCode == 0)
-        return (tempSub);
-    else {
-        freeSubmitReq(tempSub);
-        FREEUP (tempSub);
-        return NULL;
-    }
+        return tempSub;
+
+    freeSubmitReq(tempSub);
+    FREEUP(tempSub);
+    return NULL;
 }
 
 void
-handleJParameters (struct jData *jpbw, struct jData *job, struct submitReq *modReq, int replay, int delOptions, int delOptions2)
+handleJParameters(struct jData *jpbw,
+                  struct jData *job,
+                  struct submitReq *modReq,
+                  int replay,
+                  int delOptions,
+                  int delOptions2)
 {
     static char fname[]="handleJParameters";
     struct submitReq *newSub;
@@ -5683,7 +5610,6 @@ handleJParameters (struct jData *jpbw, struct jData *job, struct submitReq *modR
     int    alreadySetNewSub =0;
 
     if (IS_PEND (jpbw->jStatus) || IS_FINISH(jpbw->jStatus)) {
-
 
         if (!(jpbw->shared->jobBill.options & SUB_MODIFY_ONCE) &&
             (modReq->options & SUB_MODIFY_ONCE)) {
@@ -5706,7 +5632,7 @@ handleJParameters (struct jData *jpbw, struct jData *job, struct submitReq *modR
         if (  ! alreadySetNewSub ) {
 
             freeSubmitReq (&(jpbw->shared->jobBill));
-            copyJobBill (subReq, &jpbw->shared->jobBill, FALSE);
+            copyJobBill (subReq, &jpbw->shared->jobBill, false);
         }
 
         if (jpbw->shared->dptRoot) {
@@ -5770,7 +5696,7 @@ handleJParameters (struct jData *jpbw, struct jData *job, struct submitReq *modR
 
             struct jData *jPtr;
             for (jPtr = jpbw->nextJob; jPtr != NULL; jPtr = jPtr->nextJob) {
-                if (replay != TRUE && IS_PEND(jPtr->jStatus)) {
+                if (replay != true && IS_PEND(jPtr->jStatus)) {
                     updSwitchJob (jPtr, jPtr->qPtr, jPtr->qPtr, oldMaxCpus);
                 }
             }
@@ -5854,7 +5780,7 @@ handleJParameters (struct jData *jpbw, struct jData *job, struct submitReq *modR
                     }
                 }
 
-                if (replay != TRUE) {
+                if (replay != true) {
                     updSwitchJob (jpbw, qfp, job->qPtr, oldMaxCpus);
                 }
             }
@@ -5862,18 +5788,18 @@ handleJParameters (struct jData *jpbw, struct jData *job, struct submitReq *modR
 
 
 
-        chgPriority = FALSE;
+        chgPriority = false;
 
         if ( delOptions2 & SUB2_JOB_PRIORITY && maxUserPriority > 0) {
 
             modifyJobPriority(jpbw, maxUserPriority/2);
-            chgPriority = TRUE;
+            chgPriority = true;
         }
         else if ( modReq->options2 & SUB2_JOB_PRIORITY) {
             int error=0;
             if (checkUserPriority(jpbw, modReq->userPriority, &error)) {
                 modifyJobPriority(jpbw, modReq->userPriority);
-                chgPriority = TRUE;
+                chgPriority = true;
             }
         }
 
@@ -5895,7 +5821,7 @@ handleJParameters (struct jData *jpbw, struct jData *job, struct submitReq *modR
         jpbw->shared->jobBill.resReq = safeSave(subReq->resReq);
 
     } else if (IS_START(jpbw->jStatus)
-               && ((lsbModifyAllJobs == TRUE) || (mSchedStage == M_STAGE_REPLAY))
+               && ((lsbModifyAllJobs == true) || (mSchedStage == M_STAGE_REPLAY))
                && (modReq->options2 & SUB2_MODIFY_RUN_JOB)
                && !(modReq->options2 & SUB2_MODIFY_PEND_JOB)) {
         if (modReq->options & SUB_MODIFY_ONCE) {
@@ -5905,11 +5831,11 @@ handleJParameters (struct jData *jpbw, struct jData *job, struct submitReq *modR
             jpbw->newSub = newSub;
         }
         if ( mSchedStage != M_STAGE_REPLAY ) {
-            jpbw->pendEvent.notModified = TRUE;
+            jpbw->pendEvent.notModified = true;
         }
-        eventPending = TRUE;
+        eventPending = true;
         freeSubmitReq (&jpbw->shared->jobBill);
-        copyJobBill(subReq, &jpbw->shared->jobBill, FALSE);
+        copyJobBill(subReq, &jpbw->shared->jobBill, false);
 
         if ((modReq->options & SUB_RES_REQ)
             || (delOptions & SUB_RES_REQ)) {
@@ -5924,19 +5850,18 @@ handleJParameters (struct jData *jpbw, struct jData *job, struct submitReq *modR
     }
 }
 static struct submitReq *
-saveOldParameters (struct jData *jpbw)
+saveOldParameters(struct jData *jpbw)
 {
     struct submitReq *newSub;
 
-    newSub = (struct submitReq *) my_malloc
-        (sizeof (struct submitReq), "saveJParameters");
-    copyJobBill (&jpbw->shared->jobBill, newSub, FALSE);
-    return (newSub);
+    newSub = calloc(1, sizeof(struct submitReq));
+    copyJobBill(&jpbw->shared->jobBill, newSub, false);
+    return newSub;
 }
 
 static int
-checkJobParams (struct jData *job, struct submitReq *subReq,
-                struct submitMbdReply *Reply, struct lsfAuth *auth)
+checkJobParams(struct jData *job, struct submitReq *subReq,
+               struct submitMbdReply *Reply, struct lsfAuth *auth)
 {
     static char fname[] = "checkJobParams";
     int i, returnErr;
@@ -5963,7 +5888,7 @@ checkJobParams (struct jData *job, struct submitReq *subReq,
 
     if (!Gethostbyname_(subReq->fromHost)) {
         ls_syslog(LOG_ERR, I18N_FUNC_FAIL, fname, "IsValidHost_");
-        return (LSBE_BAD_HOST);
+        return LSBE_BAD_HOST;
     }
 
     if (subReq->options & SUB_HOST) {
@@ -5974,16 +5899,16 @@ checkJobParams (struct jData *job, struct submitReq *subReq,
                                   &askedOthPrio, 1);
 
         if (returnErr != LSBE_NO_ERROR) {
-            return (returnErr);
-        } else if ( numAskedHosts <= 0 ) {
+            return returnErr;
+        } else if (numAskedHosts <= 0) {
             return LSBE_BAD_HOST;
         }
     }
 
     now = time(NULL);
     if (subReq->termTime && (now > subReq->termTime)) {
-        FREEUP (askedHosts);
-        return(LSBE_BAD_TIME);
+        FREEUP(askedHosts);
+        return LSBE_BAD_TIME;
     }
     job->userName = safeSave (auth->lsfUserName);
     job->userId = auth->uid;
@@ -6004,9 +5929,9 @@ checkJobParams (struct jData *job, struct submitReq *subReq,
 
 
     if (subReq->resReq && subReq->resReq[0] != '\0') {
-        int useLocal = TRUE;
+        int useLocal = true;
         if (job->numAskedPtr > 0 || job->askedOthPrio >= 0) {
-            useLocal = FALSE;
+            useLocal = false;
         }
 
         useLocal = useLocal ? USE_LOCAL : 0;
@@ -6016,7 +5941,7 @@ checkJobParams (struct jData *job, struct submitReq *subReq,
                                              | PARSE_XOR);
 
         if (job->shared->resValPtr == NULL) {
-            return (LSBE_BAD_RESREQ);
+            return LSBE_BAD_RESREQ;
         }
     }
 
@@ -6042,8 +5967,8 @@ checkJobParams (struct jData *job, struct submitReq *subReq,
         subReq->rLimits[LSF_RLIMIT_DATA] = dataLimit;
         subReq->rLimits[LSF_RLIMIT_PROCESS] = processLimit;
 
-        if ((returnErr = queueOk (word, job, &Reply->badReqIndx,
-                                  subReq, auth)) != LSBE_NO_ERROR) {
+        if ((returnErr = queueOk(word, job, &Reply->badReqIndx,
+                                 subReq, auth)) != LSBE_NO_ERROR) {
             Reply->queue = word;
 
             if (!defSpec)
@@ -6053,7 +5978,7 @@ checkJobParams (struct jData *job, struct submitReq *subReq,
             break;
     }
     if (returnErr != LSBE_NO_ERROR) {
-        return (returnErr);
+        return returnErr;
     } else {
         Reply->queue = job->qPtr->queue;
         job->shared->jobBill.rLimits[LSF_RLIMIT_CPU]
@@ -6088,45 +6013,39 @@ checkJobParams (struct jData *job, struct submitReq *subReq,
         FREEUP (askedHosts);
 
         if (returnErr != LSBE_NO_ERROR)
-            return (returnErr);
+            return returnErr;
     }
 
-    if (numofprocs < subReq->numProcessors)
-    {
+    if (numofprocs < subReq->numProcessors) {
         if (job->qPtr->numHUnAvail == 0)
-            return (LSBE_PROC_NUM);
+            return LSBE_PROC_NUM;
     }
 
     if (subReq->options & SUB_INTERACTIVE) {
 
         if (subReq->options & SUB_RERUNNABLE)
-            return (LSBE_INTERACTIVE_RERUN);
+            return LSBE_INTERACTIVE_RERUN;
         if ((subReq->options & (SUB_PTY | SUB_PTY_SHELL)) &&
             (subReq->options & SUB_IN_FILE))
-            return (LSBE_PTY_INFILE);
+            return LSBE_PTY_INFILE;
     }
-    FREEUP (subReq->queue);
+
+    FREEUP(subReq->queue);
     subReq->options |= SUB_QUEUE;
-    subReq->queue = safeSave (job->qPtr->queue);
-
-
+    subReq->queue = safeSave(job->qPtr->queue);
 
     if (strcmp (subReq->dependCond, "") != 0) {
-
-
         setIdxListContext(subReq->jobName);
-
-
         if ((getIdxListContext() == NULL)
             && (strstr((*subReq).dependCond, "[*]")) != NULL) {
-            return(LSBE_DEP_ARRAY_SIZE);
+            return LSBE_DEP_ARRAY_SIZE;
         }
 
         dptRoot = parseDepCond(subReq->dependCond, auth, &parseError,
                                &Reply->badJobName, &jFlag, 0);
         if (dptRoot == NULL) {
             freeIdxListContext();
-            return(parseError);
+            return parseError;
         }
 
 
@@ -6140,30 +6059,124 @@ checkJobParams (struct jData *job, struct submitReq *subReq,
 
     if (subReq->options2 & SUB2_JOB_PRIORITY)  {
         int error;
-        if ( checkUserPriority(job, subReq->userPriority, &error)) {
+        if (checkUserPriority(job, subReq->userPriority, &error)) {
 
             job->jobPriority = subReq->userPriority;
         }
         else {
-            return(error);
+            return error;
         }
 
     }
-    else if ( maxUserPriority > 0 ) {
+    else if (maxUserPriority > 0) {
 
         job->jobPriority  = maxUserPriority/2;
     }
 
+    if (subReq->options2 & SUB2_JOB_GROUP) {
+        int cc;
+        cc = check_job_group(job, auth);
+        if (cc != LSBE_NO_ERROR)
+            return cc;
+    }
 
-    return (LSBE_NO_ERROR);
+    job->pqPtr = getLimitUsageData(LIMIT_CONSUMER_PER_PROJECT,
+                                   subReq->projectName,
+                                   job->qPtr->queue);
+    job->uqPtr = getLimitUsageData(LIMIT_CONSUMER_PER_USER,
+                                   job->userName,
+                                   job->qPtr->queue);
+    if (job->numHostPtr > 0)
+        job->hqPtr = getLimitUsageData(LIMIT_CONSUMER_PER_HOST,
+                                       job->hPtr[0]->host,
+                                       job->qPtr->queue);
 
+    return LSBE_NO_ERROR;
+}
+
+/*
+ * Limit usage per user/host/project on queue.
+ */
+struct resData *
+getLimitUsageData(limitConsumerType_t type, char *consumer, char *queue)
+{
+    struct hTab *hash;
+    int num;
+    struct consumerData *cData = NULL;
+    struct resData *rData = NULL;
+    hEnt *cEnt = NULL;
+    hEnt *rEnt = NULL;
+    int new;
+
+    if (limitConf == NULL || limitConf->nLimit == 0)
+        return NULL;
+
+    if (type == LIMIT_CONSUMER_PER_PROJECT) {
+        hash = &pDataTab;
+        num = MAX_RES_LIMITS;
+    } else if (type == LIMIT_CONSUMER_PER_HOST) {
+        hash = &hDataTab;
+        num = numofhosts();
+    } else if (type == LIMIT_CONSUMER_PER_USER) {
+        hash = &uDataTab;
+        num = numofusers;
+    }
+
+    if (hash->numEnts == 0)
+        h_initTab_(hash, num);
+
+    cEnt = h_addEnt_(hash, consumer, &new);
+    if (new) {
+        cData = my_calloc(1,
+                          sizeof(struct consumerData),
+                          "getLimitUsageData");
+        cData->type = type;
+        cData->consumer = safeSave(consumer);
+        cData->rAcct = my_calloc(1,
+                                 sizeof(struct hTab),
+                                 "getLimitUsageData");
+        h_initTab_(cData->rAcct, numofqueues);
+        cEnt->hData = cData;
+    }
+
+    rEnt = h_addEnt_(((struct consumerData *)cEnt->hData)->rAcct, queue, &new);
+    if (new) {
+        rData = my_calloc(1,
+                          sizeof(struct resData),
+                          "getLimitUsageData");
+        if (type == LIMIT_CONSUMER_PER_PROJECT) {
+            rData->project = safeSave(consumer);
+        } else if (type == LIMIT_CONSUMER_PER_HOST) {
+            rData->host = safeSave(consumer);
+        } else if (type == LIMIT_CONSUMER_PER_USER) {
+            rData->user = safeSave(consumer);
+        }
+        rData->queue = safeSave(queue);
+        rData->maxJobs = INFINIT_INT;
+        rData->numJobs = 0;
+        rData->numPENDJobs = 0;
+        rData->numRESERVEJobs = 0;
+        rData->numRUNJobs = 0;
+        rData->numSSUSPJobs = 0;
+        rData->numUSUSPJobs = 0;
+        rData->maxSlots = INFINIT_INT;
+        rData->numSlots = 0;
+        rData->numPENDSlots = 0;
+        rData->numRESERVESlots = 0;
+        rData->numRUNSlots = 0;
+        rData->numSSUSPSlots = 0;
+        rData->numUSUSPSlots = 0;
+        rEnt->hData = rData;
+    }
+
+    return rEnt->hData;
 }
 
 struct resVal *
 checkResReq(char *resReq, int checkOptions)
 {
     static char fname[] = "checkResReq";
-    int rusgDefined = FALSE, jj, isSet, options;
+    int rusgDefined = false, jj, isSet, options;
     struct resVal *resValPtr = NULL;
     struct tclHostData tclHostData;
 
@@ -6191,14 +6204,14 @@ checkResReq(char *resReq, int checkOptions)
 
     if (resValPtr->xorExprs != NULL) {
         for (jj = 0; resValPtr->xorExprs[jj]; jj++) {
-            if (evalResReq(resValPtr->xorExprs[jj], &tclHostData, FALSE) < 0) {
+            if (evalResReq(resValPtr->xorExprs[jj], &tclHostData, false) < 0) {
                 freeTclHostData (&tclHostData);
                 goto error;
             }
         }
     } else {
 
-        if (evalResReq(resValPtr->selectStr, &tclHostData, FALSE) < 0) {
+        if (evalResReq(resValPtr->selectStr, &tclHostData, false) < 0) {
             freeTclHostData (&tclHostData);
             goto error;
         }
@@ -6215,9 +6228,9 @@ checkResReq(char *resReq, int checkOptions)
         if (jj > allLsInfo->numIndx
             && (getResource (allLsInfo->resTable[jj].name) == NULL))
             goto error;
-        rusgDefined = TRUE;
+        rusgDefined = true;
     }
-    if (rusgDefined == TRUE) {
+    if (rusgDefined == true) {
         if (resValPtr->duration <= 0 || (resValPtr->decay < 0.0) )
             goto error;
     }
@@ -6261,7 +6274,7 @@ copyJobBill (struct submitReq *subReq,
     memcpy((char *) jobBill, (char *)subReq , sizeof (struct submitReq));
     now = time(NULL);
 
-    if (jobId != FALSE) {
+    if (jobId != false) {
         char fn[MAXFILENAMELEN];
 
         jobBill->submitTime = now;
@@ -6371,6 +6384,16 @@ copyJobBill (struct submitReq *subReq,
     } else {
         jobBill->userGroup = strdup("");
     }
+
+    if (subReq->options2 & SUB2_JOB_GROUP)
+        jobBill->job_group = strdup(subReq->job_group);
+    else
+        jobBill->job_group = strdup("");
+
+    if (subReq->options2 & SUB2_JOB_DESC)
+        jobBill->job_description = strdup(subReq->job_description);
+    else
+        jobBill->job_description = strdup("");
 }
 
 void
@@ -6443,6 +6466,8 @@ freeJData(struct jData *jPtr)
         _free_(jPtr->msgs[i]->msg);
     _free_(jPtr->msgs);
 
+    _free_(jPtr->run_rusage);
+
     FREE_ALL_GRPS_CAND(jPtr);
 
     if (jPtr->numRef <= 0 ) {
@@ -6483,6 +6508,8 @@ freeSubmitReq(struct submitReq *jobBill)
     FREEUP(jobBill->loginShell);
     FREEUP(jobBill->schedHostType);
     FREEUP(jobBill->userGroup);
+    FREEUP(jobBill->job_group);
+    FREEUP(jobBill->job_description);
 
     if (jobBill->numAskedHosts > 0) {
         for (i = 0; i < jobBill->numAskedHosts; i++)
@@ -6501,7 +6528,7 @@ freeSubmitReq(struct submitReq *jobBill)
  *
  * to: targer submitReq
  * old: is the submitReq of the job
- * req: is teh new requested submitReq
+ * req: is the new requested submitReq
  *
  */
 static int
@@ -6638,6 +6665,8 @@ mergeSubReq(struct submitReq *to, struct submitReq *old,
             to->fname = safeSave(old->fname);}                          \
         else to->fname = safeSave("");}
 
+    mergeStrField2(job_description, SUB2_JOB_DESC);
+
     if ( maxUserPriority < 0 ) {
         mergeIntField2(userPriority, SUB2_JOB_PRIORITY, -1);
     }
@@ -6768,12 +6797,12 @@ mergeSubReq(struct submitReq *to, struct submitReq *old,
                     if ((cpuFactor = getHostFactor (old->hostSpec)) == NULL) {
                         ls_syslog(LOG_ERR, _i18n_msg_get(ls_catd , NL_SETN, 6528,
                                                          "%s: Cannot find cpu factor for hostSpec <%s>"), fname, to->hostSpec); /* catgets 6528 */
-                        return (LSBE_BAD_HOST_SPEC);
+                        return LSBE_BAD_HOST_SPEC;
                     }
                 }
                 if (*cpuFactor != 0)
                     to->rLimits[i] = old->rLimits[i]/(*cpuFactor);
-                FREEUP (to->hostSpec);
+                FREEUP(to->hostSpec);
                 to->hostSpec = safeSave (old->hostSpec);
             } else
                 to->rLimits[i] = old->rLimits[i];
@@ -6869,7 +6898,7 @@ inZomJobList (struct jData *oldjob, int mail)
     struct jData *newjob, *jp = jDataList[ZJL]->forw;
     int i;
 
-    if (mail == TRUE)
+    if (mail == true)
         mailUser (oldjob);
 
     newjob = initJData((struct jShared *) my_calloc(1, sizeof(struct jShared),
@@ -6923,7 +6952,7 @@ inZomJobList (struct jData *oldjob, int mail)
 
 
     newjob->pendEvent.sig = SIGTERM;
-    eventPending = TRUE;
+    eventPending = true;
 
     if ((newjob->shared->jobBill.options & SUB_CHKPNTABLE) &&
         ((oldjob->shared->jobBill.options & SUB_RESTART) ||
@@ -6963,7 +6992,7 @@ isInZomJobList(struct hData *hData, struct statusReq *statusReq)
 }
 
 struct jData *
-getZombieJob (LS_LONG_INT jobId)
+getZombieJob(LS_LONG_INT jobId)
 {
     struct jData *jData;
 
@@ -6971,18 +7000,17 @@ getZombieJob (LS_LONG_INT jobId)
          jData = jData->back) {
         if (jData->jobId != jobId)
             continue;
-        return (jData);
+        return jData;
     }
     return NULL;
-
 }
 
 
 void
 accumRunTime(struct jData *jData, int newStatus, time_t eventTime)
 {
-    int             diffTime = 0;
-    time_t          currentTime;
+    int diffTime = 0;
+    time_t currentTime;
 
     if (eventTime != 0)
         currentTime = eventTime;
@@ -7008,7 +7036,7 @@ accumRunTime(struct jData *jData, int newStatus, time_t eventTime)
 }
 
 int
-msgJob (struct bucket *bucket, struct lsfAuth *auth)
+msgJob(struct bucket *bucket, struct lsfAuth *auth)
 {
     struct jData *jpbw;
     int reply;
@@ -7019,14 +7047,14 @@ msgJob (struct bucket *bucket, struct lsfAuth *auth)
                   lsb_jobid2str(bucket->proto.jobId), bucket->proto.msgId);
 
     if ((jpbw = getJobData (bucket->proto.jobId)) == NULL)
-        return (LSBE_NO_JOB);
+        return LSBE_NO_JOB;
 
 
     if (auth) {
         if (auth->uid != 0 && !jgrpPermitOk(auth, jpbw->jgrpNode)
             && !isAuthQueAd (jpbw->qPtr, auth)) {
             if ( !isJobOwner(auth, jpbw))
-                return (LSBE_PERMISSION);
+                return LSBE_PERMISSION;
         }
     }
 
@@ -7063,13 +7091,12 @@ msgJob (struct bucket *bucket, struct lsfAuth *auth)
             }
     }
 
-    return (reply);
-
+    return reply;
 }
 
 
 static sbdReplyType
-msgStartedJob (struct jData *jData, struct bucket *bucket)
+msgStartedJob(struct jData *jData, struct bucket *bucket)
 {
     static char fname[] = "msgStartedJob";
     sbdReplyType reply;
@@ -7081,12 +7108,11 @@ msgStartedJob (struct jData *jData, struct bucket *bucket)
             QUEUE_REMOVE(bucket);
             QUEUE_APPEND(bucket, jData->hPtr[0]->msgq[MSG_STAT_QUEUED]);
             bucket->bufstat = MSG_STAT_QUEUED;
-            return(LSBE_OP_RETRY);
+            return LSBE_OP_RETRY;
         }
     }
 
-    reply = msg_job (jData, bucket->storage, &jobReply);
-
+    reply = msg_job(jData, bucket->storage, &jobReply);
     switch (reply) {
         case ERR_NO_ERROR:
             break;
@@ -7101,12 +7127,12 @@ msgStartedJob (struct jData *jData, struct bucket *bucket)
                 && (UNREACHABLE (jData->hPtr[0]->hStatus))) {
                 jData->newReason = EXIT_KILL_ZOMBIE;
                 jData->jStatus |= JOB_STAT_ZOMBIE;
-                inZomJobList (jData, FALSE);
+                inZomJobList (jData, false);
                 jStatusChange (jData, JOB_STAT_EXIT, LOG_IT, fname);
             }
     }
 
-    return (ERR_NO_ERROR);
+    return ERR_NO_ERROR;
 }
 
 static void
@@ -7312,7 +7338,7 @@ getReserveParams (struct resVal *resValPtr, int *duration, int *rusage_bit_map)
 }
 
 void
-tryResume(void)
+tryResume(struct qData *qPtr)
 {
     char fname[] = "tryResume";
     struct jData *jp;
@@ -7326,11 +7352,13 @@ tryResume(void)
     if (logclass & (LC_SCHED | LC_EXEC))
         ls_syslog (LOG_DEBUG1, "%s: Enter this routinue....", fname);
 
-    for (hPtr = (struct hData *)hostList->back;
-         hPtr != (void *)hostList;
-         hPtr = hPtr->back) {
+    if (0) {
+        for (hPtr = (struct hData *)hostList->back;
+             hPtr != (void *)hostList;
+             hPtr = hPtr->back) {
 
-        hPtr->flags &= ~HOST_JOB_RESUME;
+            hPtr->flags &= ~HOST_JOB_RESUME;
+        }
     }
 
     for (jp = jDataList[SJL]->back; jp != jDataList[SJL]; jp = next) {
@@ -7341,37 +7369,50 @@ tryResume(void)
         if (!IS_SUSP(jp->jStatus))
             continue;
 
-        if (jp->hPtr[0]->flags & HOST_JOB_RESUME)
+        if (0 && jp->hPtr[0]->flags & HOST_JOB_RESUME)
             continue;
 
-        if (logclass & (LC_EXEC))
-            ls_syslog(LOG_DEBUG3, "%s: job=%s jStatus=%x reason=%x subreason=%d actPid=%d>", fname, lsb_jobid2str(jp->jobId), jp->jStatus, jp->newReason, jp->subreasons, jp->actPid);
+        ls_syslog(LOG_INFO, "\
+%s: job %s jStatus %x reason %x subreason %d actPid %d",
+                      fname, lsb_jobid2str(jp->jobId),
+                      jp->jStatus, jp->newReason,
+                      jp->subreasons, jp->actPid);
 
         if (!(jp->jStatus & JOB_STAT_SSUSP)
             || !(jp->newReason & SUSP_MBD_LOCK)
             || (jp->actPid != 0))
             continue;
 
-        if ((jp->jFlags & JFLAG_SEND_SIG) && nSbdConnections > 0) {
+        /* HOST_JOB_RESUME
+         */
+        if (0 && (jp->jFlags & JFLAG_SEND_SIG) && nSbdConnections > 0) {
 
             for (sbdPtr = sbdNodeList.forw; sbdPtr != &sbdNodeList;
                  sbdPtr = sbdPtr->forw) {
                 if (sbdPtr->jData != jp)
                     continue;
-                found = TRUE;
+                found = true;
                 break;
             }
-            if (found == TRUE) {
+            if (found == true) {
                 jp->hPtr[0]->flags |= HOST_JOB_RESUME;
                 continue;
             }
         }
+
+        /* There is a queue in which we try to resume
+         */
+        if (qPtr != NULL
+            && jp->qPtr != qPtr) {
+            continue;
+        }
+
         if (jp->jStatus & JOB_STAT_RESERVE) {
-            updResCounters (jp, jp->jStatus & ~JOB_STAT_RESERVE);
+            updResCounters(jp, jp->jStatus & ~JOB_STAT_RESERVE);
             jp->jStatus &= ~JOB_STAT_RESERVE;
         }
         resumeSig = 0;
-        if ((returnCode = shouldResume (jp, &resumeSig)) != CANNOT_RESUME) {
+        if ((returnCode = shouldResume(jp, &resumeSig)) != CANNOT_RESUME) {
 
             if (!(jp->jStatus & JOB_STAT_RESERVE)) {
                 if (logclass & (LC_EXEC))
@@ -7382,11 +7423,28 @@ tryResume(void)
             }
 
             if (returnCode == RESUME_JOB) {
-                sigStartedJob (jp, resumeSig, 0, 0);
+                sigStartedJob(jp, resumeSig, 0, 0);
                 jp->jFlags |= JFLAG_SEND_SIG;
-                jp->hPtr[0]->flags |= HOST_JOB_RESUME;
+                if (0)
+                    jp->hPtr[0]->flags |= HOST_JOB_RESUME;
 
-                adjLsbLoad (jp, TRUE, TRUE);
+                /* Clean the flag so that check_token_status()
+                 * will count this job and possibly not return
+                 * this token to glb. Here we are racing with
+                 * sbd that is resuming the job in async way.
+                 */
+                ls_syslog(LOG_INFO, "\
+%s: job %s is being resumed flags %s", __func__, lsb_jobid2str(jp->jobId),
+                          str_flags(jp->jFlags));
+
+                if (jp->jFlags & JFLAG_RES_PREEMPTED)
+                    jp->jFlags &= ~JFLAG_RES_PREEMPTED;
+                if (jp->jFlags & JFLAG_SLOT_PREEMPTED) {
+                    jp->jFlags &= ~JFLAG_SLOT_PREEMPTED;
+                    jp->preempted_by = 0;
+                }
+
+                adjLsbLoad (jp, true, true);
                 if (logclass & (LC_EXEC))
                     ls_syslog (LOG_DEBUG2, "%s: Resume job <%s> with signal value <%d>", fname, lsb_jobid2str(jp->jobId), resumeSig);
             } else {
@@ -7406,11 +7464,15 @@ shouldResume (struct jData *jp, int *resumeSig)
     static char fname[] = "shouldResume";
     int saveReason, saveSubReasons, returnCode = RESUME_JOB;
 
-    if (logclass & (LC_EXEC))
-        ls_syslog(LOG_DEBUG3, "%s: job=%s; jStatus=%x; reasons=%x, subreason=%d, numHosts=%d", fname, lsb_jobid2str(jp->jobId), jp->jStatus, jp->newReason, jp->subreasons, jp->numHostPtr);
+    if (logclass & (LC_TRACE | LC_PREEMPT)) {
+        ls_syslog(LOG_INFO, "\
+%s: job %s jStatus 0x%x reasons 0x%x subreason %d numHosts %d", __func__,
+                  lsb_jobid2str(jp->jobId), jp->jStatus,
+                  jp->newReason, jp->subreasons, jp->numHostPtr);
+    }
 
-    if (   jp->jFlags & JFLAG_URGENT_NOSTOP
-           && *resumeSig == SIG_RESUME_USER) {
+    if (jp->jFlags & JFLAG_URGENT_NOSTOP
+        && *resumeSig == SIG_RESUME_USER) {
         jp->newReason = 0;
         jp->newReason |= SUSP_USER_RESUME;
         *resumeSig = 0;
@@ -7419,8 +7481,6 @@ shouldResume (struct jData *jp, int *resumeSig)
 
     saveReason = jp->newReason;
     saveSubReasons = jp->subreasons;
-
-
 
     if ((IS_SUSP(jp->jStatus)) && (jp->newReason & SUSP_RES_LIMIT) &&
         !(jp->subreasons & SUB_REASON_RUNLIMIT) ) {
@@ -7433,7 +7493,7 @@ shouldResume (struct jData *jp, int *resumeSig)
 
 
     if (!(jp->newReason & SUSP_MBD_LOCK)) {
-        if (shouldLockJob (jp, jp->jStatus) == TRUE) {
+        if (shouldLockJob (jp, jp->jStatus) == true) {
 
             ls_syslog(LOG_ERR, _i18n_msg_get(ls_catd , NL_SETN, 6535,
                                              "%s: The job<%s> status is <%x> and reasons is <%x>"), /* catgets 6535 */
@@ -7487,7 +7547,7 @@ shouldResume (struct jData *jp, int *resumeSig)
 
     saveReason = jp->newReason;
     saveSubReasons = jp->subreasons;
-    if (shouldResumeByLoad (jp) == FALSE)
+    if (shouldResumeByLoad (jp) == false)
 
         return CANNOT_RESUME;
     else {
@@ -7513,10 +7573,45 @@ shouldResume (struct jData *jp, int *resumeSig)
         } else {
             if (*resumeSig == 0 && (jp->newReason & SUSP_RES_RESERVE))
                 *resumeSig = SIG_RESUME_OTHER;
+            ls_syslog(LOG_INFO, "\
+%s: job %s jStatus 0x%x reasons 0x%x SIG_RESUME_OTHER", __func__,
+                      lsb_jobid2str(jp->jobId), jp->jStatus, jp->newReason);
             if (jp->newReason & ~(SUSP_RES_RESERVE | SUSP_MBD_LOCK))
                 jp->newReason &= ~SUSP_RES_RESERVE;
         }
     }
+
+    if (jp->jFlags & JFLAG_SLOT_PREEMPTED) {
+        bool_t b;
+
+        b = should_resume_by_job(jp);
+        if (b != true) {
+            if (logclass & LC_PREEMPT) {
+                ls_syslog(LOG_INFO, "\
+%s: job %s cannot resume jflags %s reason SUSP_MBD_PREEMPT", __func__,
+                          lsb_jobid2str(jp->jobId),
+                          str_flags(jp->jFlags));
+
+            }
+            jp->newReason |= SUSP_MBD_PREEMPT;
+            return CANNOT_RESUME;
+        }
+
+        if (logclass & LC_PREEMPT) {
+            ls_syslog(LOG_INFO, "\
+%s: job %s can resume jflags %s", __func__, lsb_jobid2str(jp->jobId),
+                      str_flags(jp->jFlags));
+        }
+
+        /* clear the job and the preempted_by jobid
+         * in the caller after we send the resume
+         * signal.
+         */
+        *resumeSig = SIG_RESUME_OTHER;
+        jp->newReason &= ~SUSP_MBD_PREEMPT;
+        return RESUME_JOB;
+    }
+
     return returnCode;
 }
 
@@ -7537,7 +7632,7 @@ shouldResumeByLoad(struct jData *jp)
 
 
     if (!IS_SUSP (jp->jStatus))
-        return FALSE;
+        return false;
 
     packJobThresholds(&thresholds, jp);
     numHosts = thresholds.nThresholds;
@@ -7569,7 +7664,7 @@ shouldResumeByLoad(struct jData *jp)
                 FREEUP (tclHostData);
             }
             FREEUP (loads);
-            return FALSE;
+            return false;
         }
         strcpy(loads[j].hostName, jp->hPtr[i]->host);
         loads[j].li = jp->hPtr[i]->lsfLoad;
@@ -7593,9 +7688,9 @@ shouldResumeByLoad(struct jData *jp)
     }
     FREEUP (loads);
 
-    if (resume == FALSE)
-        return FALSE;
-    return TRUE;
+    if (resume == false)
+        return false;
+    return true;
 }
 
 
@@ -7626,7 +7721,8 @@ shouldResumeByRes (struct jData *jp)
         return RESUME_JOB;
     }
 
-
+    /* Save all load values on hosts where the job is executed on.
+     */
     loads = (float **) my_malloc (jp->numHostPtr * sizeof (float *), fname);
     for (i = 0; i < jp->numHostPtr; i++) {
         loads [i] = (float *) my_malloc
@@ -7639,7 +7735,9 @@ shouldResumeByRes (struct jData *jp)
                 atof (jp->hPtr[i]->instances[j]->value);
     }
 
-    adjLsbLoad (jp, TRUE, TRUE);
+    /* Call adjLsbLoad() to adjust load for these hosts
+     */
+    adjLsbLoad (jp, true, true);
 
 
     FORALL_PRMPT_RSRCS(j) {
@@ -7671,6 +7769,8 @@ shouldResumeByRes (struct jData *jp)
     } ENDFORALL_PRMPT_RSRCS;
 
 
+    /* Check if loads on these hosts are less than zero.
+     */
     for (i = 0; i < jp->numHostPtr && returnCode != CANNOT_RESUME; i++) {
         for (j = 0; j < allLsInfo->numIndx; j++) {
             if (jp->hPtr[i]->lsbLoad[j] < 0.0
@@ -7694,6 +7794,8 @@ shouldResumeByRes (struct jData *jp)
         }
     }
 
+    /* Restore the original load values on these hosts.
+     */
     for (i = 0; i < jp->numHostPtr; i++) {
         char loadString[MAXLSFNAMELEN];
         for (j = 0; j < allLsInfo->numIndx; j++)
@@ -7705,10 +7807,27 @@ shouldResumeByRes (struct jData *jp)
         }
         FREEUP(loads[i]);
     }
-    FREEUP (loads);
+    FREEUP(loads);
 
-    return (returnCode);
+    return returnCode;
 
+}
+
+/* should_resume_by_job()
+ */
+static bool_t
+should_resume_by_job(struct jData *jPtr)
+{
+    struct jData *jPtr2;
+
+    jPtr2 = getJobData(jPtr->preempted_by);
+    if (jPtr2 == NULL)
+        return true;
+
+    if (IS_FINISH(jPtr2->jStatus))
+        return true;
+
+    return false;
 }
 
 static void
@@ -7798,8 +7917,8 @@ runJob(struct runJobRequest *request, struct lsfAuth *auth)
 
     if (auth) {
         if (auth->uid != 0
-            && isAuthManager(auth) == FALSE
-            && isAuthQueAd(job->qPtr, auth) == FALSE) {
+            && isAuthManager(auth) == false
+            && isAuthQueAd(job->qPtr, auth) == false) {
             ls_syslog(LOG_DEBUG, "\
 %s: user <%d> is not permitted to issue brun command for job <%s>",
                       __func__, auth->uid, lsb_jobid2str(job->jobId));
@@ -7856,7 +7975,7 @@ runJob(struct runJobRequest *request, struct lsfAuth *auth)
     job->newReason = 0;
 
     cc = dispatch_it(job);
-    if (cc == TRUE) {
+    if (cc == true) {
         ls_syslog(LOG_DEBUG, "%s: job <%s> dispatched succesfully to host %s",
                   __func__, lsb_jobid2str(request->jobId), request->hostname[0]);
         cc = LSBE_NO_ERROR;
@@ -7897,16 +8016,16 @@ setUrgentJobExecHosts(struct runJobRequest *request,
     numUniqueEntries = 0;
     for (i = 0; i < request->numHosts; i++) {
         char        *host = request->hostname[i];
-        bool_t      uniqueEntry = TRUE;
+        bool_t      uniqueEntry = true;
 
         for (j = 0; j < numUniqueEntries; j++) {
             if (strcmp(host, reqHosts[j]) == 0) {
-                uniqueEntry = FALSE;
+                uniqueEntry = false;
                 break;
             }
         }
 
-        if (uniqueEntry == TRUE)
+        if (uniqueEntry == true)
             reqHosts[numUniqueEntries++] = host;
     }
 
@@ -8022,7 +8141,7 @@ jDataSprintf(LIST_ENTRY_T *extra, void *hint)
     struct jData *job = (struct jData *)extra;
 
     sprintf(strBuf, "<%s>", (job->jobId >= 0) ? lsb_jobid2str(job->jobId) : "-1");
-    return (strBuf);
+    return strBuf;
 
 }
 
@@ -8046,7 +8165,7 @@ cleanCandHosts (struct jData *job)
     job->processed = 0;
     FREE_CAND_PTR(job);
     job->numCandPtr = 0;
-    job->usePeerCand = FALSE;
+    job->usePeerCand = false;
 
     FREE_ALL_GRPS_CAND(job);
 
@@ -8092,15 +8211,14 @@ checkUserPriority(struct jData *jp, int userPriority, int *errnum)
 {
     int isAdmin = 0 ;
 
-    if ( maxUserPriority <= 0 ) {
+    if (maxUserPriority <= 0)  {
         *errnum = LSBE_NO_JOB_PRIORITY;
-        return FALSE;
+        return false;
     }
 
-    if ( userPriority <= 0 || userPriority > MAX_JOB_PRIORITY) {
-
+    if (userPriority <= 0 || userPriority > MAX_JOB_PRIORITY) {
         *errnum = LSBE_BAD_USER_PRIORITY;
-        return FALSE;
+        return false;
     }
 
     if (isManager(jp->userName)) {
@@ -8109,13 +8227,12 @@ checkUserPriority(struct jData *jp, int userPriority, int *errnum)
 
     isAdmin += isQueAd(jp->qPtr, jp->userName) ;
 
-    if ( userPriority > maxUserPriority && !isAdmin) {
+    if (userPriority > maxUserPriority && !isAdmin) {
         *errnum = LSBE_BAD_USER_PRIORITY;
-        return ( FALSE);
+        return false;
     }
 
-    return TRUE;
-
+    return true;
 }
 
 static void
@@ -8133,27 +8250,28 @@ setClusterAdmin(bool_t admin)
 }
 
 static bool_t
-requestByClusterAdmin( )
+requestByClusterAdmin(void)
 {
     bool_t retVal = clusterAdminFlag;
 
-    clusterAdminFlag = FALSE;
-    return (retVal);
+    clusterAdminFlag = false;
+    return retVal;
 }
 
 
 void
-setNewSub(struct jData *jpbw, struct jData *job,
+setNewSub(struct jData *jpbw,
+          struct jData *job,
           struct submitReq *subReq,
           struct submitReq *modReq,
-          int delOptions, int delOptions2 )
+          int delOptions,
+          int delOptions2)
 {
     struct submitReq *newSub;
 
-    newSub = (struct submitReq *) my_malloc
-        (sizeof (struct submitReq), "handleJParameters");
+    newSub = my_calloc(1, sizeof (struct submitReq), "handleJParameters");
 
-    copyJobBill (&(job->shared->jobBill), newSub, FALSE);
+    copyJobBill(&(job->shared->jobBill), newSub, false);
 
     if (jpbw->newSub) {
         freeSubmitReq (jpbw->newSub);
@@ -8161,11 +8279,11 @@ setNewSub(struct jData *jpbw, struct jData *job,
     }
     jpbw->newSub = newSub;
 
-    if ( delOptions2 & SUB2_JOB_PRIORITY && maxUserPriority>0 ) {
+    if (delOptions2 & SUB2_JOB_PRIORITY && maxUserPriority > 0) {
 
         newSub->userPriority = maxUserPriority/2 ;
     }
-    else if ( modReq->options2 & SUB2_JOB_PRIORITY) {
+    else if (modReq->options2 & SUB2_JOB_PRIORITY) {
 
         int error=0;
         if (checkUserPriority(jpbw, modReq->userPriority, &error)) {
@@ -8182,25 +8300,21 @@ setNewSub(struct jData *jpbw, struct jData *job,
         newSub->options2 &= ~ SUB2_QUEUE_CHKPNT;
 
         newSub->chkpntDir = safeSave("");
-    }
-    else
-        if ( modReq->options & SUB_CHKPNT_DIR) {
+    } else if (modReq->options & SUB_CHKPNT_DIR) {
 
             FREEUP(newSub->chkpntDir);
             newSub->chkpntDir = safeSave(subReq->chkpntDir);
-            if ( subReq->chkpntPeriod > 0 )
+            if (subReq->chkpntPeriod > 0)
                 newSub->chkpntPeriod = subReq->chkpntPeriod;
             newSub->options  |= SUB_CHKPNT_DIR;
             newSub->options  |= SUB_CHKPNT_PERIOD;
             newSub->options2 &= ~ SUB2_QUEUE_CHKPNT;
         }
 
-    if ( delOptions & SUB_RERUNNABLE ) {
+    if (delOptions & SUB_RERUNNABLE) {
         newSub->options  &= ~ SUB_RERUNNABLE;
         newSub->options2 &= ~ SUB2_QUEUE_RERUNNABLE;
-    }
-    else
-        if ( modReq->options & SUB_RERUNNABLE) {
+    } else if (modReq->options & SUB_RERUNNABLE) {
             newSub->options  |= SUB_RERUNNABLE;
             newSub->options  &=  ~ SUB2_QUEUE_RERUNNABLE;
         }
@@ -8215,16 +8329,13 @@ setNewSub(struct jData *jpbw, struct jData *job,
                  &&!(jpbw->shared->jobBill.options & SUB_CHKPNT_DIR)))) {
 
             struct qData *qp = job->qPtr;
-
-
             newSub->options  &= ~ SUB_CHKPNT_DIR;
             newSub->options  &= ~ SUB_CHKPNT_PERIOD;
             newSub->options2 &= ~ SUB2_QUEUE_CHKPNT;
             newSub->chkpntPeriod = -1;
             FREEUP(newSub->chkpntDir);
 
-
-            if ( qp->qAttrib & Q_ATTRIB_CHKPNT ) {
+            if (qp->qAttrib & Q_ATTRIB_CHKPNT) {
                 char dir[MAXLINELEN];
                 char jobIdStr[20];
 
@@ -8253,14 +8364,12 @@ setNewSub(struct jData *jpbw, struct jData *job,
             newSub->options  &= ~ SUB_RERUNNABLE;
             newSub->options2  &= ~ SUB2_QUEUE_RERUNNABLE;
 
-
-            if ( qp->qAttrib & Q_ATTRIB_RERUNNABLE ) {
+            if (qp->qAttrib & Q_ATTRIB_RERUNNABLE) {
                 newSub->options  |= SUB_RERUNNABLE;
                 newSub->options2 |= SUB2_QUEUE_RERUNNABLE;
             }
         }
     }
-
 
 }
 
@@ -8362,9 +8471,9 @@ arrayRequeue(struct jData      *jArray,
     static char       fname[] = "arrayRequeue";
     struct jData      *jPtr;
     time_t            requeueTime;
-    int               requeueSuccess = FALSE;
+    int               requeueSuccess = false;
     int               requeueReply  = LSBE_NO_ERROR;
-    bool_t            requeueOneElement = FALSE;
+    bool_t            requeueOneElement = false;
 
     if (logclass & (LC_TRACE | LC_SIGNAL)) {
         ls_syslog(LOG_DEBUG,"\
@@ -8396,12 +8505,12 @@ arrayRequeue(struct jData      *jArray,
             return(LSBE_EXCEPT_ACTION);
         }
 
-        requeueOneElement = FALSE;
+        requeueOneElement = false;
         jPtr = jArray->nextJob;
 
     } else {
 
-        requeueOneElement = TRUE;
+        requeueOneElement = true;
         jPtr = jArray;
     }
 
@@ -8437,7 +8546,7 @@ arrayRequeue(struct jData      *jArray,
                 SET_STATE(jPtr->jStatus, JOB_STAT_PEND);
             }
 
-            requeueSuccess = TRUE;
+            requeueSuccess = true;
 
         } else if ( (IS_START(jPtr->jStatus)
                      || (jPtr->jStatus & JOB_STAT_UNKWN))
@@ -8448,7 +8557,7 @@ arrayRequeue(struct jData      *jArray,
             jPtr->pendEvent.sig       = SIG_KILL_REQUEUE;
             jPtr->pendEvent.sigDel    = DEL_ACTION_REQUEUE;
             jPtr->pendEvent.sig1Flags = sigPtr->chkPeriod;
-            eventPending = TRUE;
+            eventPending = true;
 
             if (mSchedStage != M_STAGE_REPLAY) {
                 log_signaljob(jPtr,
@@ -8456,7 +8565,7 @@ arrayRequeue(struct jData      *jArray,
                               authPtr->uid,
                               authPtr->lsfUserName);
             }
-            requeueSuccess = TRUE;
+            requeueSuccess = true;
 
         } else {
             if (sigPtr->actFlags & REQUEUE_RUN) {
@@ -8493,7 +8602,7 @@ arrayRequeue(struct jData      *jArray,
         }
 
     } while ((jPtr = jPtr->nextJob)
-             && (requeueOneElement == FALSE));
+             && (requeueOneElement == false));
 
     if (requeueSuccess)
         return LSBE_NO_ERROR;
@@ -8555,12 +8664,12 @@ void closeSbdConnect4ZombieJob(struct jData *jData)
 static int checkSubHost(struct jData *job)
 {
 
-    int isTypeUnkown = FALSE;
-    int isModelUnkown = FALSE;
-    int requireType = FALSE;
-    int requireModel = FALSE;
-    int requireLocalType = FALSE;
-    int requireLocalModel = FALSE;
+    int isTypeUnkown = false;
+    int isModelUnkown = false;
+    int requireType = false;
+    int requireModel = false;
+    int requireLocalType = false;
+    int requireLocalModel = false;
     char *select = NULL;
     char *jSelect = NULL;
     char *qSelect = NULL;
@@ -8572,19 +8681,23 @@ static int checkSubHost(struct jData *job)
     }
 
     submitHost = getLsfHostData(job->shared->jobBill.fromHost);
+    if (submitHost == NULL
+        && daemonParams[LIM_ACCEPT_FLOAT_CLIENT].paramValue)
+        return LSBE_NO_ERROR;
+
     if (submitHost == NULL) {
         return LSBE_BAD_SUBMISSION_HOST;
     }
 
     if (strcmp(submitHost->hostType, "UNKNOWN_AUTO_DETECT") == 0) {
-        isTypeUnkown = TRUE;
+        isTypeUnkown = true;
     }
 
     if (strcmp(submitHost->hostModel, "UNKNOWN_AUTO_DETECT") == 0) {
-        isModelUnkown = TRUE;
+        isModelUnkown = true;
     }
 
-    if (isTypeUnkown == FALSE && isModelUnkown == FALSE ) {
+    if (isTypeUnkown == false && isModelUnkown == false ) {
         return LSBE_NO_ERROR;
     }
 
@@ -8604,7 +8717,7 @@ static int checkSubHost(struct jData *job)
 
     if (len == 0) {
 
-        if ( isTypeUnkown == FALSE) {
+        if ( isTypeUnkown == false) {
             return LSBE_NO_ERROR;
         }
         if (job->numAskedPtr > 0) {
@@ -8631,26 +8744,26 @@ static int checkSubHost(struct jData *job)
 
 
     if ( strstr(select, "[type \"eq\"")) {
-        requireType = TRUE;
+        requireType = true;
         if (strstr(select, "[type \"eq\" \"local\"")) {
-            requireLocalType = TRUE;
+            requireLocalType = true;
         } else {
-            requireLocalType = FALSE;
+            requireLocalType = false;
         }
     } else {
-        requireType = FALSE;
+        requireType = false;
     }
 
 
     if ( strstr(select, "[model \"eq\"")) {
-        requireModel = TRUE;
+        requireModel = true;
         if (strstr(select, "[model \"eq\" \"local\"")) {
-            requireLocalModel = TRUE;
+            requireLocalModel = true;
         } else {
-            requireLocalModel = FALSE;
+            requireLocalModel = false;
         }
     } else {
-        requireModel = FALSE;
+        requireModel = false;
     }
 
     FREEUP(select);
@@ -8770,13 +8883,23 @@ rmMessageFile(struct jData *jPtr)
     unlink(file);
 }
 
-/* jcompare()
- *
- * Job sorting function.
- *
+/*
+ * Job sorting functions.
  */
-#if 0
-inPendJobList(struct jData *job, int listno, time_t requeueTime))
+void
+_inPendJobList_(struct jData *job, int listno, time_t requeueTime)
+{
+    listInsertEntryAtFront((LIST_T *)jDataList[listno],
+                           (LIST_ENTRY_T *)job);
+
+    if (mSchedStage == M_STAGE_REPLAY)
+        return;
+    if (0)
+        sort_job_list(listno);
+}
+
+void
+sort_job_list(int listno)
 {
     LIST_T *l;
     struct jData *jPtr;
@@ -8784,14 +8907,22 @@ inPendJobList(struct jData *job, int listno, time_t requeueTime))
     int num;
     int cc;
 
-    listInsertEntryAtFront((LIST_T *)jDataList[listno],
-                           (LIST_ENTRY_T *)job);
-    l = (LIST_T *)jDataList[listno];
-    num = LIST_NUM_ENTRIES(l);
-    if (num == 1)
+    /* Have to count the jobs, cannot trust the numEnts
+     * in the list_t data as not all list access use
+     * the list_t interface.
+     */
+    cc = 0;
+    for (jPtr = (struct jData *)jDataList[listno]->back;
+         jPtr != (void *)jDataList[listno];
+         jPtr = jPtr->back)
+        ++cc;
+
+    if (cc == 0
+        || cc == 1)
         return;
 
-    jArray = calloc(num, sizeof(struct jData *));
+    jArray = calloc(cc, sizeof(struct jData *));
+    l = (LIST_T *)jDataList[listno];
 
     cc = 0;
     while ((jPtr = (struct jData *)listPop(l))) {
@@ -8799,15 +8930,28 @@ inPendJobList(struct jData *job, int listno, time_t requeueTime))
         ++cc;
     }
 
-    qsort(jArray, num, sizeof(struct jData *), jcompare);
+    qsort(jArray, cc, sizeof(struct jData *), jcompare);
+    num = cc;
 
     for (cc = 0; cc < num; cc++) {
         jPtr = jArray[cc];
-        listInsertEntryAtFront(l, (LIST_ENTRY_T *)jPtr);
+        /* jobs are sorted in increasing order by queue
+         * priority and jobids switched so the latest job
+         * in the array jArray[num - 1] is the one with
+         * the highest priority so it should be pointed
+         * by the list->back pointer.
+         */
+        listInsertEntryAtBack(l, (LIST_ENTRY_T *)jPtr);
     }
+
     free(jArray);
 }
 
+/* jcompare()
+ *
+ * Sort jobs in ascending order as we typically access then via
+ * the back pointer which is from the higher priority direction.
+ */
 static int
 jcompare(const void *j1, const void *j2)
 {
@@ -8824,23 +8968,155 @@ jcompare(const void *j1, const void *j2)
     if (jPtr1->qPtr->priority < jPtr2->qPtr->priority)
         return -1;
 
-    /* Same queue compare priority
+    /* Same queue compare job priority as set by btop
+     * or bbot.
      */
     if (jPtr1->priority > jPtr2->priority)
         return 1;
     if (jPtr1->priority < jPtr2->priority)
         return -1;
 
-    /* Same priority compare jobids
+    /* Same priority compare jobids. A job with higher jobid is
+     * "smaller" then job with lesser jobid because it has arrived
+     * after.
      */
-    if (jPtr1->jobId > jPtr2->jobId)
-        return 1;
-    if (jPtr1->jobId < jPtr2->jobId)
+    if (LSB_ARRAY_JOBID(jPtr1->jobId) > LSB_ARRAY_JOBID(jPtr2->jobId))
         return -1;
+    if (LSB_ARRAY_JOBID(jPtr1->jobId) < LSB_ARRAY_JOBID(jPtr2->jobId))
+        return 1;
+
+    if (LSB_ARRAY_IDX(jPtr1->jobId) > LSB_ARRAY_IDX(jPtr2->jobId))
+        return -1;
+    if (LSB_ARRAY_IDX(jPtr1->jobId) < LSB_ARRAY_IDX(jPtr2->jobId))
+        return 1;
 
     abort();
 
     return 0;
 }
-#endif
 
+/* handle_float_client()
+ *
+ * Floating clients are not in the openlava
+ * host list or know to mbatchd. Use the master
+ * as the from host and set the resreq to any host
+ * type unless the job has resource requirement.
+ */
+static struct hData *
+handle_float_client(struct submitReq *req)
+{
+    struct hData *hPtr;
+
+    hPtr = getHostData(masterHost);
+    if (hPtr == NULL) {
+        ls_syslog(LOG_ERR, "\
+%s: masterHosts %s host data not found?", __func__);
+        return NULL;
+    }
+
+    if (req->resReq == 0) {
+        req->resReq = strdup("type == any");
+    }
+
+    return hPtr;
+}
+
+/* set_job_bbot_last_priority()
+ *
+ * If the job last in the queue was bbot then we have
+ * to decrese our sorting priority by one to make sure
+ * qsort() puts up after it.
+ */
+static void
+set_job_last_bbot_priority(struct jData *jPtr)
+{
+    linkiter_t iter;
+    struct last_bbot_queue *lqueue;
+
+    traverse_init(bbot_queue, &iter);
+    while ((lqueue = traverse_link(&iter))) {
+
+        if (jPtr->qPtr != lqueue->qPtr)
+            continue;
+        if (lqueue->last_bbot == -1)
+            break;
+
+        lqueue->last_bbot = lqueue->last_bbot - 1;
+        jPtr->priority = lqueue->last_bbot;
+    }
+}
+/* ssusp_job()
+ * try to resume a job that has been preempted
+ * either by glb or by queue preemption.
+ */
+static void
+ssusp_job(struct jData *jPtr)
+{
+    ls_syslog(LOG_INFO, "\
+%s: jobID %s state 0x%x flags %s", __func__, lsb_jobid2str(jPtr->jobId),
+              jPtr->jStatus, str_flags(jPtr->jFlags));
+
+    if (jPtr->jStatus & JOB_STAT_USUSP) {
+
+        /* A job has been preemted for resources
+         * or slots.
+         */
+        if ((jPtr->jFlags & JFLAG_RES_PREEMPTED)
+            || (jPtr->jFlags & JFLAG_SLOT_PREEMPTED)) {
+
+            if (resume_job(jPtr) < 0) {
+                ls_syslog(LOG_INFO, "\
+%s: failed in resuming job %s jflags %s", __func__,
+                          lsb_jobid2str(jPtr->jobId),
+                          str_flags(jPtr->jFlags));
+            }
+        }
+    }
+}
+
+/* resume_job()
+ *
+ * The job will only be resumed in tryResume() here
+ * we just transition the state from USUSP to SSUSP
+ */
+static int
+resume_job(struct jData *jPtr)
+{
+    struct signalReq s;
+    struct lsfAuth auth;
+    int cc;
+
+    s.sigValue = SIGCONT;
+    s.jobId = jPtr->jobId;
+    s.chkPeriod = 0;
+    s.actFlags = 0;
+
+    memset(&auth, 0, sizeof(struct lsfAuth));
+    strcpy(auth.lsfUserName, lsbManager);
+    auth.gid = auth.uid = managerId;
+
+    /* The job will only be resumed if there
+     * are free tokens in shouldResume() function.
+     */
+    cc = signalJob(&s, &auth);
+    if (cc != LSBE_NO_ERROR) {
+        ls_syslog(LOG_ERR, "\
+%s: error while resuming job %s state %d", __func__,
+                  lsb_jobid2str(jPtr->jobId), jPtr->jStatus);
+        return -1;
+    }
+
+    if (logclass & LC_PREEMPT) {
+        ls_syslog(LOG_INFO, "\
+%s: jobid %s after being stopped jFlags %s next state must be JOB_STAT_SSUSP",
+              __func__, lsb_jobid2str(jPtr->jobId), str_flags(jPtr->jFlags));
+    }
+
+    /* Do not clean the  JFLAG_PREEMPT_GLB or JFLAG_JOB_PREEMPTED
+     * as get_job_tokens() will use them to ask for more tokens
+     * to glb should it be enabled. The flags will be cleaned
+     * in tryResume() if the job really resumes to JOB_STAT_RUN.
+     */
+
+    return 0;
+}

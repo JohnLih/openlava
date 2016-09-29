@@ -1,6 +1,6 @@
 /*
+ * Copyright (C) 2015 - 2016 David Bigagli
  * Copyright (C) 2007 Platform Computing Inc
- * Copyright (C) 2015 David Bigagli
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of version 2 of the GNU General Public License as
@@ -24,6 +24,7 @@
 static void prtQueuesLong(int, struct queueInfoEnt *);
 static void prtQueuesShort(int, struct queueInfoEnt *);
 static void print_slot_shares(struct queueInfoEnt *);
+static void print_slot_owned(struct queueInfoEnt *);
 
 static char wflag = FALSE;
 extern int terminateWhen_(int *, char *);
@@ -317,6 +318,8 @@ prtQueuesLong(int numQueues, struct queueInfoEnt *queueInfo)
                 printf("  NO_INTERACTIVE");
             if (qp->qAttrib & Q_ATTRIB_ONLY_INTERACTIVE)
                 printf("  ONLY_INTERACTIVE");
+            if (qp->qAttrib & Q_ATTRIB_OWNERSHIP)
+                printf("  OWNED_SLOTS");
             if (qp->qAttrib & Q_ATTRIB_ROUND_ROBIN)
                 printf("ROUND_ROBIN_SCHEDULING:  yes\n");
             printf("\n");
@@ -327,6 +330,10 @@ prtQueuesLong(int numQueues, struct queueInfoEnt *queueInfo)
          */
         if (qp->qAttrib & Q_ATTRIB_FAIRSHARE) {
             print_slot_shares(qp);
+        }
+
+        if (qp->qAttrib & Q_ATTRIB_OWNERSHIP) {
+            print_slot_owned(qp);
         }
 
         if (qp->qAttrib & Q_ATTRIB_PREEMPTIVE)
@@ -363,8 +370,13 @@ prtQueuesLong(int numQueues, struct queueInfoEnt *queueInfo)
             printf("REQUEUE_EXIT_VALUES:  %s\n", qp->requeueEValues);
         if (strcmp (qp->resReq, " ") != 0)
             printf("RES_REQ:  %s\n", qp->resReq);
-        if (qp->slotHoldTime > 0)
+        if (qp->slotHoldTime > 0
+            && !(qp->qAttrib & Q_ATTRIB_MEM_RESERVE))
             printf("Maximum slot reservation time: %d seconds\n", qp->slotHoldTime);
+        if (qp->slotHoldTime > 0
+            && (qp->qAttrib & Q_ATTRIB_MEM_RESERVE))
+            printf("Maximum slot and memory reservation time: %d seconds\n",
+                   qp->slotHoldTime);
         if (strcmp (qp->resumeCond, " ") != 0)
             printf("RESUME_COND:  %s\n", qp->resumeCond);
         if (strcmp (qp->stopCond, " ") != 0)
@@ -522,21 +534,21 @@ static void
 print_slot_shares(struct queueInfoEnt *qp)
 {
     int i;
-    int numRUN;
+    uint32_t numRUN;
 
     numRUN = 0;
     for (i = 0; i < qp->numAccts; i++) {
-        if (qp->saccts[i]->options & SACCT_GROUP)
+        if (qp->saccts[i]->options & SACCT_USER)
             numRUN = numRUN + qp->saccts[i]->numRUN;
     }
 
     printf("\
-\nTOTAL_SLOTS: %u FREE_SLOTS: %d\n", qp->numFairSlots,
+\nTOTAL_SLOTS: %u FREE_SLOTS: %u\n", qp->numFairSlots,
            qp->numFairSlots - numRUN);
 
     printf("\
-%9s   %6s   %8s   %6s   %6s\n",
-           "USER/GROUP", "SHARES", "PRIORITY", "PEND", "RUN");
+%9s   %6s   %8s   %6s   %6s   %6s\n",
+           "USER/GROUP", "SHARES", "PRIORITY", "PEND", "RUN", "RAN");
     for (i = 0; i < qp->numAccts; i++) {
         char buf[MAXLSFNAMELEN];
 
@@ -549,8 +561,54 @@ print_slot_shares(struct queueInfoEnt *qp)
                buf,
                qp->saccts[i]->shares,
                qp->saccts[i]->dshares);
-        printf("   %6d   %6d\n",
+        printf("   %6d   %6d   %6d\n",
                qp->saccts[i]->numPEND,
-               qp->saccts[i]->numRUN);
+               qp->saccts[i]->numRUN,
+               qp->saccts[i]->numRAN);
+    }
+}
+
+/* print_slot_owned()
+ */
+static void
+print_slot_owned(struct queueInfoEnt *qp)
+{
+    int i;
+    uint32_t numRUN;
+
+    numRUN = 0;
+    for (i = 0; i < qp->numAccts; i++) {
+        if (qp->saccts[i]->options & SACCT_USER)
+            numRUN = numRUN + qp->saccts[i]->numRUN;
+    }
+
+    if (qp->loan_duration > 0) {
+        printf("\
+\nTOTAL_SLOTS: %u FREE_SLOTS: %u LOAN_DURATION %d\n", qp->num_owned_slots,
+               qp->num_owned_slots - numRUN, qp->loan_duration);
+    } else {
+        printf("\
+\nTOTAL_SLOTS: %u FREE_SLOTS: %u\n", qp->num_owned_slots,
+               qp->num_owned_slots - numRUN);
+    }
+
+    printf("\
+%9s   %6s   %6s   %6s   %8s\n",
+           "USER/GROUP", "OWNED", "PEND", "RUN", "BORROWED");
+    for (i = 0; i < qp->numAccts; i++) {
+        char buf[MAXLSFNAMELEN];
+
+        if (qp->saccts[i]->options & SACCT_GROUP)
+            sprintf(buf, "%s/", qp->saccts[i]->name);
+        else
+            sprintf(buf, "%s", qp->saccts[i]->name);
+
+        printf("%-9s   %6d",
+               buf,
+               qp->saccts[i]->shares);
+        printf("   %6d   %6d   %8d\n",
+               qp->saccts[i]->numPEND,
+               qp->saccts[i]->numRUN,
+               qp->saccts[i]->numBORROWED);
     }
 }

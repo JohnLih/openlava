@@ -1,6 +1,6 @@
 /*
- * Copyright (C) 2007 Platform Computing Inc
  * Copyright (C) 2014-2015 David Bigagli
+ * Copyright (C) 2007 Platform Computing Inc
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of version 2 of the GNU General Public License as
@@ -70,7 +70,6 @@ static const char* getDefaultSpoolDir(void);
 extern void sub_perror(char *);
 static void trimSpaces(char *);
 static int parseXF(struct submit *, char *, char **);
-void subUsage_(int, char **);
 static int checkLimit(int, int);
 static char *useracctmap = NULL;
 static struct lenData ed = {0, NULL};
@@ -98,6 +97,7 @@ static void postSubMsg(struct submit *, LS_LONG_INT, struct submitReply *);
 static int readOptFile(char *, char *);
 static const LSB_SPOOL_INFO_T * chUserCopySpoolFile(const char *,
                                                     spoolOptions_t);
+static int parse_num_slots(const char *, int *, int *);
 
 LS_LONG_INT
 lsb_submit(struct submit  *jobSubReq, struct submitReply *submitRep)
@@ -127,6 +127,8 @@ lsb_submit(struct submit  *jobSubReq, struct submitReply *submitRep)
     subNewLine_(jobSubReq->errFile);
     subNewLine_(jobSubReq->chkpntDir);
     subNewLine_(jobSubReq->projectName);
+    subNewLine_(jobSubReq->job_description);
+
     for(loop = 0; loop < jobSubReq->numAskedHosts; loop++) {
         subNewLine_(jobSubReq->askedHosts[loop]);
     }
@@ -143,7 +145,12 @@ lsb_submit(struct submit  *jobSubReq, struct submitReply *submitRep)
         }
     }
 
-    submitReq.cwd = cwd;
+    if (jobSubReq->cwd == NULL) {
+        cwd[0] = '\0';
+        submitReq.cwd = cwd;
+    }
+    else
+        submitReq.cwd = jobSubReq->cwd;
 
     if ((grpEntry = getgrgid(getgid())))
         putEnv("LSB_UNIXGROUP", grpEntry->gr_name);
@@ -184,7 +191,8 @@ lsb_submit(struct submit  *jobSubReq, struct submitReply *submitRep)
 }
 
 int
-getCommonParams(struct submit  *jobSubReq, struct submitReq *submitReq,
+getCommonParams(struct submit  *jobSubReq,
+		struct submitReq *submitReq,
                 struct submitReply *submitRep)
 {
     int i, useKb = 0;
@@ -197,7 +205,6 @@ getCommonParams(struct submit  *jobSubReq, struct submitReq *submitReq,
 
     submitReq->options = jobSubReq->options;
     submitReq->options2 = jobSubReq->options2;
-
 
     if (jobSubReq->options & SUB_DEPEND_COND) {
         if (dependCondSyntax(jobSubReq->dependCond) < 0)
@@ -362,6 +369,14 @@ getCommonParams(struct submit  *jobSubReq, struct submitReq *submitReq,
         submitReq->userPriority = jobSubReq->userPriority;
     } else {
         submitReq->userPriority = -1;
+    }
+
+    /* Process job group
+     */
+    if (jobSubReq->options2 & SUB2_JOB_GROUP) {
+	submitReq->job_group = jobSubReq->job_group;
+    } else {
+	submitReq->job_group = "";
     }
 
     if (logclass & (LC_TRACE | LC_EXEC))
@@ -598,7 +613,11 @@ send_batch (struct submitReq *submitReqPtr, struct lenData *jf,
     xdrmem_create(&xdrs, request_buf, reqBufSize, XDR_ENCODE);
     initLSFHeader_(&hdr);
     hdr.opCode = mbdReqtype;
-    if (!xdr_encodeMsg(&xdrs, (char *) submitReqPtr, &hdr, xdr_submitReq, 0,
+    if (!xdr_encodeMsg(&xdrs,
+		       (char *)submitReqPtr,
+		       &hdr,
+		       xdr_submitReq,
+		       0,
                        auth)) {
         xdr_destroy(&xdrs);
         lsberrno = LSBE_XDR;
@@ -1173,6 +1192,13 @@ subRestart(struct submit  *jobSubReq, struct submitReq *submitReq,
     } else {
         submitReq->nxf = 0;
     }
+
+    if (jobLog->options2 & SUB2_JOB_DESC) {
+        submitReq->options2 |= SUB2_JOB_DESC;
+        submitReq->job_description = jobLog->job_description;
+    } else {
+        submitReq->job_description = "";
+    }
     if (jobLog->schedHostType)
         submitReq->schedHostType = jobLog->schedHostType;
     else
@@ -1257,10 +1283,13 @@ getChkDir(char *givenDir, char *chkPath)
 
 }
 
-
+/* subJob()
+ */
 static LS_LONG_INT
-subJob(struct submit  *jobSubReq, struct submitReq *submitReq,
-       struct submitReply *submitRep, struct lsfAuth *auth)
+subJob(struct submit  *jobSubReq,
+       struct submitReq *submitReq,
+       struct submitReply *submitRep,
+       struct lsfAuth *auth)
 {
 
     char homeDir[MAXFILENAMELEN];
@@ -1278,8 +1307,8 @@ subJob(struct submit  *jobSubReq, struct submitReq *submitReq,
     submitReq->resReq = resReq;
     submitReq->command = cmd;
 
-    if (getOtherParams (jobSubReq, submitReq, submitRep, auth,
-                        &subSpoolFiles) < 0) {
+    if (getOtherParams(jobSubReq, submitReq, submitRep, auth,
+		       &subSpoolFiles) < 0) {
         goto cleanup;
     }
 
@@ -1303,6 +1332,8 @@ subJob(struct submit  *jobSubReq, struct submitReq *submitReq,
         }
     }
 
+    /* Encode the submission request and send to mbd
+     */
     jobId = send_batch(submitReq, &jf, submitRep, auth);
     free(jf.data);
 
@@ -1350,10 +1381,8 @@ subJob(struct submit  *jobSubReq, struct submitReq *submitReq,
 cleanup:
 
     if (jobId < 0) {
-
         const char* spoolHost;
         int err;
-
 
         if (subSpoolFiles.inFileSpool[0]) {
             spoolHost = getSpoolHostBySpoolFile(subSpoolFiles.inFileSpool);
@@ -1377,7 +1406,7 @@ cleanup:
         }
     }
 
-    return (jobId);
+    return jobId;
 }
 
 
@@ -1584,6 +1613,21 @@ getOtherParams (struct submit  *jobSubReq, struct submitReq *submitReq,
             submitReq->jobName = jobSubReq->jobName;
     } else
         submitReq->jobName = "";
+
+    if (jobSubReq->options2 & SUB2_JOB_DESC) {
+        if (!jobSubReq->job_description) {
+            lsberrno = LSBE_BAD_ARG;
+            return -1;
+        }
+        if (strlen(jobSubReq->job_description) > MAX_JOB_DESC_LEN - 1) {
+            lsberrno = LSBE_BAD_ARG;
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        submitReq->job_description = jobSubReq->job_description;
+    } else {
+        submitReq->job_description = "";
+    }
 
     if (jobSubReq->options & SUB_IN_FILE) {
         if (!jobSubReq->inFile) {
@@ -2237,10 +2281,11 @@ getUserInfo(struct submitReq *submitReq, struct submit *jobSubReq)
         goto errorParent;
     }
 
-
-    if(mygetwd_(submitReq->cwd) == NULL) {
-        lsberrno = LSBE_SYS_CALL;
-        goto errorParent;
+    if (submitReq->cwd[0] == '\0') {
+        if(mygetwd_(submitReq->cwd) == NULL) {
+            lsberrno = LSBE_SYS_CALL;
+            goto errorParent;
+        }
     }
     cwdLen = strlen (submitReq->cwd) + 1;
 
@@ -2453,7 +2498,7 @@ postSubMsg(struct submit *req, LS_LONG_INT jobId, struct submitReply *reply)
 
     if ((req->options & SUB_QUEUE) || (req->options & SUB_RESTART)) {
 
-       if (getenv("BSUB_STDERR"))
+	if (getenv("BSUB_STDERR"))
             fprintf(stderr, "\
 Job <%s> is submitted to queue <%s>.\n", lsb_jobid2str(jobId),  reply->queue);
         else
@@ -2586,6 +2631,90 @@ gettimefor(char *toptarg, time_t *tTime)
     return 0;
 }
 
+void
+strip_invalidspan(char *str) {
+#define SPANSTRIP  "span[hosts=-1]"
+    int sl;
+    char *p;
+
+    sl = strlen(SPANSTRIP);
+
+    while ((p = strstr(str, SPANSTRIP)) != NULL) {
+        memmove(p, p+sl, strlen(p) + 1 - sl);
+    }
+}
+
+void
+bsub_usage(int options)
+{
+    fprintf(stderr, "Usage");
+
+    switch(options){
+	case SUB_MODIFY:
+	    fprintf(stderr, ": bmod [-h] [-V] [-B | -Bn] [-N | -Nn] [-r | -rn]\n");
+	    fprintf(stderr, "\t    [-x | -xn] [-b begin_time | -bn] [-C core_limit | -Cn]\n");
+	    fprintf(stderr, "\t    [-c [hour:]minute[/host_name | /host_model] | -cn]\n");
+	    fprintf(stderr, "\t    [-D data_limit | -Dn] [-e err_file | -en]\n");
+	    fprintf(stderr, "\t    [-E \"pre_exec_command [argument ...]\" | -En]\n");
+	    fprintf(stderr, "\t    [-f \"local_file op [remote_file]\" ... | -fn]\n");
+	    fprintf(stderr, "\t    [-F file_limit | -Fn] [-G user_group | -Gn]\n");
+	    fprintf(stderr, "\t    [-i input_file | -in | -is input_file | -isn]\n");
+	    fprintf(stderr, "\t    [-J job_name | -J \"%%job_limit\" | -Jn]\n");
+	    fprintf(stderr, "\t    [-k checkpoint_dir | -k \"checkpoint_dir [checkpoint_period]\" | -kn]\n");
+	    fprintf(stderr, "\t    [-L login_shell | -Ln]\n");
+	    fprintf(stderr, "\t    [-m \"host_name[+[pref_level]] | host_group[+[pref_level]] ...\" | -mn]\n");
+	    fprintf(stderr, "\t    [-M mem_limit | -Mn] [-n num_processors | -nn ]\n");
+	    fprintf(stderr, "\t    [-o out_file | -on] [-P project_name | -Pn]\n");
+	    fprintf(stderr, "\t    [-p process_limit | -Pn] [-q \"queue_name ...\" | -qn]\n");
+	    fprintf(stderr, "\t    [-R \"res_req\" | -Rn] [-sp priority | -spn]\n");
+	    fprintf(stderr, "\t    [-S stack_limit | -Sn] [-t term_time | -tn]\n");
+	    fprintf(stderr, "\t    [-u mail_user | -un] [-w ’dependency_expression’ | -wn]\n");
+	    fprintf(stderr, "\t    [-W run_limit [/host_name | /host_model] | -Wn]\n");
+	    fprintf(stderr, "\t    [-Z \"new_command\" | -Zs \"new_command\" | -Zsn]\n");
+	    fprintf(stderr, "\t    [job_ID | \"job_ID[index]\"]\n");
+	    break;
+	case SUB_RESTART:
+	    fprintf(stderr, ": brestart [-h] [-V] [-B] [-f] [-N] [-x]\n");
+	    fprintf(stderr, "\t\t[-b begin_time] [-C core_limit]\n");
+	    fprintf(stderr, "\t\t[-c [hour:]minute[/host_name | /host_model]]\n");
+	    fprintf(stderr, "\t\t[-D data_limit] [-E \"pre_exec_command [argument ...]\" | -En]\n");
+	    fprintf(stderr, "\t\t[-F file_limit] [-G user_group]\n");
+	    fprintf(stderr, "\t\t[-m \"host_name[+[pref_level]] | host_group[+[pref_level]] ...\"]\n");
+	    fprintf(stderr, "\t\t[-M mem_limit] [-q \"queue_name ...\"] [-S stack_limit]\n");
+	    fprintf(stderr, "\t\t[-t term_time] [-w ’dependency_expression’]\n");
+	    fprintf(stderr, "\t\t[-W run_limit [/host_name | /host_model]]\n");
+	    fprintf(stderr, "\t\tcheckpoint_dir [job_ID | \"job_ID[index]\"]\n");
+	    break;
+	default:
+	    fprintf(stderr, ": bsub [-h] [-V] [-B] [-H] [-I | -Ip | -Is | -K] [-N] [-r] [-x]\n");
+	    fprintf(stderr, "\t    [-a esub_parameters] [-b [[month:]day:]hour:minute] [-C core_limit]\n");
+	    fprintf(stderr, "\t    [-c [hour:]minute[/host_name | /host_model] | -cn]\n");
+	    fprintf(stderr, "\t    [-cwd job_current_work_dir]\n");
+	    fprintf(stderr, "\t    [-D data_limit] [-e err_file]\n");
+	    fprintf(stderr, "\t    [-E \"pre_exec_command [argument ...]\"]\n");
+	    fprintf(stderr, "\t    [-f \"local_file op [remote_file]\" ...]\n");
+	    fprintf(stderr, "\t    [-F file_limit] [-G user_group] [-g job_group]\n");
+	    fprintf(stderr, "\t    [-i input_file | -is input_file]\n");
+	    fprintf(stderr, "\t    [-J job_name | -J \"job_name[index_list]%%job_limit\"\n");
+	    fprintf(stderr, "\t    [-k \"checkpoint_dir [checkpoint_period] [method=method_name]\"\n");
+	    fprintf(stderr, "\t    [-L login_shell\n");
+	    fprintf(stderr, "\t    [-m \"host_name[+[pref_level]] | host_group[+[pref_level]] ...\"]\n");
+	    fprintf(stderr, "\t    [-M mem_limit] [-n min_processors[,max_processors]]\n");
+	    fprintf(stderr, "\t    [-o out_file] [-P project_name]\n");
+	    fprintf(stderr, "\t    [-p process_limit] [-q \"queue_name ...\"]\n");
+	    fprintf(stderr, "\t    [-R \"res_req\"] [-sp priority]\n");
+	    fprintf(stderr, "\t    [-S stack_limit] [-t [[month:]day:]hour:minut]\n");
+	    fprintf(stderr, "\t    [-u mail_user] [-w ’dependency_expression’]\n");
+	    fprintf(stderr, "\t    [-W [hours:]minutes[/host_name | /host_model]]\n");
+	    fprintf(stderr, "\t    [-Zs]\n");
+	    break;
+    }
+
+    exit(-1);
+}
+
+/* setOption_()
+ */
 int
 setOption_(int argc, char **argv, char *template, struct submit *req,
            int mask, int mask2, char **errMsg)
@@ -2768,15 +2897,22 @@ setOption_(int argc, char **argv, char *template, struct submit *req,
 
                 checkSubDelOption (SUB_RES_REQ, "Rn");
                 if (mask & SUB_RES_REQ) {
+                    while (*optarg == ' ')
+                        optarg++;
                     if (req->resReq != NULL){
-                        PRINT_ERRMSG0(errMsg, _i18n_msg_get(ls_catd,NL_SETN,442,
-                                                            "Invalid syntax; the -R option was used more than once.\n")); /* catgets 442 */
-                        return -1;
+                         if (mergeResreq(&req->resReq, optarg) == -1) {
+                             fprintf(stderr, "Resource requirements too long or invalid\n");
+                             return -1;
+                         }
                     }
-                    req->resReq = optarg;
+                    else {
+                         if ((req->resReq=strdup(optarg)) == NULL){
+                             fprintf(stderr, "Resource requirements too long\n");
+                             return -1;
+                         }
+                    }
                     req->options |= SUB_RES_REQ;
-                    while (*(req->resReq) == ' ')
-                        req->resReq++;
+                    strip_invalidspan(req->resReq);
                 }
                 break;
 
@@ -2788,6 +2924,7 @@ setOption_(int argc, char **argv, char *template, struct submit *req,
 
             case 'I':
                 if (flagI || flagK) {
+		    bsub_usage(req->options);
                     return -1;
                 }
 
@@ -2801,6 +2938,7 @@ setOption_(int argc, char **argv, char *template, struct submit *req,
                     req->options |= SUB_INTERACTIVE | SUB_PTY | SUB_PTY_SHELL;
                     flagI++;
                 } else {
+                    bsub_usage(req->options);
                     return -1;
                 }
                 break;
@@ -2811,6 +2949,7 @@ setOption_(int argc, char **argv, char *template, struct submit *req,
                 break;
             case 'K':
                 if (flagI || flagK) {
+		    bsub_usage(req->options);
                     return -1;
                 }
                 flagK++;
@@ -2830,6 +2969,7 @@ setOption_(int argc, char **argv, char *template, struct submit *req,
                 break;
 
             case 'h':
+                bsub_usage(req->options);
                 return -1;
 
             case 'm':
@@ -2852,12 +2992,24 @@ setOption_(int argc, char **argv, char *template, struct submit *req,
 
             case 'J':
                 req->options2 |= SUB2_MODIFY_PEND_JOB;
-                checkSubDelOption (SUB_JOB_NAME, "Jn");
-                if (mask & SUB_JOB_NAME) {
-                    req->jobName = optarg;
-                    req->options |= SUB_JOB_NAME;
-                    req->options2 |= SUB2_MODIFY_PEND_JOB;
+                if ( strncmp (optName, "Jd", 2) == 0) {
+                    checkSubDelOption2(SUB2_JOB_DESC, "Jdn");
+                    if (!(mask2 & SUB2_JOB_DESC))
+                        break;
+                    req->job_description = optarg;
+                    req->options2 |= SUB2_JOB_DESC;
+                } else {
+                    checkSubDelOption (SUB_JOB_NAME, "Jn");
+                    if (mask & SUB_JOB_NAME) {
+                        req->jobName = optarg;
+                        req->options |= SUB_JOB_NAME;
+                    }
                 }
+                break;
+
+            case 'g':
+                req->options2 |= SUB2_JOB_GROUP;
+                req->job_group = optarg;
                 break;
 
             case 'i':
@@ -2995,7 +3147,7 @@ setOption_(int argc, char **argv, char *template, struct submit *req,
 
                     break;
 
-                if (getValPair (&optarg, &v1, &v2) < 0) {
+                if (parse_num_slots(optarg, &v1, &v2) < 0) {
                     PRINT_ERRMSG0(errMsg, _i18n_msg_get(ls_catd,NL_SETN,414,
                                                         "Bad argument for option -n")); /* catgets 414 */
                     return -1;
@@ -3118,6 +3270,11 @@ setOption_(int argc, char **argv, char *template, struct submit *req,
                 break;
 
             case 'c':
+                if (strcmp(optarg, "wd") == 0) {
+                    req->cwd = argv[optind];
+                    optind++;
+                    break;
+                }
                 req->options2 |= SUB2_MODIFY_RUN_JOB;
                 checkRLDelOption (LSF_RLIMIT_CPU, "cn");
                 if (req->rLimits[LSF_RLIMIT_CPU] != DEFAULT_RLIMIT)
@@ -3685,92 +3842,6 @@ parentErr:
 }
 
 
-void
-subUsage_(int option, char **errMsg)
-{
-#define I18N_ESUB_INFO_USAGE                                            \
-    _i18n_msg_get(ls_catd,NL_SETN,447,"\t\t[-a additional_esub_information]\n")
-
-    if (errMsg == NULL) {
-        if (option & SUB_RESTART) {
-
-            fprintf(stderr, I18N_Usage);
-            fprintf(stderr, ": brestart [-h] [-V] [-x] [-f] [-N] [-B] [-q \"queue_name...\"] \n");
-            fprintf(stderr, "\t\t[-m \"host_name[+[pref_level]] | host_group[+[pref_level]]...]\"\n");
-
-            fprintf(stderr, "\t\t[-w \'dependency_expression\'] [-b begin_time] [-t term_time]\n");
-            fprintf(stderr, "\t\t[-c [hour:]minute[/host_name|/host_model]]\n");
-            fprintf(stderr, "\t\t[-F file_limit] [-D data_limit]\n");
-            fprintf(stderr, "\t\t[-C core_limit] [-M mem_limit] \n");
-            fprintf(stderr, "\t\t[-W run_limit[/host_name|/host_model]] \n");
-            fprintf(stderr, "\t\t[-S stack_limit] [-E \"pre_exec_command [argument ...]\"]\n");
-
-            fprintf(stderr, "\t\tcheckpoint_dir[job_ID | \"job_ID[index]\"]\n");
-            fprintf(stderr, I18N_ESUB_INFO_USAGE);
-
-        } else if (option & SUB_MODIFY) {
-            fprintf(stderr, I18N_Usage);
-            fprintf(stderr, ": bmod [-h] [-V] [-x | -xn]");
-
-            fprintf(stderr, "\n");
-
-            if (lsbMode_ & LSB_MODE_BATCH) {
-                fprintf(stderr, "\t\t[-r | -rn] [-N | -Nn] [-B | -Bn]\n");
-                fprintf(stderr, "\t\t[-c cpu_limit[/host_spec] | -cn] [-F file_limit | -Fn]\n");
-                fprintf(stderr, "\t\t[-M mem_limit | -Mn] [-D data_limit | -Dn] [-S stack_limit | -Sn]\n");
-                fprintf(stderr, "\t\t[-C core_limit | -Cn] [-W run_limit[/host_spec] | -Wn ]\n");
-                fprintf(stderr, "\t\t[-k chkpnt_dir [chkpnt_period] | -kn] [-P project_name | -Pn]\n");
-                fprintf(stderr, "\t\t[-L login_shell | -Ln] \n");
-            }
-
-
-            fprintf(stderr, "\t\t[-w depend_cond | -wn] [-R res_req| -Rn] [-J job_name | -Jn]\n");
-            fprintf(stderr, "\t\t[-q queue_name ... | -qn] \n");
-            fprintf(stderr, "\t\t[-m host_name[+[pref_level]] | host_group[+[pref_level]]...| -mn]\"\n");
-            fprintf(stderr, "\t\t[-n min_processors[,max_processors] | -nn]\n");
-            fprintf(stderr, "\t\t[-b begin_time | -bn] [-t term_time | -tn]\n");
-            fprintf(stderr, "\t\t[-i in_file | -is in_file | -in | -isn]\n");
-            fprintf(stderr, "\t\t[-o out_file | -on] [-e err_file | -en]\n");
-            fprintf(stderr, "\t\t[-u mail_user | -un] [[-f \"lfile op [rfile]\"] ... | -fn] \n");
-            fprintf(stderr, "\t\t[-E \"pre_exec_command [argument ...]\" | -En]\n");
-            fprintf(stderr, "\t\t[-sp job_priority | -spn]\n");
-            fprintf(stderr, "\t\t[-Z \"new_command\" | -Zs \"new_command\" | -Zsn] \n");
-            fprintf(stderr, "\t\t[ jobId | \"jobId[index_list]\" ] \n");
-            fprintf(stderr, I18N_ESUB_INFO_USAGE);
-        } else {
-
-            fprintf(stderr, I18N_Usage);
-            fprintf(stderr, ": bsub [-h] [-V] [-x] [-H]");
-
-            if (lsbMode_ & LSB_MODE_BATCH) {
-                fprintf(stderr, " [-r] [-N] [-B] [-I | -K | -Ip | -Is]\n");
-                fprintf(stderr, "\t\t[-L login_shell] [-c cpu_limit[/host_spec]] [-F file_limit]\n");
-                fprintf(stderr, "\t\t[-W run_limit[/host_spec]] [-k chkpnt_dir [chkpnt_period] [method=chkpnt_dir]]\n");
-                fprintf(stderr, "\t\t[-P project_name] ");
-            }
-            fprintf(stderr, "\n");
-
-            fprintf(stderr, "\t\t[-q queue_name ...]  [-R res_req]\n");
-            fprintf(stderr, "\t\t[-m \"host_name[+[pref_level]] | host_group[+[pref_level]]...]\"\n");
-            fprintf(stderr, "\t\t[-n min_processors[,max_processors]] [-J job_name]\n");
-            fprintf(stderr, "\t\t[-b begin_time] [-t term_time] [-u mail_user]\n");
-            fprintf(stderr, "\t\t[-i in_file | -is in_file] [-o out_file] [-e err_file]\n");
-            fprintf(stderr, "\t\t[-M mem_limit]  [-D data_limit]  [-S stack_limit]\n");
-
-            fprintf(stderr, "\t\t[[-f \"lfile op [rfile]\"] ...] [-w depend_cond]\n");
-
-            fprintf(stderr, "\t\t[-E \"pre_exec_command [argument ...]\"] [-Zs]\n");
-            fprintf(stderr, "\t\t[-sp job_priority]\n");
-            fprintf(stderr, "\t\t[command [argument ...]]\n");
-            fprintf(stderr, I18N_ESUB_INFO_USAGE);
-        }
-
-        exit (-1);
-    }
-
-}
-
-
 static int
 parseXF(struct submit *req, char *arg, char **errMsg)
 {
@@ -4097,6 +4168,7 @@ runBatchEsub(struct lenData *ed, struct submit *jobSubReq)
                    inFile);
     SET_PARM_BOOL_2(SUB2_JOB_CMD_SPOOL, "LSB_SUB2_JOB_CMD_SPOOL", jobSubReq);
     SET_PARM_STR(SUB_USER_GROUP, "LSB_SUB_USER_GROUP", jobSubReq, userGroup);
+    SET_PARM_STR_2(SUB2_JOB_DESC, "LSB_SUB2_JOB_DESC", jobSubReq, job_description);
 
     ls_readconfenv(myParams, NULL);
 
@@ -4336,19 +4408,6 @@ readOptFile(char *filename, char *childLine)
     return 0;
 }
 
-int
-mySubUsage_(void *args)
-{
-    struct args {
-        int argc;
-        char **argv;
-    } *myArgs;
-    myArgs = (struct args *) args;
-    subUsage_(myArgs->argc, myArgs->argv);
-    return 0;
-}
-
-
 #define I18N_MSG(msgid,msg) _i18n_msg_get(ls_catd,NL_SETN,msgid,msg)
 
 #define MSG_BAD_ENVAR2s     I18N_MSG(5550,                              \
@@ -4528,6 +4587,8 @@ void modifyJobInformation(struct submit *jobSubReq)
                FIELD_OFFSET(submit,termTime),0},
               {"LSB_SUB_COMMAND_LINE",STRPARM,
                FIELD_OFFSET(submit,command),0},
+              {"LSB_SUB2_JOB_DESC",STR2PARM,
+               FIELD_OFFSET(submit,job_description),SUB2_JOB_DESC},
               {NULL,0,0,0}
           };
 
@@ -5141,4 +5202,31 @@ static void trimSpaces(char *str)
         *ptr = '\0';
         ptr--;
     }
+}
+
+/* parse_num_slots()
+ */
+static int
+parse_num_slots(const char *arg, int *x, int *y)
+{
+    char *p;
+    char *p0;
+    char *c;
+
+    *x = *y = INFINIT_INT;
+    p0 = p = strdup(arg);
+
+    c = strchr(p, ',');
+    if (c == NULL) {
+       *x = atoi(p);
+       _free_(p0);
+       return 0;
+    }
+
+    *c = 0;
+    ++c;
+    *x = atoi(p);
+    *y = atoi(c);
+    _free_(p0);
+    return 0;
 }

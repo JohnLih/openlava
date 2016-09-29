@@ -41,6 +41,8 @@
 
 #define LONG_FORMAT     1
 #define WIDE_FORMAT     2
+#define LSFUF_FORMAT    3
+#define CUSTOM_FORMAT   4
 
 #define QUEUE_HIST      1
 #define HOST_HIST       2
@@ -93,6 +95,7 @@ extern void prtErrMsg (struct submit *, struct submitReply *);
 extern void prtBTTime(struct jobInfoEnt *);
 extern void prtJobReserv(struct jobInfoEnt *);
 extern void displayLong (struct jobInfoEnt *, struct jobInfoHead *, float);
+extern void displayUF (struct jobInfoEnt *, struct jobInfoHead *, float);
 
 extern int lsbMode_;
 
@@ -106,8 +109,8 @@ extern int printThresholds (float *, float *, int *,
                             int *, int, struct lsInfo *);
 extern void prtResourceLimit (int *, char *, float, int *);
 extern int  getNames (int, char **, int, char ***, int *, char *);
-extern int  getJobIds (int, char **, char *, char *,
-                       char *, char *, LS_LONG_INT **, int);
+extern int  getJobIds(int, char **, char *, char *,
+                      char *, char *, LS_LONG_INT **, int, char *);
 extern int  getSpecJobIds (int, char **, LS_LONG_INT **, int *);
 extern int  getSpecIdxs (char *, int **);
 extern int  getOneJobId (char *, LS_LONG_INT *, int);

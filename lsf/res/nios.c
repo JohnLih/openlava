@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2015 David Bigagli
+ * Copyright (C) 2015-2016 David Bigagli
  * Copyright (C) 2007 Platform Computing Inc
  *
  * This program is free software; you can redistribute it and/or modify
@@ -132,7 +132,9 @@ static void myHandler(int sig)
 int ls_niosetdebug(int);
 
 static int niosDebug = 0;
-static int maxtasks;
+
+#define NIOS_MAX_TASKTBL       10024
+static int maxtasks = NIOS_MAX_TASKTBL;
 static int maxfds;
 
 static struct config_param niosParams[] = {
@@ -150,14 +152,16 @@ static struct config_param niosParams[] = {
         {"LSF_NIOS_JOBSTATUS_INTERVAL", NULL},
 #define LSB_INTERACT_MSG_EXITTIME 6
         {"LSB_INTERACT_MSG_EXITTIME", NULL},
+#define NIOS_RWAIT_SELECT 7
+        {"NIOS_RWAIT_SELECT", NULL},
+#define NIOS_MAX_TASKS 8
+        {"NIOS_MAX_TASKS", NULL},
         {NULL, NULL}
     };
 
 #define MSG_POLLING_INTR 60
 
 extern void checkJobStatus(int numTries);
-
-#define NIOS_MAX_TASKTBL       10024
 
 #define MAX_TRY_TIMES           20
 
@@ -229,6 +233,14 @@ main(int argc, char **argv)
         }
     }
 
+    if (niosParams[NIOS_MAX_TASKS].paramValue) {
+        if (isint_(niosParams[NIOS_MAX_TASKS].paramValue)) {
+            maxtasks = atoi(niosParams[NIOS_MAX_TASKS].paramValue);
+            if ( maxtasks <= 0) {
+                maxtasks = NIOS_MAX_TASKTBL;
+            }
+        }
+    }
 
     timeout = getenv("LSF_NIOS_PEND_TIMEOUT");
     if (timeout != NULL) {
@@ -431,9 +443,6 @@ main(int argc, char **argv)
 
     }
 
-    maxtasks = NIOS_MAX_TASKTBL;
-
-
     sigprocmask(SIG_UNBLOCK, &sigmask, NULL);
 
     if (isatty(0)) {
@@ -535,8 +544,8 @@ serv(char **argv, int asock)
                 die();
             }
         } else if (m < 0) {
+            ls_syslog(LOG_ERR, I18N_FUNC_FAIL_MM, fname, "ls_niotasks");
             PassSig(SIGKILL);
-            ls_syslog(LOG_ERR, I18N_FUNC_FAIL, fname, "ls_niotasks");
             die();
         }
 
@@ -1304,7 +1313,7 @@ getStdin(struct lslibNiosHdr *hdr)
     retVal = ls_niotasks(req.r.set_on ? NIO_TASK_STDINON : NIO_TASK_STDINOFF,
                        reply.rpidlist, maxtasks);
     if (retVal < 0) {
-        ls_syslog(LOG_ERR, I18N_FUNC_FAIL_M, fname, "ls_niotasks");
+        ls_syslog(LOG_ERR, I18N_FUNC_FAIL_MM, fname, "ls_niotasks");
 
         PassSig(SIGKILL);
         die();
@@ -1328,6 +1337,7 @@ emusig(int tid, int st)
     static char fname[] = "emusig()";
     SIGFUNCTYPE handle;
     LS_WAIT_T status = *((LS_WAIT_T *)&st);
+    struct lslibNiosHdr hdr;
 
     if (LS_WIFSTOPPED(status)) {
 
@@ -1365,9 +1375,8 @@ emusig(int tid, int st)
         return;
     } else if (LS_WIFSIGNALED(status) || LS_WIFEXITED(status)) {
 
-
-
-
+	/* Task is gone
+	 */
         if (standalone) {
             if (LS_WIFSIGNALED(status))
                 exit_sig = LS_WTERMSIG(status);
@@ -1383,15 +1392,30 @@ emusig(int tid, int st)
 
         } else {
 
-
-
             if (niosDebug) {
                 ls_syslog(LOG_DEBUG,"\
 %s: Nios signaled exit_sig=<%d> sending SIGUSR1 to oparent",
                           fname,  LS_WTERMSIG(status));
             }
 
-            kill(ppid, SIGUSR1);
+            /* Don't send SIGUSR1 in multiple thread program,
+             * sigsuspend() returns only when all the other threads
+             * block the SIGUSR1. In a golang program, we cannot
+             * configure the sigmask of management threads of golang.
+             */
+            if (niosParams[NIOS_RWAIT_SELECT].paramValue &&
+                !strcasecmp(niosParams[NIOS_RWAIT_SELECT].paramValue, "y")) {
+                hdr.opCode = CHILD_EXIT;
+                hdr.len = 0;
+                if (b_write_fix(chfd, (char *)&hdr,
+                                sizeof(struct lslibNiosHdr)) !=
+                    sizeof(struct lslibNiosHdr)) {
+                    PassSig(SIGKILL);
+                    die();
+                }
+            } else {
+                kill(ppid, SIGUSR1);
+            }
         }
     }
 }

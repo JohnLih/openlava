@@ -1,6 +1,6 @@
 /*
+ * Copyright (C) 2011-2016 David Bigagli
  * Copyright (C) 2007 Platform Computing Inc
- * Copyright (C) 2011-2015 David Bigagli
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of version 2 of the GNU General Public License as
@@ -80,14 +80,20 @@ updCounters(struct jData *jData, int oldStatus, time_t eventTime)
             if ((oldStatus & JOB_STAT_PEND) || (oldStatus & JOB_STAT_PSUSP) ) {
                 updQaccount (jData, -numReq+num, -numReq, num, 0, 0, 0);
                 updUserData(jData, -numReq+num, -numReq, num, 0, 0, 0);
+                updLimitSlotData(jData, -numReq+num, -numReq, num, 0, 0, 0);
+                updLimitJobData(jData, -1, -1, 1, 0, 0, 0);
                 updHostData(TRUE, jData, 1, 1, 0, 0, 0);
             } else if (oldStatus & JOB_STAT_SSUSP) {
                 updQaccount (jData, 0, 0, num, -num, 0, 0);
                 updUserData(jData, 0, 0, num, -num, 0, 0);
+                updLimitSlotData(jData, 0, 0, num, -num, 0, 0);
+                updLimitJobData(jData, 0, 0, 1,-1, 0, 0);
                 updHostData(FALSE, jData, 0, 1, -1, 0, 0);
             } else if (oldStatus & JOB_STAT_USUSP) {
                 updQaccount (jData, 0, 0, num, 0, -num, 0);
                 updUserData(jData, 0, 0, num, 0, -num, 0);
+                updLimitSlotData(jData, 0, 0, num, 0, -num, 0);
+                updLimitJobData(jData, 0, 0, 1, 0, -1, 0);
                 updHostData(FALSE, jData, 0, 1, 0, -1, 0);
             } else if ( (oldStatus & ( JOB_STAT_RUN | JOB_STAT_WAIT)) ) {
                 ls_syslog(LOG_DEBUG2, "%s: Job %s RWAIT to RUN",
@@ -102,14 +108,20 @@ updCounters(struct jData *jData, int oldStatus, time_t eventTime)
             if (oldStatus & JOB_STAT_RUN) {
                 updQaccount (jData, 0, 0, -num, num, 0, 0);
                 updUserData(jData, 0, 0, -num, num, 0, 0);
+                updLimitSlotData(jData, 0, 0, -num, num, 0, 0);
+                updLimitJobData(jData, 0, 0, -1, 1, 0, 0);
                 updHostData(FALSE, jData, 0, -1, 1, 0, 0);
             } else if (oldStatus & JOB_STAT_USUSP) {
                 updQaccount (jData, 0, 0, 0, num, -num, 0);
                 updUserData(jData, 0, 0, 0, num, -num, 0);
+                updLimitSlotData(jData, 0, 0, -num, num, 0, 0);
+                updLimitJobData(jData, 0, 0, -1, 1, 0, 0);
                 updHostData(FALSE, jData, 0, 0, 1, -1, 0);
             } else if (oldStatus & JOB_STAT_PEND) {
                 updQaccount (jData, -numReq+num, -numReq, 0, num, 0, 0);
                 updUserData(jData, -numReq+num, -numReq, 0, num, 0, 0);
+                updLimitSlotData(jData, -numReq+num, -numReq, 0, num, 0, 0);
+                updLimitJobData(jData, -1, -1, 0, 1, 0, 0);
                 updHostData(TRUE, jData, 1, 0, 1, 0, 0);
             } else {
                 ls_syslog(LOG_ERR, "\
@@ -121,14 +133,20 @@ updCounters(struct jData *jData, int oldStatus, time_t eventTime)
             if (oldStatus & JOB_STAT_RUN) {
                 updQaccount (jData, 0, 0, -num, 0, num, 0);
                 updUserData(jData, 0, 0, -num, 0, num, 0);
+                updLimitSlotData(jData, 0, 0, -num, 0, num, 0);
+                updLimitJobData(jData, 0, 0, -1, 0, 1, 0);
                 updHostData(FALSE, jData, 0, -1, 0, 1, 0);
             } else if (oldStatus & JOB_STAT_SSUSP) {
                 updQaccount (jData, 0, 0, 0, -num, num, 0);
                 updUserData(jData, 0, 0, 0, -num, num, 0);
+                updLimitSlotData(jData, 0, 0, 0, -num, num, 0);
+                updLimitJobData(jData, 0, 0, 0, -1, 1, 0);
                 updHostData(FALSE, jData, 0, 0, -1, 1, 0);
             } else if (oldStatus & JOB_STAT_PEND) {
                 updQaccount (jData, -numReq+num, -numReq, 0, 0, num, 0);
                 updUserData(jData, -numReq+num, -numReq, 0, 0, num, 0);
+                updLimitSlotData(jData, -numReq+num, -numReq, 0, 0, num, 0);
+                updLimitJobData(jData, -1, -1, 0, 0, 1, 0);
                 updHostData(TRUE, jData, 1, 0, 0, 1, 0);
             } else {
                 ls_syslog(LOG_ERR, "\
@@ -147,21 +165,31 @@ updCounters(struct jData *jData, int oldStatus, time_t eventTime)
                 updQaccount (jData, -num, 0, -num, 0, 0, 0);
                 updHostData(TRUE, jData, -1, -1, 0, 0, 0);
                 updUserData(jData, -num, 0, -num, 0, 0, 0);
+                updLimitSlotData(jData, -num, 0, -num, 0, 0, 0);
+                updLimitJobData(jData, -1, 0, -1, 0, 0, 0);
             } else if (oldStatus & JOB_STAT_RUN) {
                 updQaccount (jData, -num, 0, -num, 0, 0, 0);
                 updHostData(TRUE, jData, -1, -1, 0, 0, 0);
                 updUserData(jData, -num, 0, -num, 0, 0, 0);
+                updLimitSlotData(jData, -num, 0, -num, 0, 0, 0);
+                updLimitJobData(jData, -1, 0, -1, 0, 0, 0);
             } else if (oldStatus & JOB_STAT_USUSP) {
                 updQaccount (jData, -num, 0, 0, 0, -num, 0);
                 updHostData(TRUE, jData, -1, 0, 0, -1, 0);
                 updUserData(jData, -num, 0, 0, 0, -num, 0);
+                updLimitSlotData(jData, -num, 0, 0, 0, -num, 0);
+                updLimitJobData(jData, -1, 0, 0, 0, -1, 0);
             } else if (oldStatus & JOB_STAT_SSUSP) {
                 updQaccount (jData, -num, 0, 0, -num, 0, 0);
                 updHostData(TRUE, jData, -1, 0, -1, 0, 0);
                 updUserData(jData, -num, 0, 0, -num, 0, 0);
+                updLimitSlotData(jData, -num, 0, 0, -num, 0, 0);
+                updLimitJobData(jData, -1, 0, 0, -1, 0, 0);
             } else if (IS_PEND (oldStatus)) {
                 updQaccount (jData, -numReq, -numReq, 0, 0, 0, 0);
                 updUserData(jData, -numReq, -numReq, 0, 0, 0, 0);
+                updLimitSlotData(jData, -numReq, -numReq, 0, 0, 0, 0);
+                updLimitJobData(jData, -1, -1, 0, 0, 0, 0);
             }
             else {
                 ls_syslog(LOG_ERR, "%s: Job <%s> transited from %x to %x",
@@ -173,16 +201,22 @@ updCounters(struct jData *jData, int oldStatus, time_t eventTime)
                 updQaccount (jData, numReq-num, numReq, -num, 0, 0, 0);
                 updHostData(TRUE, jData, -1, -1, 0, 0, 0);
                 updUserData(jData, numReq-num, numReq, -num, 0, 0, 0);
+                updLimitSlotData(jData, numReq-num, numReq, -num, 0, 0, 0);
+                updLimitJobData(jData, -1, 1, -1, 0, 0, 0);
             }
             else if (oldStatus & JOB_STAT_USUSP) {
                 updQaccount (jData, -num+numReq, numReq, 0, 0, -num, 0);
                 updHostData(TRUE, jData, -1, 0, 0, -1, 0);
                 updUserData(jData, -num+numReq, numReq, 0, 0, -num, 0);
+                updLimitSlotData(jData, -num+numReq, numReq, 0, 0, -num, 0);
+                updLimitJobData(jData, -1, 1, 0, 0, -1, 0);
             }
             else if (oldStatus & JOB_STAT_SSUSP) {
                 updQaccount (jData, -num+numReq, numReq, 0, -num, 0, 0);
                 updHostData(TRUE, jData, -1, 0, -1, 0, 0);
                 updUserData(jData, -num+numReq, numReq, 0, -num, 0, 0);
+                updLimitSlotData(jData, -num+numReq, numReq, 0, -num, 0, 0);
+                updLimitJobData(jData, -1, 1, 0, -1, 0, 0);
             } else {
                 ls_syslog(LOG_ERR, "%s: Job <%s> transited from %d to %d",
                           __func__, lsb_jobid2str(jData->jobId),
@@ -222,8 +256,29 @@ updSwitchJob (struct jData *jp, struct qData *qfp, struct qData *qtp,
 
     if (jp->jStatus & JOB_STAT_RESERVE) {
         jp->qPtr = qfp;
+        jp->pqPtr = getLimitUsageData(LIMIT_CONSUMER_PER_PROJECT,
+                                      jp->shared->jobBill.projectName,
+                                      jp->qPtr->queue);
+        jp->uqPtr = getLimitUsageData(LIMIT_CONSUMER_PER_USER,
+                                      jp->userName,
+                                      jp->qPtr->queue);
+        if (jp->numHostPtr > 0)
+            jp->hqPtr = getLimitUsageData(LIMIT_CONSUMER_PER_HOST,
+                                          jp->hPtr[0]->host,
+                                          jp->qPtr->queue);
+
         updResCounters (jp, jp->jStatus & ~JOB_STAT_RESERVE);
         jp->qPtr = qtp;
+        jp->pqPtr = getLimitUsageData(LIMIT_CONSUMER_PER_PROJECT,
+                                      jp->shared->jobBill.projectName,
+                                      jp->qPtr->queue);
+        jp->uqPtr = getLimitUsageData(LIMIT_CONSUMER_PER_USER,
+                                      jp->userName,
+                                      jp->qPtr->queue);
+        if (jp->numHostPtr > 0)
+            jp->hqPtr = getLimitUsageData(LIMIT_CONSUMER_PER_HOST,
+                                          jp->hPtr[0]->host,
+                                          jp->qPtr->queue);
         jp->jStatus &= ~JOB_STAT_RESERVE;
         reserved = TRUE;
     }
@@ -231,67 +286,163 @@ updSwitchJob (struct jData *jp, struct qData *qfp, struct qData *qtp,
         case JOB_STAT_PEND:
         case JOB_STAT_PSUSP:
             jp->qPtr = qfp;
+            jp->pqPtr = getLimitUsageData(LIMIT_CONSUMER_PER_PROJECT,
+                                          jp->shared->jobBill.projectName,
+                                          jp->qPtr->queue);
+            jp->uqPtr = getLimitUsageData(LIMIT_CONSUMER_PER_USER,
+                                          jp->userName,
+                                          jp->qPtr->queue);
+            if (jp->numHostPtr > 0)
+                jp->hqPtr = getLimitUsageData(LIMIT_CONSUMER_PER_HOST,
+                                              jp->hPtr[0]->host,
+                                              jp->qPtr->queue);
 
             if (mSchedStage != M_STAGE_REPLAY) {
                 updQaccount (jp, -oldNumReq, -oldNumReq, 0, 0, 0, 0);
                 updUserData(jp, -oldNumReq, -oldNumReq, 0, 0, 0, 0);
+                updLimitSlotData(jp, -oldNumReq, -oldNumReq, 0, 0, 0, 0);
+                updLimitJobData(jp, -1, -1, 0, 0, 0, 0);
             }
             jp->qPtr = qtp;
+            jp->pqPtr = getLimitUsageData(LIMIT_CONSUMER_PER_PROJECT,
+                                          jp->shared->jobBill.projectName,
+                                          jp->qPtr->queue);
+            jp->uqPtr = getLimitUsageData(LIMIT_CONSUMER_PER_USER,
+                                          jp->userName,
+                                          jp->qPtr->queue);
+            if (jp->numHostPtr > 0)
+                jp->hqPtr = getLimitUsageData(LIMIT_CONSUMER_PER_HOST,
+                                              jp->hPtr[0]->host,
+                                              jp->qPtr->queue);
 
             if (mSchedStage != M_STAGE_REPLAY) {
                 updQaccount (jp, numReq, numReq, 0, 0, 0, 0);
                 updUserData(jp, numReq, numReq, 0, 0, 0, 0);
+                updLimitSlotData(jp, numReq, numReq, 0, 0, 0, 0);
+                updLimitJobData(jp, 1, 1, 0, 0, 0, 0);
             }
             break;
         case JOB_STAT_RUN:
         case (JOB_STAT_RUN | JOB_STAT_UNKWN):
             jp->qPtr = qfp;
+            jp->pqPtr = getLimitUsageData(LIMIT_CONSUMER_PER_PROJECT,
+                                          jp->shared->jobBill.projectName,
+                                          jp->qPtr->queue);
+            jp->uqPtr = getLimitUsageData(LIMIT_CONSUMER_PER_USER,
+                                          jp->userName,
+                                          jp->qPtr->queue);
+            if (jp->numHostPtr > 0)
+                jp->hqPtr = getLimitUsageData(LIMIT_CONSUMER_PER_HOST,
+                                              jp->hPtr[0]->host,
+                                              jp->qPtr->queue);
 
             if (mSchedStage != M_STAGE_REPLAY) {
                 updQaccount (jp, -num, 0, -num, 0, 0, 0);
                 updHostData(TRUE, jp, -1, -1, 0, 0, 0);
                 updUserData(jp,-num, 0, -num, 0, 0, 0);
+                updLimitSlotData(jp,-num, 0, -num, 0, 0, 0);
+                updLimitJobData(jp,-1, 0, -1, 0, 0, 0);
             }
             jp->qPtr = qtp;
+            jp->pqPtr = getLimitUsageData(LIMIT_CONSUMER_PER_PROJECT,
+                                          jp->shared->jobBill.projectName,
+                                          jp->qPtr->queue);
+            jp->uqPtr = getLimitUsageData(LIMIT_CONSUMER_PER_USER,
+                                          jp->userName,
+                                          jp->qPtr->queue);
+            if (jp->numHostPtr > 0)
+                jp->hqPtr = getLimitUsageData(LIMIT_CONSUMER_PER_HOST,
+                                              jp->hPtr[0]->host,
+                                              jp->qPtr->queue);
 
             if (mSchedStage != M_STAGE_REPLAY) {
                 updQaccount (jp, num, 0, num, 0, 0, 0);
                 updHostData(TRUE, jp, 1, 1, 0, 0, 0);
                 updUserData(jp, num, 0, num, 0, 0, 0);
+                updLimitSlotData(jp, num, 0, num, 0, 0, 0);
+                updLimitJobData(jp, 1, 0, 1, 0, 0, 0);
             }
             break;
         case JOB_STAT_SSUSP:
         case (JOB_STAT_SSUSP | JOB_STAT_UNKWN):
             jp->qPtr = qfp;
+            jp->pqPtr = getLimitUsageData(LIMIT_CONSUMER_PER_PROJECT,
+                                          jp->shared->jobBill.projectName,
+                                          jp->qPtr->queue);
+            jp->uqPtr = getLimitUsageData(LIMIT_CONSUMER_PER_USER,
+                                          jp->userName,
+                                          jp->qPtr->queue);
+            if (jp->numHostPtr > 0)
+                jp->hqPtr = getLimitUsageData(LIMIT_CONSUMER_PER_HOST,
+                                              jp->hPtr[0]->host,
+                                              jp->qPtr->queue);
 
             if (mSchedStage != M_STAGE_REPLAY) {
                 updQaccount (jp, -num, 0, 0, -num, 0, 0);
                 updHostData(TRUE, jp, -1, 0, -1, 0, 0);
                 updUserData(jp,-num, 0, 0, -num, 0, 0);
+                updLimitSlotData(jp,-num, 0, 0, -num, 0, 0);
+                updLimitJobData(jp,-1, 0, 0, -1, 0, 0);
             }
             jp->qPtr = qtp;
+            jp->pqPtr = getLimitUsageData(LIMIT_CONSUMER_PER_PROJECT,
+                                          jp->shared->jobBill.projectName,
+                                          jp->qPtr->queue);
+            jp->uqPtr = getLimitUsageData(LIMIT_CONSUMER_PER_USER,
+                                          jp->userName,
+                                          jp->qPtr->queue);
+            if (jp->numHostPtr > 0)
+                jp->hqPtr = getLimitUsageData(LIMIT_CONSUMER_PER_HOST,
+                                              jp->hPtr[0]->host,
+                                              jp->qPtr->queue);
 
             if (mSchedStage != M_STAGE_REPLAY) {
                 updQaccount (jp, num, 0, 0, num, 0, 0);
                 updHostData(TRUE, jp, 1, 0, 1, 0, 0);
                 updUserData(jp, num, 0, 0, num, 0, 0);
+                updLimitSlotData(jp, num, 0, 0, num, 0, 0);
+                updLimitJobData(jp, 1, 0, 0, 1, 0, 0);
             }
             break;
         case JOB_STAT_USUSP:
         case (JOB_STAT_USUSP | JOB_STAT_UNKWN):
             jp->qPtr = qfp;
+            jp->pqPtr = getLimitUsageData(LIMIT_CONSUMER_PER_PROJECT,
+                                          jp->shared->jobBill.projectName,
+                                          jp->qPtr->queue);
+            jp->uqPtr = getLimitUsageData(LIMIT_CONSUMER_PER_USER,
+                                          jp->userName,
+                                          jp->qPtr->queue);
+            if (jp->numHostPtr > 0)
+                jp->hqPtr = getLimitUsageData(LIMIT_CONSUMER_PER_HOST,
+                                              jp->hPtr[0]->host,
+                                              jp->qPtr->queue);
 
             if (mSchedStage != M_STAGE_REPLAY) {
                 updQaccount (jp, -num, 0, 0, 0, -num, 0);
                 updHostData(TRUE, jp, -1, 0, 0, -1, 0);
                 updUserData(jp,-num, 0, 0, 0, -num, 0);
+                updLimitSlotData(jp,-num, 0, 0, 0, -num, 0);
+                updLimitJobData(jp,-1, 0, 0, 0, -1, 0);
             }
             jp->qPtr = qtp;
+            jp->pqPtr = getLimitUsageData(LIMIT_CONSUMER_PER_PROJECT,
+                                          jp->shared->jobBill.projectName,
+                                          jp->qPtr->queue);
+            jp->uqPtr = getLimitUsageData(LIMIT_CONSUMER_PER_USER,
+                                          jp->userName,
+                                          jp->qPtr->queue);
+            if (jp->numHostPtr > 0)
+                jp->hqPtr = getLimitUsageData(LIMIT_CONSUMER_PER_HOST,
+                                              jp->hPtr[0]->host,
+                                              jp->qPtr->queue);
 
             if (mSchedStage != M_STAGE_REPLAY) {
                 updQaccount (jp, num, 0, 0, 0, num, 0);
                 updHostData(TRUE, jp, 1, 0, 0, 1, 0);
                 updUserData(jp, num, 0, 0, 0, num, 0);
+                updLimitSlotData(jp, num, 0, 0, 0, num, 0);
+                updLimitJobData(jp, 1, 0, 0, 0, 1, 0);
             }
             break;
         default:
@@ -340,26 +491,30 @@ updQaccount(struct jData *jp, int numJobs, int numPEND,
     newJob = (numRUN == 0 && numSSUSP == 0 && numUSUSP == 0
               && numRESERVE == 0 && numPEND == 0);
 
-
     updUAcct(jp, jp->uPtr, &(qp->uAcct), numRUN, numSSUSP, numUSUSP,
              numRESERVE,numPEND, (struct hData *)NULL,
              NULL, (void *) qp);
 
-
-    FOR_EACH_USER_ANCESTOR_UGRP(jp->uPtr, grp) {
-
-        updUAcct(jp, grp, &(qp->uAcct), numRUN, numSSUSP, numUSUSP,
-                 numRESERVE, numPEND, (struct hData *) NULL,
-                 NULL, (void *)qp);
-
-    } END_FOR_EACH_USER_ANCESTOR_UGRP;
-
     /* update fairshare counters
      */
     if (qp->fsSched) {
-        (*qp->fsSched->fs_update_sacct)(qp, jp, numJobs, numPEND, numRUN);
-        ls_syslog(LOG_DEBUG, "\
-%s: fs_update_sacct %s %d %d", __func__, jp->userName, numPEND, numRUN);
+        (*qp->fsSched->fs_update_sacct)(qp,
+					jp,
+					numJobs,
+					numPEND,
+					numRUN,
+					numUSUSP,
+					numSSUSP);
+    }
+
+    if (qp->own_sched) {
+        (*qp->own_sched->fs_update_sacct)(qp,
+					  jp,
+					  numJobs,
+					  numPEND,
+					  numRUN,
+					  numUSUSP,
+					  numSSUSP);
     }
 
     if (!newJob) {
@@ -456,6 +611,154 @@ updUAcct (struct jData *jData,
         if (numSlots <= 0 && (logclass & LC_JLIMIT))
             ls_syslog(LOG_DEBUG3, "%s: H's JL/U reached; job=%s host=%s user=%s", fname, lsb_jobid2str(jData->jobId), hp->host, jData->uPtr->user);
     }
+}
+
+/* updLimitSlotData() */
+void
+updLimitSlotData(struct jData *jp, int numJobs, int numPEND,
+            int numRUN, int numSSUSP, int numUSUSP, int numRESERVE)
+{
+    struct resData *qp = jp->pqPtr;
+    struct resData *uq = jp->uqPtr;
+    struct resData *hq = jp->hqPtr;
+
+    if (qp == NULL || uq == NULL)
+        return;
+
+    if (logclass & LC_JLIMIT)
+        ls_syslog(LOG_DEBUG1,
+"%s: Entering with job=%s project=%s user=%s queue=%s numJobs=%d numPEND=%d numRUN=%d numSSUSP=%d numUSUSP=%d numRESERVE=%d",
+                            __func__,
+                            lsb_jobid2str(jp->jobId),
+                            qp->project,
+                            uq->user,
+                            qp->queue,
+                            numJobs,
+                            numPEND,
+                            numRUN,
+                            numSSUSP,
+                            numUSUSP,
+                            numRESERVE);
+
+    addValue (&qp->numSlots, numJobs, jp, (char *)__func__, "numJobs");
+    addValue (&qp->numPENDSlots, numPEND, jp, (char *)__func__, "numPEND");
+    addValue (&qp->numRUNSlots, numRUN, jp, (char *)__func__, "numRUN");
+    addValue (&qp->numSSUSPSlots, numSSUSP, jp, (char *)__func__, "numSSUSP");
+    addValue (&qp->numUSUSPSlots, numUSUSP, jp, (char *)__func__, "numUSUSP");
+    addValue (&qp->numRESERVESlots, numRESERVE, jp, (char *)__func__, "numRESERVE");
+
+    addValue (&uq->numSlots, numJobs, jp, (char *)__func__, "numJobs");
+    addValue (&uq->numPENDSlots, numPEND, jp, (char *)__func__, "numPEND");
+    addValue (&uq->numRUNSlots, numRUN, jp, (char *)__func__, "numRUN");
+    addValue (&uq->numSSUSPSlots, numSSUSP, jp, (char *)__func__, "numSSUSP");
+    addValue (&uq->numUSUSPSlots, numUSUSP, jp, (char *)__func__, "numUSUSP");
+    addValue (&uq->numRESERVESlots, numRESERVE, jp, (char *)__func__, "numRESERVE");
+
+    if (!hq && jp->numHostPtr > 0) {
+        hq = getLimitUsageData(LIMIT_CONSUMER_PER_HOST,
+                               jp->hPtr[0]->host,
+                               jp->qPtr->queue);
+    }
+
+    if (hq) {
+        addValue (&hq->numSlots, numJobs, jp, (char *)__func__, "numJobs");
+        addValue (&hq->numPENDSlots, numPEND, jp, (char *)__func__, "numPEND");
+        addValue (&hq->numRUNSlots, numRUN, jp, (char *)__func__, "numRUN");
+        addValue (&hq->numSSUSPSlots, numSSUSP, jp, (char *)__func__, "numSSUSP");
+        addValue (&hq->numUSUSPSlots, numUSUSP, jp, (char *)__func__, "numUSUSP");
+        addValue (&hq->numRESERVESlots, numRESERVE, jp, (char *)__func__, "numRESERVE");
+    }
+
+    if (logclass & LC_JLIMIT)
+        ls_syslog(LOG_DEBUG2,
+"%s: job=%s project=%s user=%s queue=%s numJobs=%d numPEND=%d numRUN=%d numSSUSP=%d numUSUSP=%d numRESERVE=%d",
+                            __func__,
+                            lsb_jobid2str(jp->jobId),
+                            qp->project,
+                            uq->user,
+                            qp->queue,
+                            qp->numSlots,
+                            qp->numPENDSlots,
+                            qp->numRUNSlots,
+                            qp->numSSUSPSlots,
+                            qp->numUSUSPSlots,
+                            qp->numRESERVESlots);
+
+    return;
+}
+
+/* updLimitJobData() */
+void
+updLimitJobData(struct jData *jp, int numJobs, int numPEND,
+            int numRUN, int numSSUSP, int numUSUSP, int numRESERVE)
+{
+    struct resData *qp = jp->pqPtr;
+    struct resData *uq = jp->uqPtr;
+    struct resData *hq = jp->hqPtr;
+
+    if (qp == NULL || uq == NULL)
+        return;
+
+    if (logclass & LC_JLIMIT)
+        ls_syslog(LOG_DEBUG1,
+"%s: Entering with job=%s project=%s user=%s queue=%s numJobs=%d numPEND=%d numRUN=%d numSSUSP=%d numUSUSP=%d numRESERVE=%d",
+                            __func__,
+                            lsb_jobid2str(jp->jobId),
+                            qp->project,
+                            uq->user,
+                            qp->queue,
+                            numJobs,
+                            numPEND,
+                            numRUN,
+                            numSSUSP,
+                            numUSUSP,
+                            numRESERVE);
+
+    addValue (&qp->numJobs, numJobs, jp, (char *)__func__, "numJobs");
+    addValue (&qp->numPENDJobs, numPEND, jp, (char *)__func__, "numPEND");
+    addValue (&qp->numRUNJobs, numRUN, jp, (char *)__func__, "numRUN");
+    addValue (&qp->numSSUSPJobs, numSSUSP, jp, (char *)__func__, "numSSUSP");
+    addValue (&qp->numUSUSPJobs, numUSUSP, jp, (char *)__func__, "numUSUSP");
+    addValue (&qp->numRESERVEJobs, numRESERVE, jp, (char *)__func__, "numRESERVE");
+
+    addValue (&uq->numJobs, numJobs, jp, (char *)__func__, "numJobs");
+    addValue (&uq->numPENDJobs, numPEND, jp, (char *)__func__, "numPEND");
+    addValue (&uq->numRUNJobs, numRUN, jp, (char *)__func__, "numRUN");
+    addValue (&uq->numSSUSPJobs, numSSUSP, jp, (char *)__func__, "numSSUSP");
+    addValue (&uq->numUSUSPJobs, numUSUSP, jp, (char *)__func__, "numUSUSP");
+    addValue (&uq->numRESERVEJobs, numRESERVE, jp, (char *)__func__, "numRESERVE");
+
+    if (!hq && jp->numHostPtr > 0) {
+        hq = getLimitUsageData(LIMIT_CONSUMER_PER_HOST,
+                               jp->hPtr[0]->host,
+                               jp->qPtr->queue);
+    }
+
+    if (hq) {
+        addValue (&hq->numJobs, numJobs, jp, (char *)__func__, "numJobs");
+        addValue (&hq->numPENDJobs, numPEND, jp, (char *)__func__, "numPEND");
+        addValue (&hq->numRUNJobs, numRUN, jp, (char *)__func__, "numRUN");
+        addValue (&hq->numSSUSPJobs, numSSUSP, jp, (char *)__func__, "numSSUSP");
+        addValue (&hq->numUSUSPJobs, numUSUSP, jp, (char *)__func__, "numUSUSP");
+        addValue (&hq->numRESERVEJobs, numRESERVE, jp, (char *)__func__, "numRESERVE");
+    }
+
+    if (logclass & LC_JLIMIT)
+        ls_syslog(LOG_DEBUG2,
+"%s: job=%s project=%s user=%s queue=%s numJobs=%d numPEND=%d numRUN=%d numSSUSP=%d numUSUSP=%d numRESERVE=%d",
+                            __func__,
+                            lsb_jobid2str(jp->jobId),
+                            qp->project,
+                            uq->user,
+                            qp->queue,
+                            qp->numJobs,
+                            qp->numPENDJobs,
+                            qp->numRUNJobs,
+                            qp->numSSUSPJobs,
+                            qp->numUSUSPJobs,
+                            qp->numRESERVEJobs);
+
+    return;
 }
 
 /* addUAcct()
@@ -945,13 +1248,13 @@ updHostData(char updHPart, struct jData *jData, int numJobs, int numRUN,
         if (logclass & LC_JLIMIT)
             ls_syslog(LOG_DEBUG3, "%s: job=%s host=%s RUN=%d SSUSP=%d USUSP=%d RESERVE=%d", __func__, lsb_jobid2str(jData->jobId), hp->host, hp->numRUN, hp->numSSUSP, hp->numUSUSP, hp->numRESERVE);
 
-
         if (hp->numJobs >= hp->maxJobs) {
 
             hp->hStatus |= HOST_STAT_FULL;
             hReasonTb[1][hp->hostId] = PEND_HOST_JOB_LIMIT;
-            if (logclass & (LC_PEND | LC_JLIMIT)) {
-                ls_syslog(LOG_DEBUG2, "\
+
+            if (logclass & (LC_PEND | LC_JLIMIT | LC_PREEMPT)) {
+                ls_syslog(LOG_INFO, "\
 %s: Set reason <%d> job=%s host=%s numJobs=%d maxJobs=%d",
                           __func__, hReasonTb[1][hp->hostId],
                           lsb_jobid2str(jData->jobId), hp->host,
@@ -963,9 +1266,9 @@ updHostData(char updHPart, struct jData *jData, int numJobs, int numRUN,
 
             hp->hStatus &= ~HOST_STAT_FULL;
 
-            if ((logclass & (LC_PEND | LC_JLIMIT))
+            if ((logclass & (LC_PEND | LC_JLIMIT | LC_PREEMPT))
                 && hReasonTb[1][hp->hostId] == PEND_HOST_JOB_LIMIT) {
-                ls_syslog(LOG_DEBUG2, "\
+                ls_syslog(LOG_INFO, "\
 %s: Clear reason <%d>; job=%s host=%s numJobs=%d maxJobs=%d",
                           __func__, hReasonTb[1][hp->hostId],
                           lsb_jobid2str(jData->jobId), hp->host,
@@ -1136,19 +1439,21 @@ struct uData *
 addUserData(char *username, int maxjobs, float pJobLimit,
             char *filename, int override, int config)
 {
-    static char fname[] = "addUserData";
     hEnt *userEnt;
     int new;
     struct uData *uData;
     static int first = TRUE;
 
     if (logclass & (LC_JLIMIT))
-        ls_syslog(LOG_DEBUG2, "addUserData: New uData for user/group %s with maxJobs=%d pJobLimit=%f", username, maxjobs, pJobLimit);
+        ls_syslog(LOG_DEBUG2, "\
+%s: new uData for user/group %s with maxJobs=%d pJobLimit=%f",
+		  __func__, username, maxjobs, pJobLimit);
 
     if (first) {
         h_initTab_(&uDataList, 61);
         first = FALSE;
     }
+
     userEnt = h_addEnt_(&uDataList, username, &new);
     if (new) {
         uData = my_calloc(1,
@@ -1157,90 +1462,45 @@ addUserData(char *username, int maxjobs, float pJobLimit,
         initUData(uData);
     } else if (override) {
         uData = (struct uData *)userEnt->hData;
-        FREEUP (uData->user);
+        FREEUP(uData->user);
     } else {
         if (filename)
-            ls_syslog(LOG_ERR, _i18n_msg_get(ls_catd , NL_SETN, 7013,
-                                             "%s: %s: User <%s> is multiply defined; retaining old definition"), /* catgets 7013 */
-                      fname,
+            ls_syslog(LOG_ERR, "\
+%s: %s: User <%s> is multiply defined; retaining old definition",
+                      __func__,
                       filename,
                       username);
-        return (struct uData *)userEnt->hData;
+        return userEnt->hData;
     }
+
     if (config == TRUE)
         uData->flags |= USER_UPDATE;
 
     uData->user = safeSave(username);
     uData->pJobLimit = pJobLimit;
     uData->maxJobs   = maxjobs;
+    userEnt->hData = uData;
 
-    uData->uDataIndex = UDATA_TABLE_NUM_ELEMENTS(uDataPtrTb);
-
-
-    uDataTableAddEntry(uDataPtrTb, uData);
-
-    userEnt->hData = (int *) uData;
-
-    if (! (uData->flags & USER_GROUP) && strstr(uData->user, "others") == NULL)
-    {
-        struct uData              *allUserGrp;
-        LS_BITSET_ITERATOR_T      iter;
-
-        if (logclass & (LC_TRACE))
-            ls_syslog(LOG_DEBUG2, "\
-%s: new user <%s> added to the all user set",
-                      fname, uData->user);
-
-
-        setAddElement(allUsersSet, (void *)uData);
-
-
-        BITSET_ITERATOR_ZERO_OUT(&iter);
-        setIteratorAttach(&iter, uGrpAllSet, fname);
-        for (allUserGrp = (struct uData *)setIteratorBegin(&iter);
-             allUserGrp != NULL;
-             allUserGrp = (struct uData *)setIteratorGetNextElement(&iter))
-        {
-            char strBuf[128];
-            if (uData->parents == NULL) {
-                memset(strBuf, 0, 128);
-                sprintf(strBuf, "%s's parents set", uData->user);
-                uData->parents = setCreate(MAX_GROUPS,
-                                           getIndexByuData,
-                                           getuDataByIndex ,
-                                           strBuf);
-                if (uData->parents == NULL) {
-                    ls_syslog(LOG_ERR, I18N_FUNC_S_FAIL_EMSG_S,
-                              fname, "setCreate", strBuf, setPerror(bitseterrno));
-                    mbdDie(MASTER_MEM);
-                }
-            }
-
-            if (uData->ancestors == NULL) {
-                memset(strBuf, 0, 128);
-                sprintf(strBuf, "%s's ancestors set", uData->user);
-                uData->ancestors = setCreate(MAX_GROUPS,
-                                             getIndexByuData,
-                                             getuDataByIndex ,
-                                             strBuf);
-                if (uData->ancestors == NULL) {
-                    ls_syslog(LOG_ERR, I18N_FUNC_S_FAIL_EMSG_S,
-                              fname, "setCreate", strBuf, setPerror(bitseterrno));
-                    mbdDie(MASTER_MEM);
-                }
-            }
-
-            setAddElement(uData->parents, (void *)allUserGrp);
-            setAddElement(uData->ancestors, (void *)allUserGrp);
-
-
-            if (allUserGrp->ancestors != NULL)
-                setOperate(uData->ancestors, allUserGrp->ancestors,
-                           LS_SET_UNION);
-        }
-    }
     return uData;
+}
 
+double
+get_host_shares(char *host, char *queue)
+{
+    struct hShareData *hData = NULL;
+    struct qShareData *qData = NULL;
+    hEnt *he = NULL;
+    hEnt *qe = NULL;
+
+    if ((he = h_getEnt_(&hShareTab, host)) == NULL)
+        return 0;
+
+    hData = (struct hShareData *)he->hData;
+    if ((qe = h_getEnt_(hData->qAcct, queue)) == NULL)
+        return 0;
+
+    qData = (struct qShareData *)qe->hData;
+    return qData->dshares;
 }
 
 void
@@ -1284,6 +1544,16 @@ checkParams(struct infoReq *req, struct parameterInfo *reply)
     reply->acctArchiveInSize = acctArchiveInSize;
     reply->maxPreemptJobs = mbdParams->maxPreemptJobs;
     reply->maxStreamRecords = mbdParams->maxStreamRecords;
+    reply->freshPeriod = freshPeriod;
+    reply->maxSbdConnections = maxSbdConnections;
+    reply->hist_mins = mbdParams->hist_mins;
+    reply->run_abs_limit = mbdParams->run_abs_limit;
+    if (mbdParams->preemptableResources)
+        reply->preemptableResources = mbdParams->preemptableResources;
+    else
+        reply->preemptableResources = "";
+    reply->preempt_slot_suspend = mbdParams->preempt_slot_suspend;
+    reply->slot_decay_factor = mbdParams->slot_decay_factor;
 }
 
 void
@@ -1353,7 +1623,7 @@ isAuthManager(struct lsfAuth *auth)
     if (mSchedStage == M_STAGE_REPLAY)
         return true;
 
-    return (isManager(auth->lsfUserName));
+    return isManager(auth->lsfUserName);
 }
 
 char *
@@ -1404,6 +1674,8 @@ updResCounters(struct jData *jData, int newStatus)
 
                 updQaccount (jData, 0, 0, 0, -num, 0, num);
                 updUserData(jData, 0, 0, 0, -num, 0, num);
+                updLimitSlotData(jData, 0, 0, 0, -num, 0, num);
+                updLimitJobData(jData, 0, 0, 0, -1, 0, 1);
                 updHostData(TRUE, jData, 0, 0, -1, 0, 1);
             }  else if ((jData->jStatus & JOB_STAT_RESERVE)
                         && !(newStatus & JOB_STAT_RESERVE)
@@ -1411,11 +1683,15 @@ updResCounters(struct jData *jData, int newStatus)
                             || (newStatus & JOB_STAT_PEND))) {
                 updQaccount (jData, 0, 0, 0, num, 0, -num);
                 updUserData(jData, 0, 0, 0, num, 0, -num);
+                updLimitSlotData(jData, 0, 0, 0, num, 0, -num);
+                updLimitJobData(jData, 0, 0, 0, 1, 0, -1);
                 updHostData(TRUE, jData, 0, 0, 1, 0, -1);
             } else if ((jData->jStatus & JOB_STAT_RESERVE)
                        && IS_FINISH(newStatus)) {
                 updQaccount (jData, -num, 0, 0, 0, 0, -num);
                 updUserData(jData, -num, 0, 0, 0, 0, -num);
+                updLimitSlotData(jData, -num, 0, 0, 0, 0, -num);
+                updLimitJobData(jData, -1, 0, 0, 0, 0, -1);
                 updHostData(TRUE, jData, -1, 0, 0, 0, -1);
             } else {
             ls_syslog(LOG_ERR, "%s: Job <%s> transited from %x to %x",
@@ -1430,6 +1706,8 @@ updResCounters(struct jData *jData, int newStatus)
                 && IS_START (newStatus)) {
                 updQaccount (jData, 0, 0, 0, 0, -num, num);
                 updUserData(jData, 0, 0, 0, 0, -num,  num);
+                updLimitSlotData(jData, 0, 0, 0, 0, -num,  num);
+                updLimitJobData(jData, 0, 0, 0, 0, -1, 1);
                 updHostData(TRUE, jData, 0, 0, 0, -1, 1);
             }  else if ((jData->jStatus & JOB_STAT_RESERVE)
                         && !(newStatus & JOB_STAT_RESERVE)
@@ -1437,11 +1715,15 @@ updResCounters(struct jData *jData, int newStatus)
 
                 updQaccount (jData, 0, 0, 0, 0, num, -num);
                 updUserData(jData, 0, 0, 0, 0, num, -num);
+                updLimitSlotData(jData, 0, 0, 0, 0, -num,  num);
+                updLimitJobData(jData, 0, 0, 0, 0, -1, 1);
                 updHostData(TRUE, jData, 0, 0, 0, 1, -1);
             } else if ((jData->jStatus & JOB_STAT_RESERVE)
                        && IS_FINISH(newStatus)) {
                 updQaccount (jData, -num, 0, 0, 0, 0, -num);
                 updUserData(jData, -num, 0, 0, 0, 0, -num);
+                updLimitSlotData(jData, -num, 0, 0, 0, 0, -num);
+                updLimitJobData(jData, -1, 0, 0, 0, 0, -1);
                 updHostData(TRUE, jData, -1, 0, 0, 0, -1);
             } else {
                 ls_syslog(LOG_ERR, "\
@@ -1459,19 +1741,24 @@ updResCounters(struct jData *jData, int newStatus)
                 updQaccount (jData, 0, num, 0, 0, 0, -num);
                 updHostData(TRUE, jData, -1, 0, 0, 0, -1);
                 updUserData(jData, 0, num, 0, 0, 0, -num);
-
+                updLimitSlotData(jData, 0, num, 0, 0, 0, -num);
+                updLimitJobData(jData, 0, 1, 0, 0, 0, -1);
             }  else if (!(jData->jStatus & JOB_STAT_RESERVE)
                         && (newStatus & JOB_STAT_RESERVE)
                         && IS_PEND (newStatus)) {
                 updQaccount (jData, 0, -num, 0, 0, 0, num);
                 updHostData(TRUE, jData, 1, 0, 0, 0, 1);
                 updUserData(jData, 0, -num, 0, 0, 0, num);
+                updLimitSlotData(jData, 0, -num, 0, 0, 0, num);
+                updLimitJobData(jData, 0, -1, 0, 0, 0, 1);
             } else if (IS_PEND (jData->jStatus)
                        && (jData->jStatus & JOB_STAT_RESERVE)
                        && IS_FINISH(newStatus)) {
                 updQaccount (jData, -numReq, -numReq+num, 0, 0, 0, -num);
                 updHostData(TRUE, jData, -1, 0, 0, 0, -1);
                 updUserData(jData, -numReq, -numReq+num, 0, 0, 0, -num);
+                updLimitSlotData(jData, -numReq, -numReq+num, 0, 0, 0, -num);
+                updLimitJobData(jData, -1, -1, 0, 0, 0, -1);
             } else {
                 ls_syslog(LOG_ERR, "\
 %s: Job <%s> transited from %x to %x", __func__,
@@ -1511,7 +1798,9 @@ initUData(struct uData *uPtr)
     uPtr->descendants = NULL;
     uPtr->parents     = NULL;
     uPtr->ancestors   = NULL;
-    uPtr->pxySJL = NULL;
+    /* User jobs references
+     */
+    uPtr->jobs = dlink_make();
 }
 
 void
@@ -1533,8 +1822,21 @@ updHostLeftRusageMem(struct jData *jobP, int order)
 
 
             if (resValPtr->duration != INFINIT_INT)
-
                 return;
+
+            if ((hasResSpanHosts(jobP->shared->resValPtr)
+                 || hasResSpanHosts(jobP->qPtr->resValPtr))
+                && (jobP->shared->jobBill.numProcessors > 1)
+                && (jobP->shared->jobBill.numProcessors == jobP->shared->jobBill.maxNumProcessors)) {
+                resMem /= jobP->shared->jobBill.numProcessors;
+                if (logclass & (LC_TRACE | LC_SCHED )) {
+                    ls_syslog(LOG_DEBUG, "\
+%s: Updating job <%s>'s reserved mem to <%f> as all processors of the job are allocated on the same host.",
+                    fname,
+                    lsb_jobid2str(jobP->jobId),
+                    resMem);
+                }
+            }
 
             for (numHost = 0; numHost < jobP->numHostPtr; numHost++) {
                 if (jobP->hPtr[numHost]->leftRusageMem == INFINIT_LOAD){
@@ -1558,4 +1860,29 @@ updHostLeftRusageMem(struct jData *jobP, int order)
             }
         }
     }
+}
+
+/* fork_mbd()
+ */
+int
+fork_mbd(void)
+{
+    pid_t pid;
+    int cc;
+    int n;
+
+    pid = fork();
+    if (pid < 0) {
+	ls_syslog(LOG_ERR, "\
+%s: ohmygosh fork() failed %m", __func__);
+	return -1;
+    }
+    if (pid > 0)
+	return pid;
+
+    n = sysconf(_SC_OPEN_MAX);
+    for (cc = 3; cc < n; cc++)
+	close(cc);
+
+    return pid;
 }

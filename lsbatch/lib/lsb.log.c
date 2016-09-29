@@ -1,6 +1,6 @@
 /*
+ * Copyright (C) 2014-2016 David Bigagli
  * Copyright (C) 2007 Platform Computing Inc
- * Copyright (C) 2014-2015 David Bigagli
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of version 2 of the GNU General Public License as
@@ -51,6 +51,12 @@ static int readJobSignal (char *, struct signalLog *);
 static int readJobMsg (char *, struct jobMsgLog *);
 static int readJobClean(char *, struct jobCleanLog *);
 static int readLogSwitch(char *, struct logSwitchLog *);
+static int readNewJgrp(char *, struct jgrpLog *);
+static int readDelJgrp(char *, struct jgrpLog *);
+static int readModJgrp(char *, struct jgrpModLog *);
+static int readJobPreempting(char *, struct jobPreemptingLog *);
+static int readJobPreempted(char *, struct jobPreemptedLog *);
+
 static int writeJobNew(FILE *, struct jobNewLog *);
 static int writeJobMod(FILE *, struct jobModLog *);
 static int writeJobStart(FILE *, struct jobStartLog *);
@@ -79,6 +85,11 @@ static int writeJobForce(FILE* , struct jobForceRequestLog*);
 static int readJobForce(char *, struct jobForceRequestLog* );
 static int writeJobAttrSet(FILE* , struct jobAttrSetLog*);
 static int writeStreamEnd(FILE *, struct endStream *);
+static int writeNewJgrp(FILE *, struct jgrpLog *);
+static int writeDelJgrp(FILE *, struct jgrpLog *);
+static int writeModJgrp(FILE *, struct jgrpModLog *);
+static int writeJobPreempting(FILE *, struct jobPreemptingLog *);
+static int writeJobPreempted(FILE *, struct jobPreemptedLog *);
 static int readJobAttrSet(char *, struct jobAttrSetLog* );
 static void freeLogRec(struct eventRec *);
 struct eventRec * lsbGetNextJobEvent(struct eventLogHandle *,
@@ -98,25 +109,34 @@ static int lsb_readeventrecord(char *, struct eventRec *);
 #define   EVENT_JOB_RELATED     1
 #define   EVENT_NON_JOB_RELATED 0
 
+static inline int
+copyQStr(char **line,
+         int maxLen,
+         int nonNil,
+         char *dbuf)
+{
+    static char buf[BUFSIZ];
+    int cc;
 
-#define copyQStr(line, maxLen, nonNil, destStr)    {            \
-        char *tmpLine;                                          \
-        int ccount;                                             \
-        if ((tmpLine = (char *) malloc (strlen(line))) == NULL) \
-            return LSBE_NO_MEM;                               \
-        if ((ccount = stripQStr(line, tmpLine)) < 0) {          \
-            FREEUP (tmpLine);                                   \
-            return LSBE_EVENT_FORMAT;                         \
-        }                                                       \
-        line += ccount + 1;                                     \
-        if (strlen(tmpLine) >= maxLen                           \
-            || (nonNil && strlen(tmpLine)==0)) {                \
-            FREEUP (tmpLine);                                   \
-            return LSBE_EVENT_FORMAT;                         \
-        }                                                       \
-        strcpy(destStr, tmpLine);                               \
-        FREEUP (tmpLine);                                       \
+    memset(buf, 0, sizeof(buf));
+    memset(dbuf, 0, strlen(dbuf));
+
+    cc = stripQStr(*line, buf);
+    if (cc < 0)
+        return LSBE_EVENT_FORMAT;
+
+    *line += cc + 1;
+    cc = strlen(buf);
+
+    if (cc >= maxLen
+        || (nonNil && cc == 0)) {
+        return LSBE_EVENT_FORMAT;
     }
+
+    strcpy(dbuf, buf);
+
+    return LSBE_NO_ERROR;
+}
 
 #define saveQStr(line, destStr)  {                              \
         char *tmpLine;                                          \
@@ -410,6 +430,7 @@ lsb_geteventrec(FILE *log_fp, int *LineNum)
      */
     strcpy(logRec->version, namebuf);
     if ((version = atoi(logRec->version)) <= 0) {
+        free(namebuf);
         lsberrno = LSBE_EVENT_FORMAT;
         return NULL;
     }
@@ -437,8 +458,123 @@ lsb_geteventrec(FILE *log_fp, int *LineNum)
         return logRec;
 
     return NULL;
-
 }
+
+/* lsb_geteventrecord()
+ *
+ * Use special purpose lsb.events reading routine
+ *
+ */
+struct eventRec *
+lsb_geteventrecord(FILE *log_fp, int *LineNum)
+{
+    int cc;
+    int ccount;
+    int cnt;
+    char *line;
+    char etype[MAX_LSB_NAME_LEN];
+    char *namebuf;
+    static struct eventRec *logRec;
+    int eventKind;
+    int tempTimeStamp;
+
+    cnt = 0;
+    if (logRec != NULL)  {
+        freeLogRec(logRec);
+        free(logRec);
+    }
+
+    logRec = calloc(1, sizeof (struct eventRec));
+    if (logRec == NULL) {
+        lsberrno = LSBE_NO_MEM;
+        return NULL;
+    }
+
+    (*LineNum)++;
+
+    if ((line = _getNextLine_(log_fp, &cnt, false)) == NULL) {
+        if (lserrno == LSE_NO_MEM) {
+            lsberrno = LSBE_NO_MEM;
+        } else {
+            lsberrno = LSBE_EOF;
+        }
+        return NULL;
+    }
+
+    while (*line == '#') {
+
+        line = _getNextLine_(log_fp, &cnt, false);
+        if (line == NULL) {
+            lsberrno = LSBE_EOF;
+            return NULL;
+        }
+    }
+
+    if (logclass & LC_TRACE)
+        ls_syslog(LOG_DEBUG2, "%s: line=%s", __func__, line);
+
+    namebuf = calloc(1, strlen(line)+1);
+    if (namebuf == NULL) {
+        lsberrno = LSBE_NO_MEM;
+        return NULL;
+    }
+
+    if ((ccount = stripQStr(line, namebuf)) < 0
+        || strlen(line) == ccount
+        || strlen(namebuf) >= MAX_LSB_NAME_LEN) {
+        lsberrno = LSBE_EVENT_FORMAT;
+        free(namebuf);
+        return NULL;
+    }
+
+    strcpy(etype, namebuf);
+    line += ccount + 1;
+
+    if ((ccount = stripQStr(line, namebuf)) < 0
+        || strlen(line) == ccount
+        || strlen(namebuf) >= MAX_VERSION_LEN) {
+        lsberrno = LSBE_EVENT_FORMAT;
+        free(namebuf);
+        return NULL;
+    }
+
+    /* The log record keeps the version as char[]
+     * while the global is uint32_t
+     */
+    strcpy(logRec->version, namebuf);
+    if ((version = atoi(logRec->version)) <= 0) {
+        lsberrno = LSBE_EVENT_FORMAT;
+        return NULL;
+    }
+    line += ccount + 1;
+
+    free(namebuf);
+
+    cc = sscanf(line, "%d%n", &tempTimeStamp, &ccount);
+    logRec->eventTime = tempTimeStamp;
+
+    if (cc != 1) {
+        lsberrno = LSBE_EVENT_FORMAT;
+        return NULL;
+    }
+    line += ccount + 1;
+
+    if ((logRec->type = getEventTypeAndKind(etype, &eventKind)) == -1)
+        return NULL;
+    if (logclass & LC_TRACE)
+        ls_syslog(LOG_DEBUG2, "%s: log.type=%x", __func__, logRec->type);
+
+    /* read the record and build the logRec data
+     * structure.
+     */
+    readEventRecord(line, logRec);
+
+    if (lsberrno == LSBE_NO_ERROR)
+        return logRec;
+
+    return NULL;
+}
+
 
 static void
 freeLogRec(struct eventRec *logRec)
@@ -472,6 +608,10 @@ freeLogRec(struct eventRec *logRec)
                 free(logRec->eventLog.jobNewLog.loginShell);
             if (logRec->eventLog.jobNewLog.userGroup)
                 free(logRec->eventLog.jobNewLog.userGroup);
+            if (logRec->eventLog.jobNewLog.job_group)
+                free(logRec->eventLog.jobNewLog.job_group);
+            if (logRec->eventLog.jobNewLog.job_description)
+                free(logRec->eventLog.jobNewLog.job_description);
             return;
         case EVENT_JOB_MODIFY2:
             FREEUP(logRec->eventLog.jobModLog.userName);
@@ -504,6 +644,7 @@ freeLogRec(struct eventRec *logRec)
             FREEUP(logRec->eventLog.jobModLog.projectName);
             FREEUP(logRec->eventLog.jobModLog.loginShell);
             FREEUP(logRec->eventLog.jobModLog.schedHostType);
+            FREEUP(logRec->eventLog.jobModLog.job_description);
             return;
 
         case EVENT_JOB_START:
@@ -588,6 +729,13 @@ freeLogRec(struct eventRec *logRec)
             return;
         case EVENT_LOG_SWITCH:
             return;
+        case EVENT_JOB_PREEMPTING:
+            for (i = 0; i < logRec->eventLog.jobPreempting.numHosts; i++) {
+                _free_(logRec->eventLog.jobPreempting.hosts[i]);
+            }
+            _free_(logRec->eventLog.jobPreempting.hosts);
+        case EVENT_JOB_PREEMPTED:
+            return;
         default:
             return;
     }
@@ -599,9 +747,6 @@ readJobNew(char *line, struct jobNewLog *jobNewLog)
 {
     int  i, cc, ccount;
     int  tmpSubmit, tmpBegin, tmpTerm;
-
-
-
 
     cc = sscanf(line, "%d%d%d%d%d%d%d%d%d%d%n",
                 &(jobNewLog->jobId),
@@ -624,7 +769,7 @@ readJobNew(char *line, struct jobNewLog *jobNewLog)
 
     line += ccount + 1;
 
-    copyQStr(line, MAX_LSB_NAME_LEN, 1, jobNewLog->userName);
+    copyQStr(&line, MAX_LSB_NAME_LEN, 1, jobNewLog->userName);
 
     for (i = 0; i < LSF_RLIM_NLIMITS; i++) {
         cc = sscanf(line, "%d%n", &(jobNewLog->rLimits[i]), &ccount);
@@ -633,7 +778,7 @@ readJobNew(char *line, struct jobNewLog *jobNewLog)
         line += ccount + 1;
     }
 
-    copyQStr(line, MAXHOSTNAMELEN, 0, jobNewLog->hostSpec);
+    copyQStr(&line, MAXHOSTNAMELEN, 0, jobNewLog->hostSpec);
 
     cc = sscanf(line, "%f%d%n", &jobNewLog->hostFactor,
                 &jobNewLog->umask, &ccount);
@@ -641,16 +786,16 @@ readJobNew(char *line, struct jobNewLog *jobNewLog)
         return LSBE_EVENT_FORMAT;
     line += ccount + 1;
 
-    copyQStr(line, MAX_LSB_NAME_LEN, 1, jobNewLog->queue);
+    copyQStr(&line, MAX_LSB_NAME_LEN, 1, jobNewLog->queue);
     saveQStr(line, jobNewLog->resReq);
-    copyQStr(line, MAXHOSTNAMELEN, 1, jobNewLog->fromHost);
-    copyQStr(line, MAXFILENAMELEN, 0, jobNewLog->cwd);
-    copyQStr(line, MAXFILENAMELEN, 0, jobNewLog->chkpntDir);
-    copyQStr(line, MAXFILENAMELEN, 0, jobNewLog->inFile);
-    copyQStr(line, MAXFILENAMELEN, 0, jobNewLog->outFile);
-    copyQStr(line, MAXFILENAMELEN, 0, jobNewLog->errFile);
-    copyQStr(line, MAXFILENAMELEN, 0, jobNewLog->subHomeDir);
-    copyQStr(line, MAXFILENAMELEN, 1, jobNewLog->jobFile);
+    copyQStr(&line, MAXHOSTNAMELEN, 1, jobNewLog->fromHost);
+    copyQStr(&line, MAXFILENAMELEN, 0, jobNewLog->cwd);
+    copyQStr(&line, MAXFILENAMELEN, 0, jobNewLog->chkpntDir);
+    copyQStr(&line, MAXFILENAMELEN, 0, jobNewLog->inFile);
+    copyQStr(&line, MAXFILENAMELEN, 0, jobNewLog->outFile);
+    copyQStr(&line, MAXFILENAMELEN, 0, jobNewLog->errFile);
+    copyQStr(&line, MAXFILENAMELEN, 0, jobNewLog->subHomeDir);
+    copyQStr(&line, MAXFILENAMELEN, 1, jobNewLog->jobFile);
 
     cc = sscanf(line, "%d%n", &jobNewLog->numAskedHosts, &ccount);
     if (cc != 1)
@@ -684,8 +829,8 @@ readJobNew(char *line, struct jobNewLog *jobNewLog)
     saveQStr(line, jobNewLog->dependCond);
     saveQStr(line, jobNewLog->preExecCmd);
 
-    copyQStr(line, MAX_CMD_DESC_LEN, 0, jobNewLog->jobName);
-    copyQStr(line, MAX_CMD_DESC_LEN, 0, jobNewLog->command);
+    copyQStr(&line, MAX_CMD_DESC_LEN, 0, jobNewLog->jobName);
+    copyQStr(&line, MAX_CMD_DESC_LEN, 0, jobNewLog->command);
 
     cc = sscanf(line, "%d%n", &jobNewLog->nxf, &ccount);
     if (cc != 1)
@@ -702,8 +847,8 @@ readJobNew(char *line, struct jobNewLog *jobNewLog)
     }
 
     for (i = 0; i < jobNewLog->nxf; i++) {
-        copyQStr(line, MAXFILENAMELEN, 0, jobNewLog->xf[i].subFn);
-        copyQStr(line, MAXFILENAMELEN, 0, jobNewLog->xf[i].execFn);
+        copyQStr(&line, MAXFILENAMELEN, 0, jobNewLog->xf[i].subFn);
+        copyQStr(&line, MAXFILENAMELEN, 0, jobNewLog->xf[i].execFn);
         cc = sscanf(line, "%d%n", &jobNewLog->xf[i].options, &ccount);
         if (cc != 1)
             return LSBE_EVENT_FORMAT;
@@ -731,32 +876,62 @@ readJobNew(char *line, struct jobNewLog *jobNewLog)
                 &(jobNewLog->idx),  &ccount);
     if (cc != 2)
         return LSBE_EVENT_FORMAT;
+    line += ccount + 1;
 
     if ((jobNewLog->options2 & SUB2_BSUB_BLOCK)){
-        line += ccount;
-        if (*line != '\0') {
-            cc = sscanf(line, "%d%n", &jobNewLog->niosPort, &ccount);
-            if (cc != 1)
-                return LSBE_EVENT_FORMAT;
-        }
+        cc = sscanf(line, "%d%n", &jobNewLog->niosPort, &ccount);
+        if (cc != 1)
+            return LSBE_EVENT_FORMAT;
+        line += ccount + 1;
     }
 
     if (!(jobNewLog->options & SUB_RLIMIT_UNIT_IS_KB)) {
         convertRLimit(jobNewLog->rLimits, 1);
     }
 
-    copyQStr(line, MAXFILENAMELEN, 0, jobNewLog->inFileSpool);
-    copyQStr(line, MAXFILENAMELEN, 0, jobNewLog->commandSpool);
-    copyQStr(line, MAXPATHLEN, 0, jobNewLog->jobSpoolDir);
+    copyQStr(&line, MAXFILENAMELEN, 0, jobNewLog->inFileSpool);
+    copyQStr(&line, MAXFILENAMELEN, 0, jobNewLog->commandSpool);
+    copyQStr(&line, MAXPATHLEN, 0, jobNewLog->jobSpoolDir);
 
     cc = sscanf(line, "%d%n", &jobNewLog->userPriority, &ccount);
     if (cc != 1)
         return LSBE_EVENT_FORMAT;
+    line += ccount + 1;
 
-    if (version >= OPENLAVA_XDR_VERSION) {
+    if (version >= 30) {
         saveQStr(line, jobNewLog->userGroup);
     } else {
         jobNewLog->userGroup = strdup("");
+    }
+
+    if (version >= 32) {
+        cc = sscanf(line, "%d%n", &jobNewLog->abs_run_limit, &ccount);
+        if (cc != 1)
+            return LSBE_EVENT_FORMAT;
+        line += ccount + 1;
+    } else {
+        jobNewLog->abs_run_limit = -1;
+    }
+
+    if (version >= 33) {
+        saveQStr(line, jobNewLog->job_group);
+    } else {
+        jobNewLog->job_group = strdup("");
+    }
+
+    if (jobNewLog->options2 & SUB2_JOB_DESC) {
+        saveQStr(line, jobNewLog->job_description);
+    } else {
+        jobNewLog->job_description = strdup("");
+    }
+
+    if (version >= 40) {
+        cc = sscanf(line, "%ld%n", &jobNewLog->priority, &ccount);
+        if (cc != 1)
+            return LSBE_EVENT_FORMAT;
+        line += ccount + 1;
+    } else {
+        jobNewLog->priority = -1;
     }
 
     return LSBE_NO_ERROR;
@@ -862,8 +1037,8 @@ readJobMod(char *line, struct jobModLog *jobModLog)
             }
         }
         for (i = 0; i < jobModLog->nxf; i++) {
-            copyQStr(line, MAXFILENAMELEN, 0, jobModLog->xf[i].subFn);
-            copyQStr(line, MAXFILENAMELEN, 0, jobModLog->xf[i].execFn);
+            copyQStr(&line, MAXFILENAMELEN, 0, jobModLog->xf[i].subFn);
+            copyQStr(&line, MAXFILENAMELEN, 0, jobModLog->xf[i].execFn);
             cc = sscanf(line, "%d%n", &jobModLog->xf[i].options, &ccount);
             if (cc != 1)
                 return LSBE_EVENT_FORMAT;
@@ -910,6 +1085,10 @@ readJobMod(char *line, struct jobModLog *jobModLog)
         if ( cc != 1)
             return LSBE_EVENT_FORMAT;
         line += ccount + 1;
+    }
+
+    if (jobModLog->options2 & SUB2_JOB_DESC) {
+        saveQStr(line, jobModLog->job_description);
     }
 
     return LSBE_NO_ERROR;
@@ -975,7 +1154,7 @@ readJobStart(char *line, struct jobStartLog *jobStartLog)
     if (cc != 1)
         return LSBE_EVENT_FORMAT;
 
-    if (version >= OPENLAVA_XDR_VERSION) {
+    if (version >= 30) {
         saveQStr(line, jobStartLog->userGroup);
     } else {
         jobStartLog->userGroup = strdup("");
@@ -993,15 +1172,23 @@ readJobStartAccept(char *line, struct jobStartAcceptLog *jobStartAcceptLog)
                 &(jobStartAcceptLog->jobId),
                 &(jobStartAcceptLog->jobPid),
                 &(jobStartAcceptLog->jobPGid),
-                &ccount );
+                &ccount);
     if (cc != 3)
         return LSBE_EVENT_FORMAT;
     line += ccount + 1;
 
-    cc = sscanf(line, "%d%n", &(jobStartAcceptLog->idx), &ccount );
+    cc = sscanf(line, "%d%n", &(jobStartAcceptLog->idx), &ccount);
     if (cc != 1)
         return LSBE_EVENT_FORMAT;
     line += ccount + 1;
+
+    if (version >= 33) {
+        cc = sscanf(line, "%d%n", &(jobStartAcceptLog->jflags), &ccount);
+        if (cc != 1)
+            return LSBE_EVENT_FORMAT;
+        line += ccount + 1;
+    }
+
     return LSBE_NO_ERROR;
 
 }
@@ -1149,7 +1336,7 @@ readMig(char *line, struct migLog *migLog)
     if (cc != 1)
         return LSBE_EVENT_FORMAT;
 
-    copyQStr(line, MAX_LSB_NAME_LEN, 1, migLog->userName);
+    copyQStr(&line, MAX_LSB_NAME_LEN, 1, migLog->userName);
     return LSBE_NO_ERROR;
 
 }
@@ -1260,7 +1447,7 @@ readJobSwitch(char *line, struct jobSwitchLog *jobSwitchLog)
         return LSBE_EVENT_FORMAT;
 
     line += ccount + 1;
-    copyQStr(line, MAX_LSB_NAME_LEN, 1, jobSwitchLog->queue);
+    copyQStr(&line, MAX_LSB_NAME_LEN, 1, jobSwitchLog->queue);
 
     cc = sscanf(line, "%d%n", &(jobSwitchLog->idx),
                 &ccount);
@@ -1268,7 +1455,7 @@ readJobSwitch(char *line, struct jobSwitchLog *jobSwitchLog)
         return LSBE_EVENT_FORMAT;
     line += ccount + 1;
 
-    copyQStr(line, MAX_LSB_NAME_LEN, 1, jobSwitchLog->userName);
+    copyQStr(&line, MAX_LSB_NAME_LEN, 1, jobSwitchLog->userName);
 
     return LSBE_NO_ERROR;
 
@@ -1295,7 +1482,7 @@ readJobMove(char *line, struct jobMoveLog *jobMoveLog)
         return LSBE_EVENT_FORMAT;
     line += ccount + 1;
 
-    copyQStr(line, MAX_LSB_NAME_LEN, 1, jobMoveLog->userName);
+    copyQStr(&line, MAX_LSB_NAME_LEN, 1, jobMoveLog->userName);
 
     return LSBE_NO_ERROR;
 }
@@ -1310,13 +1497,13 @@ readQueueCtrl(char *line, struct queueCtrlLog *queueCtrlLog)
         return LSBE_EVENT_FORMAT;
 
     line += ccount + 1;
-    copyQStr(line, MAX_LSB_NAME_LEN, 1, queueCtrlLog->queue);
+    copyQStr(&line, MAX_LSB_NAME_LEN, 1, queueCtrlLog->queue);
 
     cc = sscanf(line, "%d%n", &(queueCtrlLog->userId), &ccount);
     if (cc != 1)
         return LSBE_EVENT_FORMAT;
 
-    copyQStr(line, MAX_LSB_NAME_LEN, 1, queueCtrlLog->userName);
+    copyQStr(&line, MAX_LSB_NAME_LEN, 1, queueCtrlLog->userName);
 
     return LSBE_NO_ERROR;
 }
@@ -1332,13 +1519,15 @@ readHostCtrl(char *line, struct hostCtrlLog *hostCtrlLog)
 
     line += ccount + 1;
 
-    copyQStr(line, MAXHOSTNAMELEN, 0, hostCtrlLog->host);
+    copyQStr(&line, MAXHOSTNAMELEN, 0, hostCtrlLog->host);
 
     cc = sscanf(line, "%d%n", &(hostCtrlLog->userId), &ccount);
     if (cc != 1)
         return LSBE_EVENT_FORMAT;
 
-    copyQStr(line, MAX_LSB_NAME_LEN, 1, hostCtrlLog->userName);
+    copyQStr(&line, MAX_LSB_NAME_LEN, 1, hostCtrlLog->userName);
+
+    copyQStr(&line, MAXLINELEN, 0, hostCtrlLog->message);
 
     return LSBE_NO_ERROR;
 
@@ -1349,7 +1538,7 @@ readMbdDie (char *line, struct mbdDieLog *mbdDieLog)
 {
     int cc;
 
-    copyQStr(line, MAXHOSTNAMELEN, 0,  mbdDieLog->master);
+    copyQStr(&line, MAXHOSTNAMELEN, 0,  mbdDieLog->master);
     cc = sscanf(line, "%d%d", &(mbdDieLog->numRemoveJobs),
                 &(mbdDieLog->exitCode));
     if (cc != 2)
@@ -1433,17 +1622,17 @@ readJobFinish(char *line, struct jobFinishLog *jobFinishLog, time_t eventTime)
 
     line += ccount + 1;
 
-    copyQStr(line, MAX_LSB_NAME_LEN, 1, jobFinishLog->userName);
-    copyQStr(line, MAX_LSB_NAME_LEN, 1, jobFinishLog->queue);
+    copyQStr(&line, MAX_LSB_NAME_LEN, 1, jobFinishLog->userName);
+    copyQStr(&line, MAX_LSB_NAME_LEN, 1, jobFinishLog->queue);
     saveQStr(line, jobFinishLog->resReq);
     saveQStr(line, jobFinishLog->dependCond);
     saveQStr(line, jobFinishLog->preExecCmd);
-    copyQStr(line, MAXHOSTNAMELEN, 1, jobFinishLog->fromHost);
-    copyQStr(line, MAXFILENAMELEN, 0, jobFinishLog->cwd);
-    copyQStr(line, MAXFILENAMELEN, 0, jobFinishLog->inFile);
-    copyQStr(line, MAXFILENAMELEN, 0, jobFinishLog->outFile);
-    copyQStr(line, MAXFILENAMELEN, 0, jobFinishLog->errFile);
-    copyQStr(line, MAXFILENAMELEN, 1, jobFinishLog->jobFile);
+    copyQStr(&line, MAXHOSTNAMELEN, 1, jobFinishLog->fromHost);
+    copyQStr(&line, MAXFILENAMELEN, 0, jobFinishLog->cwd);
+    copyQStr(&line, MAXFILENAMELEN, 0, jobFinishLog->inFile);
+    copyQStr(&line, MAXFILENAMELEN, 0, jobFinishLog->outFile);
+    copyQStr(&line, MAXFILENAMELEN, 0, jobFinishLog->errFile);
+    copyQStr(&line, MAXFILENAMELEN, 1, jobFinishLog->jobFile);
 
     cc = sscanf(line, "%d%n", &jobFinishLog->numAskedHosts, &ccount);
     if (cc != 1)
@@ -1507,8 +1696,8 @@ readJobFinish(char *line, struct jobFinishLog *jobFinishLog, time_t eventTime)
 
     jobFinishLog->endTime = eventTime;
 
-    copyQStr(line, MAX_CMD_DESC_LEN, 0, jobFinishLog->jobName);
-    copyQStr(line, MAX_CMD_DESC_LEN, 0, jobFinishLog->command);
+    copyQStr(&line, MAX_CMD_DESC_LEN, 0, jobFinishLog->jobName);
+    copyQStr(&line, MAX_CMD_DESC_LEN, 0, jobFinishLog->command);
 
     if ((cc =  str2lsfRu(line, &jobFinishLog->lsfRusage, &ccount)) != 19)
         return LSBE_EVENT_FORMAT;
@@ -1544,8 +1733,8 @@ readJobFinish(char *line, struct jobFinishLog *jobFinishLog, time_t eventTime)
         return LSBE_EVENT_FORMAT;
     line += ccount + 1;
 
-    copyQStr(line, MAXFILENAMELEN, 0, jobFinishLog->inFileSpool);
-    copyQStr(line, MAXFILENAMELEN, 0, jobFinishLog->commandSpool);
+    copyQStr(&line, MAXFILENAMELEN, 0, jobFinishLog->inFileSpool);
+    copyQStr(&line, MAXFILENAMELEN, 0, jobFinishLog->commandSpool);
 
     return LSBE_NO_ERROR;
 
@@ -1646,6 +1835,21 @@ lsb_puteventrec(FILE *log_fp, struct eventRec *logPtr)
             break;
         case EVENT_STREAM_END:
             etype = "STREAM_END";
+            break;
+        case EVENT_NEW_JGRP:
+            etype = "NEW_JGRP";
+            break;
+        case EVENT_DEL_JGRP:
+            etype = "DEL_JGRP";
+            break;
+        case EVENT_MOD_JGRP:
+            etype = "MOD_JGRP";
+            break;
+        case EVENT_JOB_PREEMPTING:
+            etype = "JOB_PREEMPTING";
+            break;
+        case EVENT_JOB_PREEMPTED:
+            etype = "JOB_PREEMPTED";
             break;
         default:
             lsberrno = LSBE_UNKNOWN_EVENT;
@@ -1766,6 +1970,21 @@ lsb_puteventrec(FILE *log_fp, struct eventRec *logPtr)
         case EVENT_STREAM_END:
             lsberrno = writeStreamEnd(log_fp, &(logPtr->eventLog.eos));
             break;
+        case EVENT_NEW_JGRP:
+            lsberrno = writeNewJgrp(log_fp, &(logPtr->eventLog.jgrpLog));
+            break;
+        case EVENT_DEL_JGRP:
+            lsberrno = writeDelJgrp(log_fp, &(logPtr->eventLog.jgrpLog));
+            break;
+        case EVENT_MOD_JGRP:
+            lsberrno = writeModJgrp(log_fp, &(logPtr->eventLog.jgrpMod));
+            break;
+        case EVENT_JOB_PREEMPTING:
+            lsberrno = writeJobPreempting(log_fp, &(logPtr->eventLog.jobPreempting));
+            break;
+        case EVENT_JOB_PREEMPTED:
+            lsberrno = writeJobPreempted(log_fp, &(logPtr->eventLog.jobPreempted));
+            break;
     }
 
     if (lsberrno == LSBE_NO_ERROR) {
@@ -1804,7 +2023,7 @@ writeJobNew(FILE *log_fp, struct jobNewLog *jobNewLog)
     for(i = 0; i < LSF_RLIM_NLIMITS; i++)
         if (fprintf(log_fp, " %d", jobNewLog->rLimits[i]) <0)
             return LSBE_SYS_CALL;
-    if (addQStr (log_fp, jobNewLog->hostSpec) < 0)
+    if (addQStr(log_fp, jobNewLog->hostSpec) < 0)
         return LSBE_SYS_CALL;
     if (fprintf(log_fp, " %6.2f", jobNewLog->hostFactor) < 0)
         return LSBE_SYS_CALL;
@@ -1813,23 +2032,23 @@ writeJobNew(FILE *log_fp, struct jobNewLog *jobNewLog)
     if (addQStr(log_fp, jobNewLog->queue) < 0)
         return LSBE_SYS_CALL;
     subNewLine_(jobNewLog->resReq);
-    if (addQStr (log_fp, jobNewLog->resReq) < 0)
+    if (addQStr(log_fp, jobNewLog->resReq) < 0)
         return LSBE_SYS_CALL;
-    if (addQStr (log_fp, jobNewLog->fromHost) < 0)
+    if (addQStr(log_fp, jobNewLog->fromHost) < 0)
         return LSBE_SYS_CALL;
-    if (addQStr (log_fp, jobNewLog->cwd) < 0)
+    if (addQStr(log_fp, jobNewLog->cwd) < 0)
         return LSBE_SYS_CALL;
-    if (addQStr (log_fp, jobNewLog->chkpntDir) < 0)
+    if (addQStr(log_fp, jobNewLog->chkpntDir) < 0)
         return LSBE_SYS_CALL;
-    if (addQStr (log_fp, jobNewLog->inFile) < 0)
+    if (addQStr(log_fp, jobNewLog->inFile) < 0)
         return LSBE_SYS_CALL;
-    if (addQStr (log_fp, jobNewLog->outFile) < 0)
+    if (addQStr(log_fp, jobNewLog->outFile) < 0)
         return LSBE_SYS_CALL;
-    if (addQStr (log_fp, jobNewLog->errFile) < 0)
+    if (addQStr(log_fp, jobNewLog->errFile) < 0)
         return LSBE_SYS_CALL;
-    if (addQStr (log_fp, jobNewLog->subHomeDir) < 0)
+    if (addQStr(log_fp, jobNewLog->subHomeDir) < 0)
         return LSBE_SYS_CALL;
-    if (addQStr (log_fp, jobNewLog->jobFile) < 0)
+    if (addQStr(log_fp, jobNewLog->jobFile) < 0)
         return LSBE_SYS_CALL;
 
     if (fprintf(log_fp, " %d", jobNewLog->numAskedHosts) < 0)
@@ -1841,7 +2060,7 @@ writeJobNew(FILE *log_fp, struct jobNewLog *jobNewLog)
         }
 
     subNewLine_(jobNewLog->dependCond);
-    if (addQStr (log_fp, jobNewLog->dependCond) < 0)
+    if (addQStr(log_fp, jobNewLog->dependCond) < 0)
         return LSBE_SYS_CALL;
     subNewLine_(jobNewLog->preExecCmd);
     if (addQStr(log_fp, jobNewLog->preExecCmd) < 0)
@@ -1861,10 +2080,10 @@ writeJobNew(FILE *log_fp, struct jobNewLog *jobNewLog)
             return LSBE_SYS_CALL;
     }
     subNewLine_(jobNewLog->mailUser);
-    if (addQStr (log_fp, jobNewLog->mailUser) < 0)
+    if (addQStr(log_fp, jobNewLog->mailUser) < 0)
         return LSBE_SYS_CALL;
 
-    if (addQStr (log_fp, jobNewLog->projectName) < 0)
+    if (addQStr(log_fp, jobNewLog->projectName) < 0)
         return LSBE_SYS_CALL;
 
     if (jobNewLog->options & SUB_INTERACTIVE) {
@@ -1874,10 +2093,10 @@ writeJobNew(FILE *log_fp, struct jobNewLog *jobNewLog)
     if (fprintf(log_fp, " %d", jobNewLog->maxNumProcessors) < 0)
         return LSBE_SYS_CALL;
 
-    if (addQStr (log_fp, jobNewLog->schedHostType) < 0)
+    if (addQStr(log_fp, jobNewLog->schedHostType) < 0)
         return LSBE_SYS_CALL;
 
-    if (addQStr (log_fp, jobNewLog->loginShell) < 0)
+    if (addQStr(log_fp, jobNewLog->loginShell) < 0)
         return LSBE_SYS_CALL;
 
 
@@ -1893,19 +2112,33 @@ writeJobNew(FILE *log_fp, struct jobNewLog *jobNewLog)
             return LSBE_SYS_CALL;
     }
 
-    if (addQStr (log_fp, jobNewLog->inFileSpool) < 0)
+    if (addQStr(log_fp, jobNewLog->inFileSpool) < 0)
         return LSBE_SYS_CALL;
 
-    if (addQStr (log_fp, jobNewLog->commandSpool) < 0)
+    if (addQStr(log_fp, jobNewLog->commandSpool) < 0)
         return LSBE_SYS_CALL;
 
-    if (addQStr (log_fp, jobNewLog->jobSpoolDir) < 0)
+    if (addQStr(log_fp, jobNewLog->jobSpoolDir) < 0)
         return LSBE_SYS_CALL;
 
     if (fprintf(log_fp, " %d", jobNewLog->userPriority) < 0)
         return LSBE_SYS_CALL;
 
-    if (addQStr (log_fp, jobNewLog->userGroup) < 0)
+    if (addQStr(log_fp, jobNewLog->userGroup) < 0)
+        return LSBE_SYS_CALL;
+
+    if (fprintf(log_fp, " %d", jobNewLog->abs_run_limit) < 0)
+        return LSBE_SYS_CALL;
+
+    if (addQStr(log_fp, jobNewLog->job_group) < 0)
+        return LSBE_SYS_CALL;
+
+    if (jobNewLog->options2 & SUB2_JOB_DESC) {
+        if (addQStr(log_fp, jobNewLog->job_description) < 0)
+            return LSBE_SYS_CALL;
+    }
+
+    if (fprintf(log_fp, " %ld", jobNewLog->priority) < 0)
         return LSBE_SYS_CALL;
 
     if (fprintf(log_fp, "\n") < 0)
@@ -2045,6 +2278,11 @@ writeJobMod(FILE *log_fp, struct jobModLog *jobModLog)
         return LSBE_SYS_CALL;
     }
 
+    if ((jobModLog->options2 & SUB2_JOB_DESC) &&
+        (addQStr(log_fp, jobModLog->job_description) < 0)) {
+        return LSBE_SYS_CALL;
+    }
+
     if (fprintf(log_fp, "\n") < 0)
         return LSBE_SYS_CALL;
     return LSBE_NO_ERROR;
@@ -2085,7 +2323,7 @@ writeJobStart(FILE *log_fp, struct jobStartLog *jobStartLog)
         return LSBE_SYS_CALL;
 
     if (addQStr(log_fp, jobStartLog->userGroup) < 0)
-	return LSBE_SYS_CALL;
+        return LSBE_SYS_CALL;
 
     if (fprintf(log_fp, "\n") < 0)
         return LSBE_SYS_CALL;
@@ -2103,6 +2341,9 @@ writeJobStartAccept(FILE *log_fp, struct jobStartAcceptLog *jobStartAcceptLog)
         return LSBE_SYS_CALL;
 
     if (fprintf(log_fp, " %d", jobStartAcceptLog->idx) < 0 )
+        return LSBE_SYS_CALL;
+
+    if (fprintf(log_fp, " %d", jobStartAcceptLog->jflags) < 0 )
         return LSBE_SYS_CALL;
 
     if (fprintf(log_fp, "\n") < 0)
@@ -2339,6 +2580,9 @@ writeHostCtrl(FILE *log_fp, struct hostCtrlLog *hostCtrlLog)
     if (addQStr(log_fp, hostCtrlLog->userName) < 0)
         return LSBE_SYS_CALL;
 
+    if (addQStr(log_fp, hostCtrlLog->message) < 0)
+	return LSBE_SYS_CALL;
+
     if (fprintf(log_fp, "\n") < 0)
         return LSBE_SYS_CALL;
 
@@ -2513,8 +2757,8 @@ readMbdStart(char *line, struct mbdStartLog *mbdStartLog)
 {
     int cc;
 
-    copyQStr(line, MAXHOSTNAMELEN, 0,  mbdStartLog->master);
-    copyQStr(line, MAXLSFNAMELEN, 0,  mbdStartLog->cluster);
+    copyQStr(&line, MAXHOSTNAMELEN, 0,  mbdStartLog->master);
+    copyQStr(&line, MAXLSFNAMELEN, 0,  mbdStartLog->cluster);
     cc = sscanf(line, "%d%d", &(mbdStartLog->numHosts),
                 &(mbdStartLog->numQueues));
     if (cc != 2)
@@ -2535,6 +2779,69 @@ readLogSwitch(char *line, struct logSwitchLog *logSwitchLog)
     line += ccount + 1;
     return LSBE_NO_ERROR;
 }
+
+/* readNewJgrp()
+ */
+static int
+readNewJgrp(char *line, struct jgrpLog *jgrp)
+{
+    int cc;
+    int n;
+
+    copyQStr(&line, MAXLSFNAMELEN, 0, jgrp->name);
+    copyQStr(&line, PATH_MAX, 0, jgrp->path);
+    copyQStr(&line, MAXLSFNAMELEN, 0, jgrp->user);
+    /* By default there is no job group limit.
+     */
+    jgrp->max_jobs = INT32_MAX;
+
+    cc = sscanf(line, "\
+%d %d %d %n", &jgrp->uid, &jgrp->status, (int *)&jgrp->submit_time, &n);
+    if (cc != 3)
+        return LSBE_EVENT_FORMAT;
+    line = line + n;
+
+    /* This incompatibility was introduced in the middle
+     * of the released branch so instead of the version
+     * number we check if there are more bytes on the line.
+     */
+    if (line[0] != 0) {
+        cc = sscanf(line, "%d%n", &jgrp->max_jobs, &n);
+        if (cc != 1)
+            return LSBE_EVENT_FORMAT;
+        line = line + n;
+    }
+
+    return LSBE_NO_ERROR;
+}
+
+/* readDelJgrp()
+ */
+static int
+readDelJgrp(char *line, struct jgrpLog *jgrp)
+{
+    copyQStr(&line, MAXLINELEN, 0, jgrp->path);
+
+    return LSBE_NO_ERROR;
+}
+
+/* readModJgrp
+ */
+static int
+readModJgrp(char *line, struct jgrpModLog *jgrp)
+{
+    int cc;
+    int n;
+
+    copyQStr(&line, MAXLINELEN, 0, jgrp->path);
+    cc = sscanf(line, "%d%n", &jgrp->max_jobs, &n);
+    if (cc != 1)
+        return LSBE_EVENT_FORMAT;
+    line = line + n;
+
+    return LSBE_NO_ERROR;
+}
+
 
 static int
 writeJobSignal(FILE *log_fp, struct signalLog *signalLog)
@@ -2586,8 +2893,65 @@ writeStreamEnd(FILE *fp, struct endStream *eos)
     return LSBE_NO_ERROR;
 }
 
+/* writeNewJgrp()
+ */
 static int
-readJobSignal (char *line, struct signalLog *signalLog)
+writeNewJgrp(FILE *fp, struct jgrpLog *jgrp)
+{
+    if (addQStr(fp, jgrp->name) < 0)
+        return LSBE_SYS_CALL;
+
+    if (addQStr(fp, jgrp->path) < 0)
+        return LSBE_SYS_CALL;
+
+    if (addQStr(fp, jgrp->user) < 0)
+        return LSBE_SYS_CALL;
+
+    if (fprintf(fp, "\
+ %d %d %d %d", jgrp->uid, jgrp->status,
+                (int)jgrp->submit_time, jgrp->max_jobs) < 0) {
+        return LSBE_SYS_CALL;
+    }
+
+    if (fprintf(fp, "\n") < 0)
+        return LSBE_SYS_CALL;
+
+    return LSBE_NO_ERROR;
+}
+
+/* writeDelJgrp()
+ */
+static int
+writeDelJgrp(FILE *fp, struct jgrpLog *jgrp)
+{
+    if (addQStr(fp, jgrp->path) < 0)
+        return LSBE_SYS_CALL;
+
+    if (fprintf(fp, "\n") < 0)
+        return LSBE_SYS_CALL;
+
+    return LSBE_NO_ERROR;
+}
+
+/* writeModJgrp()
+ */
+static int
+writeModJgrp(FILE *fp, struct jgrpModLog *jgrp)
+{
+    if (addQStr(fp, jgrp->path) < 0)
+        return LSBE_SYS_CALL;
+
+    if (fprintf(fp, " %d", jgrp->max_jobs) < 0)
+        return LSBE_SYS_CALL;
+
+    if (fprintf(fp, "\n") < 0)
+        return LSBE_SYS_CALL;
+
+    return LSBE_NO_ERROR;
+}
+
+static int
+readJobSignal(char *line, struct signalLog *signalLog)
 {
     int cc, ccount;
     char sigSymbol[MAXLINELEN];
@@ -2613,7 +2977,7 @@ readJobSignal (char *line, struct signalLog *signalLog)
         return LSBE_EVENT_FORMAT;
     line += ccount + 1;
 
-    copyQStr(line, MAX_LSB_NAME_LEN, 1, signalLog->userName);
+    copyQStr(&line, MAX_LSB_NAME_LEN, 1, signalLog->userName);
 
     return LSBE_NO_ERROR;
 
@@ -2732,7 +3096,7 @@ readJobForce(char* line, struct jobForceRequestLog* jobForceRequestLog)
         line += cc + 1;
     }
 
-    copyQStr(line, MAX_LSB_NAME_LEN, 1, jobForceRequestLog->userName);
+    copyQStr(&line, MAX_LSB_NAME_LEN, 1, jobForceRequestLog->userName);
 
     return LSBE_NO_ERROR;
 }
@@ -3002,7 +3366,10 @@ checkJobEventAndJobId(char *line, int eventType, int numJobIds, LS_LONG_INT *job
             }
             break;
         case EVENT_JOB_MODIFY2:
-            cc = sscanf(line, "\"%d[", (int *)&eventJobId);
+            cc = sscanf(line, "\"%d", (int *)&eventJobId);
+            if (cc != 1) {
+                cc = sscanf(line, "\"%d[", (int *)&eventJobId);
+            }
             if (cc != 1) {
                 return(1);
             }
@@ -3100,6 +3467,16 @@ getEventTypeAndKind(char *typeStr, int *eventKind)
         eventType = EVENT_LOG_SWITCH;
     else if (strcmp(typeStr, "LOG_SWITCH") == 0)
         eventType = EVENT_LOG_SWITCH;
+    else if (strcmp(typeStr, "NEW_JGRP") == 0)
+        eventType = EVENT_NEW_JGRP;
+    else if (strcmp(typeStr, "DEL_JGRP") == 0)
+        eventType = EVENT_DEL_JGRP;
+    else if (strcmp(typeStr, "MOD_JGRP") == 0)
+        eventType = EVENT_MOD_JGRP;
+    else if (strcmp(typeStr, "JOB_PREEMPTING") == 0)
+        eventType = EVENT_JOB_PREEMPTING;
+    else if (strcmp(typeStr, "JOB_PREEMPTED") == 0)
+        eventType = EVENT_JOB_PREEMPTED;
     else {
         lsberrno = LSBE_UNKNOWN_EVENT;
         *eventKind = EVENT_NON_JOB_RELATED;
@@ -3136,7 +3513,7 @@ getEventTypeAndKind(char *typeStr, int *eventKind)
             break;
     }
 
-    return(eventType);
+    return eventType;
 }
 
 
@@ -3290,6 +3667,21 @@ readEventRecord(char *line, struct eventRec *logRec)
             break;
         case EVENT_LOG_SWITCH:
             lsberrno = readLogSwitch(line, &(logRec->eventLog.logSwitchLog));
+            break;
+        case EVENT_NEW_JGRP:
+            lsberrno = readNewJgrp(line, &(logRec->eventLog.jgrpLog));
+            break;
+        case EVENT_DEL_JGRP:
+            lsberrno = readDelJgrp(line,&(logRec->eventLog.jgrpLog));
+            break;
+        case EVENT_MOD_JGRP:
+            lsberrno = readModJgrp(line,&(logRec->eventLog.jgrpMod));
+            break;
+        case EVENT_JOB_PREEMPTING:
+            lsberrno = readJobPreempting(line, &(logRec->eventLog.jobPreempting));
+            break;
+        case EVENT_JOB_PREEMPTED:
+            lsberrno = readJobPreempted(line, &(logRec->eventLog.jobPreempted));
             break;
     }
 
@@ -3756,4 +4148,94 @@ lsb_getAcctFileTime(char * fileName)
         }
     }
     return lastAcctCreationTime;
+}
+
+/* writeJobPreempting()
+ */
+static int
+writeJobPreempting(FILE *fp, struct jobPreemptingLog *jLog)
+{
+    int cc;
+
+    if (fprintf(fp, " %d %d %d", jLog->jobid, jLog->idx, jLog->numHosts) < 0)
+        return LSBE_SYS_CALL;
+
+    for (cc = 0; cc < jLog->numHosts; cc++) {
+        if (addQStr(fp, jLog->hosts[cc]) < 0)
+            return LSBE_SYS_CALL;
+    }
+
+    if (fprintf(fp, "\n") < 0)
+        return LSBE_SYS_CALL;
+
+    return LSBE_NO_ERROR;
+}
+
+/* writeJobPreempted()
+ */
+static int
+writeJobPreempted(FILE *fp, struct jobPreemptedLog *jLog)
+{
+    if (fprintf(fp, " %d %d %d %d", jLog->jobid, jLog->idx,
+                jLog->preempted_by, jLog->preempted_by_idx) < 0)
+        return LSBE_SYS_CALL;
+
+    if (fprintf(fp, "\n") < 0)
+        return LSBE_SYS_CALL;
+
+    return LSBE_NO_ERROR;
+}
+
+/* readJobPreempting()
+ *
+ * Read the hostnames of the machines preempted
+ * by this job.
+ *
+ */
+static int
+readJobPreempting(char *line, struct jobPreemptingLog *jLog)
+{
+    int n;
+    int cc;
+    char host[MAXHOSTNAMELEN];
+
+    cc = sscanf(line, "%d%d%d%n", &jLog->jobid, &jLog->idx, &jLog->numHosts, &n);
+    if (cc != 3)
+        return LSBE_EVENT_FORMAT;
+
+    line += n + 1;
+    jLog->hosts = calloc(jLog->numHosts, sizeof(char *));
+
+    for (cc = 0; cc < jLog->numHosts; cc++) {
+
+        if ((n = stripQStr(line, host)) < 0) {
+            return LSBE_EVENT_FORMAT;
+        }
+
+        jLog->hosts[cc] = strdup(host);
+        line += n + 1;
+    }
+
+    return LSBE_NO_ERROR;
+}
+
+/* readJobPreempted()
+ *
+ * Read the jobid of the job that caused the preemtion
+ * and the one that got preempted.
+ */
+static int
+readJobPreempted(char *line, struct jobPreemptedLog *jLog)
+{
+    int n;
+    int cc;
+
+    cc = sscanf(line, "%d%d%d%d%n", &jLog->jobid, &jLog->idx,
+                &jLog->preempted_by, &jLog->preempted_by_idx, &n);
+    if (cc != 4)
+        return LSBE_EVENT_FORMAT;
+
+    line = line + n;
+
+    return LSBE_NO_ERROR;
 }

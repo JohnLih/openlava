@@ -1,4 +1,5 @@
-/* $Id: lib.misc.c 397 2007-11-26 19:04:00Z mblack $
+/*
+ * Copyright (C) 2016 David Bigagli
  * Copyright (C) 2007 Platform Computing Inc
  *
  * This program is free software; you can redistribute it and/or modify
@@ -45,7 +46,7 @@ isanumber_(char *word)
     double number;
 
     if (!word || *word == '\0')
-        return FALSE;
+        return false;
 
     if (errno == ERANGE)
         errno = 0;
@@ -54,9 +55,9 @@ isanumber_(char *word)
     number = strtod (word, eptr);
     if (**eptr == '\0' &&  errno != ERANGE)
         if (number <= MAXFLOAT && number > -MAXFLOAT)
-            return TRUE;
+            return true;
 
-    return FALSE;
+    return false;
 }
 
 char
@@ -65,9 +66,9 @@ islongint_(char *word)
     long long int number;
 
     if (!word || *word == '\0')
-        return FALSE;
+        return false;
 
-    if(!isdigitstr_(word)) return FALSE;
+    if(!isdigitstr_(word)) return false;
 
     if (errno == ERANGE)
         errno = 0;
@@ -75,9 +76,9 @@ islongint_(char *word)
     sscanf(word, "%lld", &number);
     if (errno != ERANGE) {
         if (number <= INFINIT_LONG_INT && number > -INFINIT_LONG_INT)
-            return TRUE;
+            return true;
     }
-    return FALSE;
+    return false;
 
 }
 
@@ -88,10 +89,10 @@ isdigitstr_(char *string)
 
     for (i = 0; i < strlen(string); i++) {
         if (! isdigit(string[i])) {
-            return FALSE;
+            return false;
         }
     }
-    return TRUE;
+    return true;
 }
 
 LS_LONG_INT
@@ -121,7 +122,7 @@ isint_(char *word)
     int number;
 
     if (!word || *word == '\0')
-        return FALSE;
+        return false;
 
     if (errno == ERANGE)
         errno = 0;
@@ -129,10 +130,10 @@ isint_(char *word)
     number = strtol (word, eptr, 10);
     if (**eptr == '\0'&&  errno != ERANGE) {
         if (number <= INFINIT_INT && number > -INFINIT_INT)
-            return TRUE;
+            return true;
     }
 
-    return FALSE;
+    return false;
 }
 
 char *
@@ -342,10 +343,15 @@ my_getopt(int nargc, char **nargv, char *ostr, char **errMsg)
 
 }
 
+/* putEnv()
+ */
 int
 putEnv(char *env, char *val)
 {
-    return setenv(env, val, 0);
+    /* Make sure we overwrite the value
+     * if already set in the environment
+     */
+    return setenv(env, val, 1);
 }
 
 void
@@ -731,7 +737,11 @@ writeAddHost(FILE *fp,
      * or it may not be configured and does not have
      * a counter.
      */
-    fprintf(fp, "%d \"%s\" ", hPtr->rexPriority, hPtr->window);
+    fprintf(fp, "%d ", hPtr->rexPriority);
+    if (hPtr->window)
+        fprintf(fp, "\"%s\" ", hPtr->window);
+    else
+        fprintf(fp, "\"%s\" ", "");
 
     /* new line and flush
      */
@@ -936,4 +946,17 @@ freeHostEntryLog(struct hostEntryLog **hPtr)
     FREEUP(*hPtr);
 
     return 0;
+}
+
+void
+hangme(void)
+{
+    int cc;
+
+    cc = 1;
+    while (cc) {
+        ls_syslog(LOG_INFO, "%s: attachme.... %d", __func__, cc);
+        ++cc;
+        sleep(2);
+    }
 }

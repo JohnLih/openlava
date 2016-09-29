@@ -26,6 +26,7 @@ config/lsb.hosts
 config/lsb.params
 config/lsb.queues
 config/lsb.users
+config/lsb.resources
 config/lsf.cluster.*
 !config/lsf.cluster.*.in
 config/lsf.conf
@@ -35,6 +36,8 @@ config/openlava
 config/openlava.csh
 config/openlava.setup
 config/openlava.sh
+config/lsb.resources
+config/limits.sh
 config.guess
 config.sub
 ltmain.sh
@@ -43,3 +46,9 @@ treetest
 compile
 examples/docker/docker_starter
 tests/tests
+m4/libtool.m4
+m4/ltoptions.m4
+m4/ltsugar.m4
+m4/ltversion.m4
+m4/lt~obsolete.m4
+stamp-h

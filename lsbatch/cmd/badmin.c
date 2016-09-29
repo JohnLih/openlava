@@ -1,6 +1,6 @@
 /*
+ * Copyright (C) 2014-2015 David Bigagli
  * Copyright (C) 2007 Platform Computing Inc
- * Copyright (C) 2014 David Bigagli
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of version 2 of the GNU General Public License as
@@ -20,20 +20,20 @@
 #include "badmin.h"
 #include <unistd.h>
 
-extern char *myGetOpt (int nargc, char **nargv, char *ostr);
-extern int checkConf (int, int);
-extern int getConfirm (char *msg);
+extern char *myGetOpt(int nargc, char **nargv, char *ostr);
+extern int checkConf(int, int);
+extern int getConfirm(char *msg);
 extern int lsb_debugReq(struct debugReq *pdebug , char *host);
 extern int linux_optind;
 extern int linux_opterr;
-static int doBatchCmd (int argc, char *argv[]);
-static int badminDebug (int nargc, char *nargv[], int opCode);
+static int doBatchCmd(int argc, char *argv[]);
+static int badminDebug(int nargc, char *nargv[], int opCode);
 
 
 int
 main(int argc, char **argv)
 {
-    int cc,  myIndex;
+    int myIndex;
     char *prompt = "badmin>";
     static char line[MAXLINELEN];
 
@@ -44,19 +44,21 @@ main(int argc, char **argv)
 
     setbuf(stdout, NULL);
 
-    while ((cc = getopt(argc, argv, "Vh")) != EOF) {
-        switch (cc) {
-            case 'V':
-                fputs(_LS_VERSION_, stderr);
-                exit(0);
-            case 'h':
-            default:
-
-                cmdsUsage("badmin",
-                          cmdList,
-                          cmdInfo);
+    if (argc>1 && argv[1][0] == '-') {
+        switch (argv[1][1]) {
+        case 'V':
+            fputs(_LS_VERSION_, stderr);
+            exit(0);
+        case 'h':
+           cmdsUsage("badmin",cmdList,cmdInfo);
+        default:
+           fprintf (stderr, "badmin: illegal option -- %c\n", argv[1][1]);
+           cmdsUsage("badmin",cmdList,cmdInfo);
         }
     }
+
+    optind = 1;
+
     if (argc > optind) {
         int rc;
 
@@ -66,9 +68,9 @@ main(int argc, char **argv)
             cmdsUsage("badmin", cmdList, cmdInfo);
         }
         optind++;
-        rc = doBatchCmd (argc, argv);
-        _i18n_end ( ls_catd );
-        exit ( rc );
+        rc = doBatchCmd(argc, argv);
+        _i18n_end (ls_catd);
+        exit (rc);
     }
 
     for (;;) {
@@ -78,7 +80,7 @@ main(int argc, char **argv)
             exit(-1);
         }
 
-        parseAndDo (line, doBatchCmd);
+        parseAndDo(line, doBatchCmd);
     }
     return 0;
 }
@@ -88,7 +90,7 @@ doBatchCmd(int argc, char *argv[])
 {
     int cmdRet = 0, myIndex;
 
-    if ((myIndex=adminCmdIndex(argv[optind-1], cmdList)) == -1) {
+    if ((myIndex = adminCmdIndex(argv[optind-1], cmdList)) == -1) {
         fprintf(stderr,
                 _i18n_msg_get(ls_catd,NL_SETN,2554, "Invalid command <%s>. Try help\n"),/* catgets  2554  */
                 argv[optind-1]);
@@ -163,6 +165,7 @@ breconfig(int argc, char **argv, int configFlag)
     int fd;
     FILE *fp;
     char *linep;
+    char filename[]="/tmp/lsbXXXXXX";
 
     while ((optName = myGetOpt(argc, argv, "f|v|")) != NULL) {
         switch(optName[0]) {
@@ -185,7 +188,7 @@ breconfig(int argc, char **argv, int configFlag)
         fprintf(stderr, "\nChecking configuration files ...\n\n");
 
         stdoutsave = dup(1);
-        fd = mkstemp("lsbatch");
+        fd = mkstemp(filename);
         if (fd > 0 ) {
 
             dup2(fd, 1);
@@ -196,7 +199,7 @@ breconfig(int argc, char **argv, int configFlag)
             dup2(stdoutsave, 1);
             dup2(stdoutsave, 2);
 
-            fp = fdopen(fd, "r");
+            fp = fopen(filename, "r");
             if (fp != 0) {
                 if (checkReply == EXIT_FATAL_ERROR
                     || checkReply == EXIT_WARNING_ERROR) {
@@ -215,7 +218,7 @@ breconfig(int argc, char **argv, int configFlag)
                 fflush(stderr);
             }
             fclose(fp);
-            close(fd);
+            unlink(filename);
         }
         else
             checkReply = checkConf(0, 2);
@@ -318,17 +321,14 @@ badminDebug(int nargc, char *nargv[], int opCode)
                     if (strcmp(word, "LC_XDR") == 0)
                         debug.logClass |= LC_XDR;
 
-                    if (strcmp(word, "LC_CHKPNT") == 0)
-                        debug.logClass |= LC_CHKPNT;
+                    if (strcmp(word, "LC_FAIRSHARE") == 0)
+                        debug.logClass |= LC_FAIR;
 
                     if (strcmp(word, "LC_FILE") == 0)
                         debug.logClass |= LC_FILE;
 
                     if (strcmp(word, "LC_AUTH") == 0)
                         debug.logClass |= LC_AUTH;
-
-                    if (strcmp(word, "LC_HANG") == 0)
-                        debug.logClass |= LC_HANG;
 
                     if (strcmp(word, "LC_SIGNAL") == 0)
                         debug.logClass |= LC_SIGNAL;
@@ -347,10 +347,6 @@ badminDebug(int nargc, char *nargv[], int opCode)
 
                     if (strcmp(word, "LC_LOADINDX") == 0)
                         debug.logClass |= LC_LOADINDX;
-
-                    if (strcmp(word, "LC_M_LOG") == 0) {
-                        debug.logClass |= LC_M_LOG;
-                    }
 
                     if (strcmp(word, "LC_PERFM") == 0) {
                         debug.logClass |= LC_PERFM;

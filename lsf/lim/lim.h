@@ -40,7 +40,7 @@
 
 #define KEEPTIME   2
 #define MAXCANDHOSTS  10
-#define MAXCLIENTS   64
+#define MAXCLIENTS   1024
 #define WARNING_ERR   EXIT_WARNING_ERROR
 #define MIN_FLOAT16  2.328306E-10
 #define LIM_EVENT_MAXSIZE  (1024 * 1024)
@@ -325,16 +325,15 @@ typedef enum {
     LSF_LOG_MASK,
     LSF_CONF_RETRY_MAX,
     LSF_CONF_RETRY_INT,
-    LSF_CROSS_UNIX_NT,
     LSF_LIM_IGNORE_CHECKSUM,
-    LSF_MASTER_LIST,
-    LSF_REJECT_NONLSFHOST,
     LSF_LIM_JACKUP_BUSY,
     LIM_RSYNC_CONFIG,
     LIM_COMPUTE_ONLY,
     LSB_SHAREDIR,
     LIM_NO_MIGRANT_HOSTS,
-    LIM_DONT_FORK
+    LIM_DONT_FORK,
+    LIM_DEFINE_NCPUS,
+    LIM_ACCEPT_FLOAT_CLIENT
 } limParams_t;
 
 #define LOOP_ADDR       0x7F000001
@@ -516,19 +515,19 @@ extern int xdr_loadmatrix(XDR *, int, struct loadVectorStruct *,
                           struct LSFHeader *);
 extern int xdr_masterReg(XDR *, struct masterReg *, struct LSFHeader *);
 extern int xdr_statInfo(XDR *, struct statInfo *, struct LSFHeader *);
-extern void clientIO(struct Masks *);
+extern void lim_client_io(struct Masks *);
 extern uint16_t getLIMPort(struct hostNode *);
 
 /* openlava migrating host management
  */
-extern void addMigrantHost(XDR *,
-                           struct sockaddr_in *,
-                           struct LSFHeader *,
-                           int);
-extern void rmMigrantHost(XDR *,
-                          struct sockaddr_in *,
-                          struct LSFHeader *,
-                          int);
+extern void lim_add_migrant_host(XDR *,
+				 struct sockaddr_in *,
+				 struct LSFHeader *,
+				 int);
+extern void lim_rm_migrant_host(XDR *,
+				struct sockaddr_in *,
+				struct LSFHeader *,
+				int);
 extern int logInit(void);
 extern int logLIMStart(void);
 extern int logLIMDown(void);

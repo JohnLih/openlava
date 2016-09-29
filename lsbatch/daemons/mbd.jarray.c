@@ -265,6 +265,19 @@ handleNewJobArray(struct jData *jarray,
     }
 
     jarray->uPtr = getUserData(jarray->userName);
+    if (!jarray->pqPtr)
+        jarray->pqPtr = getLimitUsageData(LIMIT_CONSUMER_PER_PROJECT,
+                                          jarray->shared->jobBill.projectName,
+                                          jarray->qPtr->queue);
+    if (!jarray->uqPtr)
+        jarray->uqPtr = getLimitUsageData(LIMIT_CONSUMER_PER_USER,
+                                          jarray->userName,
+                                          jarray->qPtr->queue);
+
+    if (!jarray->hqPtr && jarray->numHostPtr > 0)
+        jarray->hqPtr = getLimitUsageData(LIMIT_CONSUMER_PER_HOST,
+                                          jarray->hPtr[0]->host,
+                                          jarray->qPtr->queue);
 
     if (jarray->shared->jobBill.options2 & SUB2_HOLD) {
         userPending = 1;
@@ -312,6 +325,21 @@ handleNewJobArray(struct jData *jarray,
                     0,
                     0,
                     0);
+        updLimitSlotData(jarray,
+                         jarray->shared->jobBill.maxNumProcessors * numJobs,
+                         jarray->shared->jobBill.maxNumProcessors * numJobs,
+                         0,
+                         0,
+                         0,
+                         0);
+        updLimitJobData(jarray,
+                        numJobs,
+                        numJobs,
+                        0,
+                        0,
+                        0,
+                        0);
+
     }
 
     if (mSchedStage == M_STAGE_REPLAY) {

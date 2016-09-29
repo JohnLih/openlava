@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2014-2015 David Bigagli
+ * Copyright (C) 2014-2016 David Bigagli
  * Copyright (C) 2007 Platform Computing Inc
  *
  * This program is free software; you can redistribute it and/or modify
@@ -35,7 +35,6 @@ extern void freeQConf(struct queueConf *, int);
 extern void freeWorkUser(int);
 extern void freeWorkHost(int);
 extern void freeWorkQueue(int);
-extern void uDataTableFree(UDATA_TABLE_T *);
 extern void cleanCandHosts (struct jData *);
 static uint32_t getQueueSlots(struct qData *);
 
@@ -58,10 +57,12 @@ static struct lsConf *paramFileConf = NULL;
 static struct lsConf *userFileConf = NULL;
 static struct lsConf *hostFileConf = NULL;
 static struct lsConf *queueFileConf = NULL;
+static struct lsConf *resFileConf = NULL;
 struct userConf *userConf = NULL;
 static struct hostConf *hostConf = NULL;
 static struct queueConf *queueConf = NULL;
 static struct paramConf *paramConf = NULL;
+struct resLimitConf *limitConf = NULL;
 static struct gData *tempUGData[MAX_GROUPS];
 static struct gData *tempHGData[MAX_GROUPS];
 static int nTempUGroups;
@@ -72,6 +73,7 @@ static char batchName[MAX_LSB_NAME_LEN] = "root";
 #define USER_FILE     0x02
 #define HOST_FILE     0x04
 #define QUEUE_FILE    0x08
+#define RESOURCE_FILE 0x16
 
 #define HDATA         1
 #define UDATA         2
@@ -84,6 +86,7 @@ static void readParamConf(int);
 static int  readHostConf(int);
 static void readUserConf(int);
 static void readQueueConf(int);
+static void readResConf(int);
 
 static int isHostAlias (char *);
 static int searchAll(char *);
@@ -138,13 +141,23 @@ static int parseFirstHostErr(int,
                              int);
 static struct hData *mkLostAndFoundHost(void);
 static int init_fairshare_scheduler(void);
-static int load_fair_plugin(struct qData *);
+static struct fair_sched *load_fair_plugin(struct qData *,
+                                           const char *);
 static int parse_preemption(struct qData *);
 static int sort_queues(void);
 static int queue_cmp(const void *, const void *);
 static void check_same_priority_queues(void);
 static int init_preemption_scheduler(void);
 static int load_preempt_plugin(struct qData *);
+static int init_ownership_scheduler(void);
+static bool_t is_fairplugin_ok(void);
+static bool_t is_preemptplugin_ok(void);
+static bool_t is_ownplugin_ok(void);
+static int parse_host_shares(const char *, struct qData *qp);
+static void make_hsacct(struct hData *, char *, int);
+static bool_t check_ownership(struct qData *);
+static bool_t has_slot_preemption_;
+static void add_host_dedicated_res(struct hData *, struct hostInfo *);
 
 int
 minit(int mbdInitFlags)
@@ -159,11 +172,10 @@ minit(int mbdInitFlags)
 
     Signal_(SIGTERM, (SIGFUNCTYPE) terminate_handler);
     Signal_(SIGINT,  (SIGFUNCTYPE) terminate_handler);
-    Signal_(SIGCHLD, (SIGFUNCTYPE) child_handler);
+    Signal_(SIGCHLD, (SIGFUNCTYPE) mbd_child_handler);
     Signal_(SIGALRM, SIG_IGN);
     Signal_(SIGHUP,  SIG_IGN);
     Signal_(SIGPIPE, SIG_IGN);
-    Signal_(SIGCHLD, (SIGFUNCTYPE) child_handler);
 
     if (!(debug || lsb_CheckMode)) {
         Signal_(SIGTTOU, SIG_IGN);
@@ -181,8 +193,6 @@ minit(int mbdInitFlags)
 
     initTab(&jobIdHT);
     initTab(&jgrpIdHT);
-
-    uDataPtrTb = uDataTableCreate();
 
     qDataList = (struct qData *)listCreate("Queue List");
 
@@ -261,17 +271,6 @@ minit(int mbdInitFlags)
     tclLsInfo = getTclLsInfo();
     initTcl(tclLsInfo);
 
-    allUsersSet = setCreate(MAX_GROUPS,
-                            getIndexByuData,
-                            getuDataByIndex,
-                            "");
-    setAllowObservers(allUsersSet);
-
-    uGrpAllSet = setCreate(MAX_GROUPS, getIndexByuData, getuDataByIndex, "");
-
-    uGrpAllAncestorSet = setCreate(MAX_GROUPS, getIndexByuData,
-                                   getuDataByIndex, "");
-
     TIMEIT(0, readParamConf(mbdInitFlags), "minit_readParamConf");
     TIMEIT(0, readHostConf(mbdInitFlags), "minit_readHostConf");
     getLsbResourceInfo();
@@ -300,6 +299,7 @@ minit(int mbdInitFlags)
 
     TIMEIT(0, readUserConf(mbdInitFlags), "minit_readUserConf");
     TIMEIT(0, readQueueConf(mbdInitFlags), "minit_readQueueConf");
+    TIMEIT(0, readResConf(mbdInitFlags), "minit_readResConf");
     copyGroups(FALSE);
 
     updUserList(mbdInitFlags);
@@ -355,6 +355,7 @@ minit(int mbdInitFlags)
      */
     init_fairshare_scheduler();
     init_preemption_scheduler();
+    init_ownership_scheduler();
 
     if (!lsb_CheckMode) {
         TIMEIT(0, init_log(), "init_log()");
@@ -431,7 +432,13 @@ initHData(struct hData *hData)
     int   i;
 
     if (hData == NULL) {
+        /* Allocate memory only when creating the host data.
+         * When hData in input is not NULL than we are copying
+         * the host data from a temporary storage.
+         */
         hData = my_calloc(1, sizeof(struct hData), "initHData");
+        hData->dres_tab = calloc(1, sizeof(hTab));
+        h_initTab_(hData->dres_tab, 11);
     }
 
     hData->host = NULL;
@@ -480,6 +487,7 @@ initHData(struct hData *hData)
     hData->pxySJL = NULL;
     hData->pxyRsvJL = NULL;
     hData->leftRusageMem = INFINIT_LOAD;
+    hData->affinity = FALSE;
 
     return hData;
 }
@@ -717,6 +725,57 @@ createDefQueue(void)
     inQueueList(qp);
 }
 
+static void
+readResConf(int mbdInitFlags)
+{
+    char file[PATH_MAX];
+    struct stat st;
+
+    if (mbdInitFlags == FIRST_START
+        || mbdInitFlags == RECONFIG_CONF) {
+        sprintf(file, "%s/lsb.resources", daemonParams[LSB_CONFDIR].paramValue);
+
+        /* lsb.resources is optional */
+        if (stat(file, &st) != 0) {
+            limitConf = my_calloc(1, sizeof (struct resLimitConf), __FUNCTION__);
+            return;
+        }
+
+        resFileConf = getFileConf(file, RESOURCE_FILE);
+        if (resFileConf == NULL && lserrno == LSE_NO_FILE) {
+            ls_syslog(LOG_ERR, "\
+%s: lsb.resources not found %M, no resource limit", __FUNCTION__);
+            limitConf = my_calloc(1, sizeof (struct resLimitConf), __FUNCTION__);
+            return;
+        }
+    } else if (resFileConf == NULL) {
+        ls_syslog(LOG_DEBUG, "\
+%s: lsb.resources not found, no resource limit", __FUNCTION__);
+        limitConf = my_calloc(1, sizeof (struct resLimitConf), __FUNCTION__);
+        return;
+    }
+
+    if ((limitConf = lsb_readres(resFileConf)) == NULL) {
+        if (lsberrno == LSBE_CONF_FATAL) {
+            ls_syslog(LOG_ERR, I18N_FUNC_FAIL, __FUNCTION__, "lsb_readres");
+            if (lsb_CheckMode) {
+                lsb_CheckError = FATAL_ERR;
+                return;
+            }
+            mbdDie(MASTER_FATAL);
+        }
+
+        if (lsberrno == LSBE_CONF_WARNING)
+            lsb_CheckError = WARNING_ERR;
+        ls_syslog(LOG_ERR, I18N_FUNC_FAIL_MM, __FUNCTION__, "lsb_readres");
+        limitConf = my_calloc(1, sizeof (struct resLimitConf), __FUNCTION__);
+        return;
+    }
+
+    if (lsberrno == LSBE_CONF_WARNING)
+        lsb_CheckError = WARNING_ERR;
+}
+
 /* addHost()
  * Configure the host to be part of MBD. Merge the
  * lsf base hostInfo information with the batch
@@ -725,8 +784,7 @@ createDefQueue(void)
  */
 void
 addHost(struct hostInfo *lsf,
-        struct hData *thPtr,
-        char *filename)
+        struct hData *thPtr)
 {
     static char first = TRUE;
     hEnt *ent;
@@ -794,6 +852,7 @@ addHost(struct hostInfo *lsf,
         hPtr->maxTmp    = lsf->maxTmp;
         hPtr->nDisks    = lsf->nDisks;
         hPtr->resBitMaps  = getResMaps(lsf->nRes, lsf->resources);
+        add_host_dedicated_res(hPtr, lsf);
 
         /* Fill up the hostent structure that is not used
          * anywhere anyway...
@@ -804,6 +863,7 @@ addHost(struct hostInfo *lsf,
 
     hPtr->uJobLimit = thPtr->uJobLimit;
     hPtr->maxJobs   = thPtr->maxJobs;
+    hPtr->affinity  = thPtr->affinity;
     if (thPtr->maxJobs == -1) {
         /* The MXJ was set as ! in lsb.hosts
          */
@@ -978,6 +1038,7 @@ addMember(struct gData *groupPtr,
     struct gData *subgrpPtr = NULL;
     char name[MAXHOSTNAMELEN];
     struct hostent *hp;
+    struct hEnt *ent;
 
     if (grouptype == USER_GRP) {
         subgrpPtr = getGrpData (tempUGData, word, nTempUGroups);
@@ -1058,8 +1119,10 @@ addMember(struct gData *groupPtr,
     if (isgrp) {
         groupPtr->gPtr[groupPtr->numGroups] = subgrpPtr;
         groupPtr->numGroups++;
-    } else
-        h_addEnt_(&groupPtr->memberTab, name, NULL);
+    } else {
+        ent = h_addEnt_(&groupPtr->memberTab, name, NULL);
+        ent->hData = strdup(name);
+    }
 
     return;
 
@@ -1479,9 +1542,9 @@ initQData (void)
     qPtr->acceptIntvl        = INFINIT_INT;
 
     qPtr->loadSched = my_calloc(allLsInfo->numIndx,
-                              sizeof(float), __func__);
+                                sizeof(float), __func__);
     qPtr->loadStop = my_calloc(allLsInfo->numIndx,
-                             sizeof(float), __func__);
+                               sizeof(float), __func__);
     initThresholds (qPtr->loadSched, qPtr->loadStop);
     qPtr->procLimit = -1;
     qPtr->minProcLimit = -1;
@@ -1529,6 +1592,7 @@ initQData (void)
     qPtr->chkpntPeriod = -1;
     qPtr->chkpntDir = NULL;
     qPtr->fairshare = NULL;
+    qPtr->ownership = NULL;
 
     return qPtr;
 }
@@ -1620,13 +1684,15 @@ mkLostAndFoundHost(void)
     struct hData *lost;
     struct hData host;
 
+    memset(&host, 0, sizeof(struct hData));
+
     initHData(&host);
     host.host = LOST_AND_FOUND;
     host.cpuFactor = 1.0;
     host.uJobLimit = 0;
     host.maxJobs =  0;
 
-    addHost(NULL, &host, "LostFoundHost");
+    addHost(NULL, &host);
     checkHWindow();
 
     lost = getHostData(LOST_AND_FOUND);
@@ -1717,13 +1783,12 @@ addUnixGrp (struct group *unixGrp, char *grpName,
 static void
 getClusterData(void)
 {
-    static char   fname[]="getClusterData()";
-    int           i;
-    int           num;
+    int i;
+    int num;
 
     TIMEIT(0, clusterName = ls_getclustername(), "minit_ls_getclustername");
     if (clusterName == NULL) {
-        ls_syslog(LOG_ERR, I18N_FUNC_FAIL_MM, fname, "ls_getclustername");
+        ls_syslog(LOG_ERR, "%s: ls_getclustername() failed %M", __func__);
         if (! lsb_CheckMode)
             mbdDie(MASTER_RESIGN);
         else {
@@ -1731,19 +1796,22 @@ getClusterData(void)
             return ;
         }
     }
+
     if (debug) {
         FREEUP(managerIds);
         if (lsbManagers)
             FREEUP (lsbManagers[0]);
         FREEUP (lsbManagers);
         nManagers = 1;
-        lsbManagers = my_malloc(sizeof (char *), fname);
-        lsbManagers[0] = my_malloc(MAX_LSB_NAME_LEN, fname);
+        lsbManagers = my_malloc(sizeof(char *), __func__);
+        lsbManagers[0] = my_malloc(MAX_LSB_NAME_LEN, __func__);
+
         if (getUser(lsbManagers[0], MAX_LSB_NAME_LEN) == 0) {
 
-            managerIds = my_malloc (sizeof (uid_t), fname);
+            managerIds = my_malloc(sizeof (uid_t), __func__);
             if (getUid(lsbManagers[0], &managerIds[0]) != 0) {
-                ls_syslog(LOG_ERR, I18N_FUNC_FAIL_MM, fname, "getUid");
+                ls_syslog(LOG_ERR, "\
+%s: getUid() failed: %M", __func__);
                 if (! lsb_CheckMode)
                     mbdDie(MASTER_RESIGN);
                 else {
@@ -1753,19 +1821,21 @@ getClusterData(void)
                 managerIds[0] = -1;
             }
         } else {
-            ls_syslog(LOG_ERR, I18N_FUNC_FAIL_MM, fname, "getUser");
+            ls_syslog(LOG_ERR, "%s: getUser() failed %M", __func__);
             mbdDie(MASTER_RESIGN);
         }
+
         if (!lsb_CheckMode)
-            ls_syslog(LOG_NOTICE,I18N(6256,
-                                      "%s: The LSF administrator is the invoker in debug mode"),fname); /*catgets 6256 */
+            ls_syslog(LOG_NOTICE, \
+                      "%s: The LSF administrator is the invoker in debug mode", __func__);
         lsbManager = lsbManagers[0];
         managerId  = managerIds[0];
     }
+
     num = 0;
     clusterInfo = ls_clusterinfo(NULL, &num, NULL, 0, 0);
     if (clusterInfo == NULL) {
-        ls_syslog(LOG_ERR, I18N_FUNC_FAIL_MM, fname, "ls_clusterinfo");
+        ls_syslog(LOG_ERR, "%s: ls_clusterinfo() failed %M", __func__);
         if (!lsb_CheckMode)
             mbdDie(MASTER_RESIGN);
         else {
@@ -1782,17 +1852,18 @@ getClusterData(void)
             }
         }
 
-        for(i=0; i < num; i++) {
+        for (i = 0; i < num; i++) {
             if (!debug &&
                 (strcmp(clusterName, clusterInfo[i].clusterName) == 0))
-                setManagers (clusterInfo[i]);
+                setManagers(clusterInfo[i]);
         }
 
         if (!nManagers && !debug) {
-            ls_syslog(LOG_ERR, _i18n_msg_get(ls_catd , NL_SETN, 6182,
-                                             "%s: Local cluster %s not returned by LIM"),fname, clusterName); /* catgets 6182 */
+            ls_syslog(LOG_ERR, "\
+%s: Local cluster %s not returned by LIM", __func__, clusterName);
             mbdDie(MASTER_FATAL);
         }
+
         numofclusters = num;
     }
 }
@@ -1827,7 +1898,7 @@ setManagers(struct clusterInfo clusterInfo)
         if ((pw = getpwnam (sp)) == NULL) {
             ls_syslog(LOG_ERR, "\
 %s: Invalid LSF administrator name <%s> and userId <%d>",
-                          __func__, sp, tempId);
+                      __func__, sp, tempId);
             managerIds[i] = -1;
             continue;
         }
@@ -1859,14 +1930,23 @@ setManagers(struct clusterInfo clusterInfo)
         putEnv("LSB_MANAGER", managerStr);
     }
 
-    if (setreuid(managerId, managerId) < 0) {
+    /* This message is most likely going to syslog.
+     */
+    if (ls_logchown(managerId) < 0) {
         ls_syslog(LOG_ERR, "\
-%s: failed to set managerId for mbatchd: %m", __func__);
-        mbdDie(MASTER_FATAL);
+%s: failed to chown() logfile to %d %m", __func__, managerId);
     }
 
-    ls_syslog(LOG_INFO, "%s: mbatchd running as managerId %d",
-              __func__, managerId);
+    if (setreuid(managerId, managerId) < 0) {
+        ls_syslog(LOG_ERR, "\
+%s: failed to set managerId for mbatchd running as uid %d: %m",
+                  __func__, getuid());
+        /* Don't die keep running as root.
+         */
+    } else {
+        ls_syslog(LOG_INFO, "\
+%s: mbatchd running as managerId %d", __func__, managerId);
+    }
 }
 
 static void
@@ -1912,12 +1992,9 @@ setParams(struct paramConf *paramConf)
     setValue(maxUserPriority, params->maxUserPriority);
     setValue(jobPriorityValue, params->jobPriorityValue);
     setValue(jobPriorityTime, params->jobPriorityTime);
-    setJobPriUpdIntvl( );
-
+    setJobPriUpdIntvl();
 
     setValue(sharedResourceUpdFactor, params->sharedResourceUpdFactor);
-
-    setValue(scheRawLoad, params->scheRawLoad);
 
     setValue(preExecDelay, params->preExecDelay);
     setValue(slotResourceReserve, params->slotResourceReserve);
@@ -1928,7 +2005,12 @@ setParams(struct paramConf *paramConf)
     setValue(acctArchiveInDays, params->acctArchiveInDays);
     setValue(acctArchiveInSize, params->acctArchiveInSize);
 
+    /* Set all the globals in one data strcuture.
+     */
     mbdParams = calloc(1, sizeof(struct parameterInfo));
+
+    /* Copy the library values to the mbd data strcutures
+     */
     memcpy(mbdParams, params, sizeof(struct parameterInfo));
     if (params->defaultQueues)
         mbdParams->defaultQueues = strdup(params->defaultQueues);
@@ -1937,12 +2019,27 @@ setParams(struct paramConf *paramConf)
     if (params->pjobSpoolDir)
         mbdParams->pjobSpoolDir = strdup(params->pjobSpoolDir);
 
+    /* Set default and convert to minutes
+     */
+    if (mbdParams->hist_mins == -1)
+        mbdParams->hist_mins = DEF_HIST_MINUTES;
+    mbdParams->hist_mins = mbdParams->hist_mins * 60;
+    /* By default the value is false and we scale the
+     * runtime limit by the cpu factor, if set to true
+     * we don't.
+     */
+    mbdParams->run_abs_limit = params->run_abs_limit;
+
+    /* If defined in lsb.params then mbatchd preempts based on this
+     * specified resources instead of slots.
+     */
+    if (params->preemptableResources)
+        mbdParams->preemptableResources = strdup(params->preemptableResources);
 }
 
 static void
-addUData (struct userConf *userConf)
+addUData(struct userConf *userConf)
 {
-    static char fname[] = "addUData";
     struct userInfoEnt *uPtr;
     int i;
 
@@ -1950,7 +2047,7 @@ addUData (struct userConf *userConf)
     for (i = 0; i < userConf->numUsers; i++) {
         uPtr = &(userConf->users[i]);
         addUserData(uPtr->user, uPtr->maxJobs, uPtr->procJobLimit,
-                    fname, TRUE, TRUE);
+                    (char *)__func__, TRUE, TRUE);
         if (strcmp ("default", uPtr->user) == 0)
             defUser = TRUE;
     }
@@ -1963,9 +2060,10 @@ createTmpGData(struct groupInfoEnt *groups,
                struct gData *tempGData[],
                int *nTempGroups)
 {
-    static char fname[] = "createTmpGData";
     struct groupInfoEnt *gPtr;
-    char *HUgroups, *sp, *wp;
+    char *HUgroups;
+    char *sp;
+    char *wp;
     int i;
     struct gData *grpPtr;
 
@@ -1980,15 +2078,17 @@ createTmpGData(struct groupInfoEnt *groups,
 
         if (groupType == HOST_GRP && gPtr && gPtr->group
             && isHostAlias(gPtr->group)) {
-            ls_syslog(LOG_WARNING, _i18n_msg_get(ls_catd , NL_SETN, 6186,
-                                                 "%s: Host group name <%s> conflicts with host name; ignoring"), fname, gPtr->group); /* catgets 6186 */
+            ls_syslog(LOG_WARNING, "\
+%s: Host group name <%s> conflicts with host name; ignoring", __func__,
+                      gPtr->group);
             lsb_CheckError = WARNING_ERR;
             continue;
         }
 
         if (getGrpData (tempGData, gPtr->group, *nTempGroups)) {
-            ls_syslog(LOG_WARNING, _i18n_msg_get(ls_catd , NL_SETN, 6187,
-                                                 "%s: Group <%s> is multiply defined in %s; ignoring"), fname, gPtr->group, HUgroups); /* catgets 6187 */
+            ls_syslog(LOG_WARNING, "\
+%s: Group <%s> is multiply defined in %s; ignoring", __func__,
+                      gPtr->group, HUgroups);
             lsb_CheckError = WARNING_ERR;
             continue;
         }
@@ -2001,18 +2101,25 @@ createTmpGData(struct groupInfoEnt *groups,
             addMember(grpPtr,
                       wp,
                       groupType,
-                      fname,
+                      (char *)__func__,
                       tempGData,
                       nTempGroups);
         }
 
-        if (grpPtr->memberTab.numEnts == 0 &&
-            grpPtr->numGroups == 0 &&
-            strcmp(gPtr->memberList, "all") != 0) {
-            ls_syslog(LOG_WARNING, _i18n_msg_get(ls_catd , NL_SETN, 6188,
-                                                 "%s: No valid member in group <%s>; ignoring the group"), fname, grpPtr->group); /* catgets 6188 */
+        /* Copy the group slots built in resource
+         */
+        if (gPtr->group_slots) {
+            grpPtr->group_slots = strdup(gPtr->group_slots);
+            grpPtr->max_slots = gPtr->max_slots;
+        }
+
+        if (grpPtr->memberTab.numEnts == 0
+            && grpPtr->numGroups == 0
+            && strcmp(gPtr->memberList, "all") != 0) {
+            ls_syslog(LOG_WARNING, "\
+%s: No valid member in group <%s>; ignoring the group", __func__, grpPtr->group);
             lsb_CheckError = WARNING_ERR;
-            freeGrp (grpPtr);
+            freeGrp(grpPtr);
             *nTempGroups -= 1;
         }
     }
@@ -2048,39 +2155,42 @@ isHostAlias (char *grpName)
 static void
 addHostData(int numHosts, struct hostInfoEnt *hosts)
 {
-    static char    fname[] = "addHostData";
-    int            i;
-    int            j;
-    struct hData   hPtr;
+    int i;
+    int j;
+    struct hData hPtr;
 
     removeFlags (&hostTab, HOST_UPDATE | HOST_AUTOCONF_MXJ, HDATA);
     if (numHosts == 0 || hosts == NULL) {
-        ls_syslog(LOG_ERR, _i18n_msg_get(ls_catd , NL_SETN, 6189,
-                                         "%s: No hosts specified in lsb.hosts; all hosts known by LSF will be used"), fname); /* catgets 6189 */
+        ls_syslog(LOG_ERR, "\
+%s: No hosts specified in lsb.hosts; all hosts known by LSF will be used",
+                  __func__);
         addDefaultHost();
         return;
     }
 
     for (i = 0; i < numHosts; i++) {
 
+        /* Find the batch host among LIM hosts
+         */
         for (j = 0; j < numLIMhosts; j++) {
             if (equalHost_(hosts[i].host, LIMhosts[j].hostName))
                 break;
         }
         if (j == numLIMhosts) {
-            ls_syslog(LOG_ERR, _i18n_msg_get(ls_catd , NL_SETN, 6190,
-                                             "%s: Host <%s> is not used by the batch system; ignored"), fname, hosts[i].host); /* catgets 6190 */
+            ls_syslog(LOG_ERR, "\
+%s: Host <%s> is not used by the batch system; ignored",
+                      __func__, hosts[i].host);
             continue;
         }
         if (LIMhosts[j].isServer != TRUE) {
-            ls_syslog(LOG_ERR, _i18n_msg_get(ls_catd , NL_SETN, 6191,
-                                             "%s: Host <%s> is not a server; ignoring"), fname, hosts[i].host); /* catgets 6191 */
+            ls_syslog(LOG_ERR, "\
+%s: Host <%s> is not a server; ignoring", __func__, hosts[i].host);
             continue;
         }
 
         if (!Gethostbyname_(LIMhosts[j].hostName)) {
-            ls_syslog(LOG_ERR, _i18n_msg_get(ls_catd , NL_SETN, 6242,
-                                             "%s: Host <%s> is not a valid host; ignoring"), fname, hosts[i].host); /* catgets 6242 */
+            ls_syslog(LOG_ERR, "\
+%s: Host <%s> is not a valid host; ignoring", __func__, hosts[i].host);
             continue;
         }
 
@@ -2093,23 +2203,33 @@ addHostData(int numHosts, struct hostInfoEnt *hosts)
          */
         hPtr.host = hostConf->hosts[i].host;
         hPtr.uJobLimit = hostConf->hosts[i].userJobLimit;
-        hPtr.maxJobs   = hostConf->hosts[i].maxJobs;
+
+        /* Migrant host uses rexPriority to indicate
+         * the MXJ and maxCPU the migrant host has.
+         */
+        if (LIMhosts[j].rexPriority > 0) {
+            hPtr.maxJobs = LIMhosts[j].rexPriority;
+            LIMhosts[j].maxCpus = LIMhosts[j].maxCpus;
+        } else {
+            hPtr.maxJobs = hostConf->hosts[i].maxJobs;
+        }
 
         if (hostConf->hosts[i].chkSig != INFINIT_INT)
-            hPtr.chkSig    = hostConf->hosts[i].chkSig;
+            hPtr.chkSig = hostConf->hosts[i].chkSig;
         if (hostConf->hosts[i].mig == INFINIT_INT)
-            hPtr.mig       = hostConf->hosts[i].mig;
+            hPtr.mig = hostConf->hosts[i].mig;
         else
-            hPtr.mig       = hostConf->hosts[i].mig * 60;
+            hPtr.mig = hostConf->hosts[i].mig * 60;
 
         hPtr.loadSched = hostConf->hosts[i].loadSched;
         hPtr.loadStop = hostConf->hosts[i].loadStop;
         hPtr.windows = hostConf->hosts[i].windows;
+        hPtr.affinity = hostConf->hosts[i].affinity;
 
         /* Add the host by merging the lsf base
          * host information with the batch configuration.
          */
-        addHost(&LIMhosts[j], &hPtr, fname);
+        addHost(&LIMhosts[j], &hPtr);
 
     } /* for (i = 0; i < numHosts; i++) */
 }
@@ -2143,7 +2263,6 @@ setDefaultParams(void)
     jobTerminateInterval = DEF_JTERMINATE_INTERVAL;
     jobRunTimes = INFINIT_INT;
     jobDepLastSub = 0;
-    scheRawLoad = 0;
     maxUserPriority = -1;
     jobPriorityValue = -1;
     jobPriorityTime = -1;
@@ -2237,6 +2356,16 @@ addQData(struct queueConf *queueConf, int mbdInitFlags )
             badqueue = TRUE;
         }
 
+        if (queue->hostshare) {
+            if (parse_host_shares(queue->hostshare, qPtr) < 0) {
+                ls_syslog(LOG_ERR, "\
+%s: No valid value for key HOSTS_SHARES in the queue <%s>; ignoring the queue",
+                          __func__, qPtr->queue);
+                lsb_CheckError = WARNING_ERR;
+                badqueue = TRUE;
+            }
+        }
+
         if (badqueue) {
             freeQData(qPtr, FALSE);
             continue;
@@ -2263,11 +2392,11 @@ addQData(struct queueConf *queueConf, int mbdInitFlags )
                 FREEUP(oldQPtr->reasonTb[0]);
                 FREEUP(oldQPtr->reasonTb[1]);
                 oldQPtr->reasonTb[0] = my_calloc(numLIMhosts + 2,
-                                               sizeof(int),
-                                               __func__);
+                                                 sizeof(int),
+                                                 __func__);
                 oldQPtr->reasonTb[1] = my_calloc(numLIMhosts + 2,
-                                               sizeof(int),
-                                               __func__);
+                                                 sizeof(int),
+                                                 __func__);
 
                 for(j = 0; j < numLIMhosts+2; j++) {
                     oldQPtr->reasonTb[0][j] = 0;
@@ -2284,6 +2413,15 @@ addQData(struct queueConf *queueConf, int mbdInitFlags )
         if (queue->preemption) {
             qPtr->preemption = strdup(queue->preemption);
             qPtr->qAttrib |= Q_ATTRIB_PREEMPTIVE;
+        }
+
+        if (queue->ownership) {
+            /* Keep using the qAttrib since the
+             * API library needs it
+             */
+            qPtr->ownership = strdup(queue->ownership);
+            qPtr->qAttrib |= Q_ATTRIB_OWNERSHIP;
+            qPtr->loan_duration = queue->loan_duration;
         }
     }
 
@@ -2316,10 +2454,10 @@ addQData(struct queueConf *queueConf, int mbdInitFlags )
                     ls_syslog(LOG_ERR, "\
 %s: Bad time expression %s/%s in queue window %s; ignored",
                               __func__, queue->windows, save, qPtr->queue);
-                        lsb_CheckError = WARNING_ERR;
-                        freeWeek(qPtr->weekR);
-                        free(save);
-                        continue;
+                    lsb_CheckError = WARNING_ERR;
+                    freeWeek(qPtr->weekR);
+                    free(save);
+                    continue;
                 }
                 qPtr->windEdge = now;
                 if (*(qPtr->windows) != '\0')
@@ -2375,10 +2513,10 @@ addQData(struct queueConf *queueConf, int mbdInitFlags )
             if (cpuFactor == NULL) {
                 ls_syslog(LOG_ERR, "\
 %s: Invalid hostspec %s for %s in queue <%s>; ignored",
-                    __func__,
-                    queue->defaultHostSpec,
-                    "DEFAULT_HOST_SPEC",
-                    qPtr->queue);
+                          __func__,
+                          queue->defaultHostSpec,
+                          "DEFAULT_HOST_SPEC",
+                          qPtr->queue);
                 lsb_CheckError = WARNING_ERR;
             }
             if (cpuFactor != NULL)
@@ -2421,8 +2559,8 @@ addQData(struct queueConf *queueConf, int mbdInitFlags )
         if (queue->preCmd)
             qPtr->preCmd = safeSave (queue->preCmd);
 
-	if (queue->prepostUsername)
-	    qPtr->prepostUsername = safeSave (queue->prepostUsername);
+        if (queue->prepostUsername)
+            qPtr->prepostUsername = safeSave (queue->prepostUsername);
 
         if (queue->postCmd)
             qPtr->postCmd = safeSave (queue->postCmd);
@@ -2439,9 +2577,9 @@ addQData(struct queueConf *queueConf, int mbdInitFlags )
 
         if (queue->resReq) {
             qPtr->resValPtr = checkResReq(queue->resReq,
-                                        USE_LOCAL
-                                        | PARSE_XOR
-                                        | CHK_TCL_SYNTAX);
+                                          USE_LOCAL
+                                          | PARSE_XOR
+                                          | CHK_TCL_SYNTAX);
             if (qPtr->resValPtr == NULL) {
                 ls_syslog(LOG_ERR, "\
 %s: invalid RES_REQ %s in queues %s; ignoring",
@@ -2457,7 +2595,7 @@ addQData(struct queueConf *queueConf, int mbdInitFlags )
         if (queue->resumeCond) {
             struct resVal *resValPtr;
             resValPtr = checkResReq(queue->resumeCond,
-                                     USE_LOCAL | CHK_TCL_SYNTAX);
+                                    USE_LOCAL | CHK_TCL_SYNTAX);
             if (resValPtr == NULL) {
                 ls_syslog(LOG_ERR, "\
 %s: invalid RESUME_COND %s in queue %s; ignoring",
@@ -2522,6 +2660,148 @@ addQData(struct queueConf *queueConf, int mbdInitFlags )
 
         if (qPtr->qAttrib & Q_ATTRIB_BACKFILL)
             qAttributes |= Q_ATTRIB_BACKFILL;
+    }
+}
+
+/* parse_host_shares()
+ *
+ * [[host1, 1] [grp2,5]] or [all, 10]
+ */
+static int
+parse_host_shares(const char *host_shares,
+                  struct qData *qp)
+{
+    char *p;
+    char *u;
+    int cc;
+    int n;
+
+    u = strdup(host_shares);
+    assert(u);
+
+    p = strchr(u, '[');
+    *p++ = 0;
+
+    tokenize(p);
+
+    while (1) {
+        char name[128];
+        int shares;
+        int i;
+        struct hData *hPtr = NULL;
+
+        cc = sscanf(p, "%s%u%n", name, &shares, &n);
+        if (cc == EOF)
+            break;
+        if (cc != 2)
+            goto error;
+        p = p + n;
+
+        /* configure shares for all hosts in the queue */
+        if (searchAll(name)) {
+            if (qp->hostList && qp->numAskedPtr > 0) {
+                for (i = 0; i < qp->numAskedPtr; i++)
+                    make_hsacct(qp->askedPtr[i].hData, qp->queue, shares);
+            } else {
+                struct hData *hPtr;
+                for (hPtr = (struct hData *)hostList->back;
+                     hPtr != (void *)hostList;
+                     hPtr = hPtr->back) {
+                    make_hsacct(hPtr, qp->queue, shares);
+                }
+            }
+            /* configure shares for a specific host */
+        } else if (hostQMember(name, qp)
+                   && (hPtr = getHostData(name)) != NULL) {
+            make_hsacct(hPtr, qp->queue, shares);
+        } else {
+            struct gData *gp = NULL;
+            int num = 0;
+            char** grpMembers = NULL;
+
+            /* invalid shares */
+            if ((gp = getHGrpData(name)) == NULL)
+                goto error;
+
+            /* configure shares for a host group */
+            grpMembers = expandGrp(gp, name, &num);
+            for (i = 0; i < num; i++) {
+                if (hostQMember(grpMembers[i], qp)
+                    && (hPtr = getHostData(grpMembers[i])) != NULL)
+                    make_hsacct(hPtr, qp->queue, shares);
+            }
+            FREEUP(grpMembers);
+        }
+    }
+
+    FREEUP(u);
+    return true;
+
+error:
+
+    FREEUP(u);
+    return false;
+}
+
+/*
+ * Make host share account of queues.
+ */
+static void
+make_hsacct(struct hData *hPtr, char *queue, int shares)
+{
+    struct hShareData *hData = NULL;
+    struct qShareData *qData = NULL;
+    struct qShareData *qPtr = NULL;
+    hEnt *he = NULL;
+    hEnt *qe = NULL;
+    hEnt *hashEntryPtr = NULL;
+    sTab hashSearchPtr;
+    int  new;
+
+    if (!hPtr->affinity
+        && !daemonParams[SBD_BIND_CPU].paramValue) {
+        ls_syslog(LOG_WARNING, "\
+%s: HOSTS_SHARES requires SBD_BIND_CPU=y in lsb.conf or AFFINITY=y for host <%s> in lsb.hosts; ignoring HOSTS_SHARES of host <%s> for queue <%s>",
+                  __func__, hPtr->host, hPtr->host, queue);
+        return;
+    }
+
+    if (hShareTab.numEnts == 0)
+        h_initTab_(&hShareTab, numofhosts());
+
+    he = h_addEnt_(&hShareTab, hPtr->host, &new);
+    if (new) {
+        hData = my_calloc(1,
+                          sizeof(struct hShareData),
+                          "make_hsacct");
+        hData->host = safeSave(hPtr->host);
+        hData->total = 0;
+        hData->qAcct= my_calloc(1,
+                                sizeof(struct hTab),
+                                "make_hsacct");
+        h_initTab_(hData->qAcct, numofqueues);
+        he->hData = hData;
+    } else {
+        hData = (struct hShareData *)he->hData;
+    }
+
+    qe = h_addEnt_(hData->qAcct, queue, &new);
+    if (new) {
+        qData = my_calloc(1,
+                          sizeof(struct qShareData),
+                          "make_hsacct");
+        qData->queue = safeSave(queue);
+        qData->shares = shares;
+        hData->total += shares;
+        qe->hData = qData;
+
+        /* re-build share ratio */
+        hashEntryPtr = h_firstEnt_(hData->qAcct, &hashSearchPtr);
+        while (hashEntryPtr) {
+            qPtr = (struct qShareData *) hashEntryPtr->hData;
+            qPtr->dshares = ((double)qPtr->shares)/hData->total;
+            hashEntryPtr = h_nextEnt_(&hashSearchPtr);
+        }
     }
 }
 
@@ -2651,7 +2931,7 @@ updCondData (struct lsConf *conf, int fileType)
         condition = (struct condData *) hashEntryPtr->hData;
         if (condition->rootNode == NULL)
             continue;
-        status = evalDepCond (condition->rootNode, NULL);
+        status = evalDepCond (condition->rootNode, NULL, NULL);
         if (status == DP_TRUE)
             status = TRUE;
         else
@@ -2827,7 +3107,7 @@ addDefaultHost(void)
             continue;
         initHData(&hData);
         hData.host = LIMhosts[i].hostName;
-        addHost(&LIMhosts[i], &hData, "addDefaultHost");
+        addHost(&LIMhosts[i], &hData);
     }
 }
 
@@ -2909,6 +3189,7 @@ updHostList(void)
 %s: Entering this routine...", __func__);
 
     if (hostList) {
+        FREEUP(hostList->name);
         FREEUP(hostList);
     }
 
@@ -2937,7 +3218,9 @@ updHostList(void)
         hPtr->hostId = cc;
         ++cc;
 
-        /* Hopsa in da lista...
+        /* Hopsa in da lista... To traverse the host list
+         * in increasing hostId order, as bjobs expects,
+         * go via the forward pointer.
          */
         listInsertEntryAtBack(hostList, (LIST_ENTRY_T *)hPtr);
 
@@ -3138,7 +3421,6 @@ updUserList(int mbdInitFlags)
     }
 
     uDataGroupCreate();
-    setuDataCreate();
 
     if (mbdInitFlags == RECONFIG_CONF || mbdInitFlags == WINDOW_CONF) {
         struct uData*  uData;
@@ -3320,7 +3602,7 @@ freeGrp(struct gData *grpPtr)
     h_delTab_(&grpPtr->memberTab);
     if (grpPtr->group && grpPtr->group[0] != '\0')
         FREEUP(grpPtr->group);
-
+    FREEUP(grpPtr->group_slots);
     FREEUP(grpPtr);
 }
 
@@ -3405,8 +3687,15 @@ parseFirstHostErr(int returnErr,
 static int
 init_fairshare_scheduler(void)
 {
+    char buf[PATH_MAX];
     struct qData *qPtr;
     int cc;
+
+    if (! is_fairplugin_ok())
+        return -1;
+
+    sprintf(buf, "\
+%s/libfairshare.so", daemonParams[LSF_LIBDIR].paramValue);
 
     for (qPtr = qDataList->forw;
          qPtr != (void *)qDataList;
@@ -3415,13 +3704,29 @@ init_fairshare_scheduler(void)
         if (qPtr->fairshare == NULL)
             continue;
 
-        cc = load_fair_plugin(qPtr);
-        if (cc < 0) {
+        qPtr->fsSched = load_fair_plugin(qPtr, buf);
+        if (qPtr->fsSched == NULL) {
             ls_syslog(LOG_ERR, "\
 %s: failed loading fairshare plugin, fall back to fcfs", __func__);
             FREEUP(qPtr->fairshare);
+            qPtr->qAttrib &= ~Q_ATTRIB_FAIRSHARE;
             continue;
         }
+        /* invoke the plugin initializer
+         */
+        cc = (*qPtr->fsSched->fs_init)(qPtr, userConf);
+        if (cc < 0) {
+            ls_syslog(LOG_ERR, "\
+%s: failed initializing fairshare plugin, fall back to fcfs", __func__);
+            tree_free(qPtr->fsSched->tree, free_sacct);
+            dlclose(qPtr->fsSched->handle);
+            _free_(qPtr->fsSched->name);
+            _free_(qPtr->fsSched);
+            _free_(qPtr->fairshare);
+            qPtr->qAttrib &= ~Q_ATTRIB_FAIRSHARE;
+            return -1;
+        }
+
         qPtr->numFairSlots = getQueueSlots(qPtr);
         (*qPtr->fsSched->fs_init_sched_session)(qPtr);
     }
@@ -3431,23 +3736,19 @@ init_fairshare_scheduler(void)
 
 /* load_fair_plugin()
  */
-static int
-load_fair_plugin(struct qData *qPtr)
+static struct fair_sched *
+load_fair_plugin(struct qData *qPtr,
+                 const char *file)
 {
-    char buf[PATH_MAX];
     struct fair_sched *f;
 
-    f = qPtr->fsSched = calloc(1, sizeof(struct fair_sched));
-    assert(qPtr->fsSched);
+    f = calloc(1, sizeof(struct fair_sched));
 
-    sprintf(buf, "\
-%s/../lib/libfairshare.so", daemonParams[LSB_CONFDIR].paramValue);
-
-    f->handle = dlopen(buf, RTLD_NOW);
+    f->handle = dlopen(file, RTLD_NOW);
     if (f->handle == NULL) {
         ls_syslog(LOG_ERR, "\
-%s: gudness cannot open %s: %s", __func__, buf, dlerror());
-        return -1;
+%s: gudness cannot open %s: %s", __func__, file, dlerror());
+        return NULL;
     }
 
     /* now check for scheduler symbols.
@@ -3455,68 +3756,95 @@ load_fair_plugin(struct qData *qPtr)
     f->fs_init = dlsym(f->handle, "fs_init");
     if (f->fs_init == NULL) {
         ls_syslog(LOG_ERR, "%s: ohmygosh missing fs_init() symbol in %s: %s",
-                  __func__, buf, dlerror());
+                  __func__, file, dlerror());
         dlclose(f->handle);
-        free(qPtr->fsSched);
-        return -1;
+        free(f);
+        return NULL;
     }
 
     f->fs_update_sacct = dlsym(f->handle, "fs_update_sacct");
-    if (f->fs_init == NULL) {
+    if (f->fs_update_sacct == NULL) {
         ls_syslog(LOG_ERR, "\
 %s: ohmygosh missing fs_update_sacct() symbol in %s: %s", __func__,
-                  buf, dlerror());
+                  file, dlerror());
         dlclose(f->handle);
-        free(qPtr->fsSched);
-        return -1;
+        free(f);
+        return NULL;
     }
 
     f->fs_init_sched_session = dlsym(f->handle, "fs_init_sched_session");
-    if (f->fs_init == NULL) {
+    if (f->fs_init_sched_session == NULL) {
         ls_syslog(LOG_ERR, "\
 %s: ohmygosh missing fs_init_sched_session() symbol in %s: %s", __func__,
-                  buf, dlerror());
+                  file, dlerror());
         dlclose(f->handle);
-        free(qPtr->fsSched);
-        return -1;
+        free(f);
+        return NULL;
     }
 
     f->fs_elect_job = dlsym(f->handle, "fs_elect_job");
-    if (f->fs_init == NULL) {
+    if (f->fs_elect_job == NULL) {
         ls_syslog(LOG_ERR, "\
 %s: ohmygosh missing fs_elect_job() symbol in %s: %s", __func__,
-                  buf, dlerror());
+                  file, dlerror());
         dlclose(f->handle);
-        free(qPtr->fsSched);
-        return -1;
+        free(f);
+        return NULL;
     }
 
     f->fs_fin_sched_session = dlsym(f->handle, "fs_fin_sched_session");
-    if (f->fs_init == NULL) {
+    if (f->fs_fin_sched_session == NULL) {
         ls_syslog(LOG_ERR, "\
 %s: ohmygosh missing fs_fin_sched_session() symbol in %s: %s", __func__,
-                  buf, dlerror());
+                  file, dlerror());
         dlclose(f->handle);
-        free(qPtr->fsSched);
-        return -1;
+        free(f);
+        return NULL;
     }
 
     f->fs_get_saccts = dlsym(f->handle, "fs_get_saccts");
-    if (f->fs_init == NULL) {
+    if (f->fs_get_saccts == NULL) {
         ls_syslog(LOG_ERR, "\
 %s: ohmygosh missing fs_get_saccts() symbol in %s: %s", __func__,
-                  buf, dlerror());
+                  file, dlerror());
         dlclose(f->handle);
-        free(qPtr->fsSched);
-        return -1;
+        free(f);
+        return NULL;
+    }
+
+    f->fs_own_init = dlsym(f->handle, "fs_own_init");
+    if (f->fs_own_init == NULL) {
+        ls_syslog(LOG_ERR, "\
+%s: ohmygosh missing fs_own_init() symbol in %s: %s", __func__,
+                  file, dlerror());
+        dlclose(f->handle);
+        free(f);
+        return NULL;
+    }
+
+    f->fs_init_own_sched_session = dlsym(f->handle, "fs_init_own_sched_session");
+    if (f->fs_init_own_sched_session == NULL) {
+        ls_syslog(LOG_ERR, "\
+%s: ohmygosh missing fs_init_own_sched_session() symbol in %s: %s", __func__,
+                  file, dlerror());
+        dlclose(f->handle);
+        free(f);
+        return NULL;
+    }
+
+    f->fs_decay_ran_time = dlsym(f->handle, "fs_decay_ran_time");
+    if (f->fs_decay_ran_time == NULL) {
+        ls_syslog(LOG_ERR, "\
+%s: ohmygosh missing fs_decay_ran_time() symbol in %s: %s", __func__,
+                  file, dlerror());
+        dlclose(f->handle);
+        free(f);
+        return NULL;
     }
 
     f->name = strdup(qPtr->queue);
-    /* invoke the plugin initializer
-     */
-    (*f->fs_init)(qPtr, userConf);
 
-    return 0;
+    return f;
 }
 
 /* getQueueSlots()
@@ -3539,7 +3867,7 @@ getQueueSlots(struct qData *qPtr)
         if (!isHostQMember(hPtr, qPtr))
             continue;
 
-        numSlots = numSlots + hPtr->numCPUs;
+        numSlots = numSlots + hPtr->maxJobs;
     }
 
     return numSlots;
@@ -3622,35 +3950,31 @@ static int
 sort_queues(void)
 {
     struct qData *qPtr;
-    struct qData *qPtr2;
     struct qData **v;
     int n;
     int i;
+    LIST_T *l;
 
     n = 0;
-    for (qPtr = qDataList->forw;
+    for (qPtr = qDataList->back;
          qPtr != (void *)qDataList;
-         qPtr = qPtr->forw)
+         qPtr = qPtr->back)
         ++n;
 
     v = calloc(n, sizeof(struct qData *));
+    l = (LIST_T *)qDataList;
 
     i = 0;
-    for (qPtr = qDataList->forw;
-         qPtr != (void *)qDataList;
-         qPtr = qPtr2) {
-
-        qPtr2 = qPtr->forw;
-
+    while ((qPtr = (struct qData *)listPop(l))) {
         v[i] = qPtr;
-        listRemoveEntry((LIST_T *)qDataList, (LIST_ENTRY_T *)qPtr);
         ++i;
     }
 
     qsort(v, n, sizeof(struct qData *), queue_cmp);
 
     for (i = 0; i < n; i++) {
-        listInsertEntryAtFront((LIST_T *)qDataList, (LIST_ENTRY_T *)v[i]);
+        qPtr = v[i];
+        listInsertEntryAtFront(l, (LIST_ENTRY_T *)qPtr);
     }
 
     _free_(v);
@@ -3723,6 +4047,12 @@ static int
 init_preemption_scheduler(void)
 {
     struct qData *qPtr;
+    bool_t has_preemption = false;
+
+    has_slot_preemption_ = false;
+
+    if (! is_preemptplugin_ok())
+        return -1;
 
     for (qPtr = qDataList->forw;
          qPtr != qDataList;
@@ -3731,10 +4061,40 @@ init_preemption_scheduler(void)
         if (! (qPtr->qAttrib & Q_ATTRIB_PREEMPTIVE))
             continue;
 
-        load_preempt_plugin(qPtr);
+        if (load_preempt_plugin(qPtr) < 0) {
+            ls_syslog(LOG_ERR, "\
+%s: load_preemption_plugin() failed, no preemption in the system",
+                      __func__);
+        }
+        has_preemption = true;
+    }
+
+    if (has_preemption
+        && mbdParams->preemptableResources) {
+        has_slot_preemption_ = false;
+        ls_syslog(LOG_INFO, "\
+%s: system has preemption, preemtable reesources %s, no slot preemption",
+                 __func__, mbdParams->preemptableResources);
+    }
+
+    if (has_preemption
+        && mbdParams->preemptableResources == NULL) {
+        has_slot_preemption_ = true;
+        ls_syslog(LOG_INFO, "\
+%s: system has slots based preemption", __func__);
     }
 
     return 0;
+}
+
+/* has_slot_preemption()
+ *
+ * Do we have preemption defined in the scheduler.
+ */
+bool_t
+has_slot_preemption(void)
+{
+    return has_slot_preemption_;
 }
 
 /* load_preempt_plugin()
@@ -3749,7 +4109,7 @@ load_preempt_plugin(struct qData *qPtr)
     qPtr->prmSched->name = strdup(qPtr->queue);
 
     sprintf(buf, "\
-%s/../lib/libpreempt.so", daemonParams[LSB_CONFDIR].paramValue);
+%s/libpreempt.so", daemonParams[LSF_LIBDIR].paramValue);
 
     p->handle = dlopen(buf, RTLD_NOW);
     if (p->handle == NULL) {
@@ -3767,6 +4127,7 @@ load_preempt_plugin(struct qData *qPtr)
 %s: ohmygosh missing fs_init() symbol in %s: %s",
                   __func__, buf, dlerror());
         dlclose(p->handle);
+        _free_(qPtr->prmSched->name);
         free(qPtr->prmSched);
         qPtr->qAttrib &= ~Q_ATTRIB_PREEMPTIVE;
         return -1;
@@ -3778,10 +4139,228 @@ load_preempt_plugin(struct qData *qPtr)
 %s: ohmygosh missing fs_init() symbol in %s: %s",
                   __func__, buf, dlerror());
         dlclose(p->handle);
+        _free_(qPtr->prmSched->name);
         free(qPtr->prmSched);
         qPtr->qAttrib &= ~Q_ATTRIB_PREEMPTIVE;
         return -1;
     }
 
     return 0;
+}
+
+/* init_ownersip_scheduler()
+ */
+static int
+init_ownership_scheduler(void)
+{
+    char buf[PATH_MAX];
+    struct qData *qPtr;
+    int cc;
+
+    if (! is_ownplugin_ok())
+        return -1;
+
+    sprintf(buf, "\
+%s/libfairshare.so", daemonParams[LSF_LIBDIR].paramValue);
+
+    for (qPtr = qDataList->forw;
+         qPtr != (void *)qDataList;
+         qPtr = qPtr->forw) {
+
+        if (qPtr->ownership == NULL)
+            continue;
+
+        qPtr->own_sched = load_fair_plugin(qPtr, buf);
+        if (qPtr->own_sched == NULL) {
+            ls_syslog(LOG_ERR, "\
+%s: failed loading ownership plugin, fall back to fcfs", __func__);
+            _free_(qPtr->ownership);
+            qPtr->qAttrib &= ~Q_ATTRIB_OWNERSHIP;
+            continue;
+        }
+
+        cc = (*qPtr->own_sched->fs_own_init)(qPtr, userConf);
+        if (cc < 0) {
+            ls_syslog(LOG_ERR, "\
+%s: failed initializing fairshare plugin, fall back to fcfs", __func__);
+            tree_free(qPtr->own_sched->tree, free_sacct);
+            dlclose(qPtr->own_sched->handle);
+            _free_(qPtr->own_sched->name);
+            _free_(qPtr->own_sched);
+            _free_(qPtr->ownership);
+            qPtr->qAttrib &= ~Q_ATTRIB_OWNERSHIP;
+            return -1;
+        }
+
+        /* Keep both fairshare slots and owned slots as they
+         * are used in the 2 different algorithms we run
+         * in the queue.
+         */
+        qPtr->numFairSlots = qPtr->num_owned_slots = getQueueSlots(qPtr);
+        if (! check_ownership(qPtr)) {
+            ls_syslog(LOG_ERR, "\
+%s: check_ownership() failed, fall back to fcfs", __func__);
+            /* dlclose(qPtr->own_sched->handle);
+             */
+            tree_free(qPtr->own_sched->tree, free_sacct);
+            dlclose(qPtr->own_sched->handle);
+            _free_(qPtr->own_sched->name);
+            _free_(qPtr->own_sched);
+            _free_(qPtr->ownership);
+            qPtr->qAttrib &= ~Q_ATTRIB_OWNERSHIP;
+            return -1;
+        }
+        (*qPtr->own_sched->fs_init_own_sched_session)(qPtr);
+    }
+
+    return 0;
+}
+
+/* is_fairplugin_ok()
+ */
+static bool_t
+is_fairplugin_ok(void)
+{
+    struct qData *qPtr;
+
+    if (daemonParams[LSF_LIBDIR].paramValue)
+        return true;
+
+    ls_syslog(LOG_ERR, "\
+%s: LSF_LIBDIR not defined in lsf.conf, no fairshare possible",
+              __func__);
+
+    for (qPtr = qDataList->forw;
+         qPtr != (void *)qDataList;
+         qPtr = qPtr->forw) {
+
+        if (qPtr->fairshare) {
+            _free_(qPtr->fairshare);
+            qPtr->qAttrib &= ~Q_ATTRIB_FAIRSHARE;
+            ls_syslog(LOG_ERR, "\
+%s: queue %s fairshare disabled", __func__, qPtr->queue);
+        }
+    }
+
+    return false;
+}
+
+static bool_t
+is_preemptplugin_ok(void)
+{
+    struct qData *qPtr;
+
+    if (daemonParams[LSF_LIBDIR].paramValue)
+        return true;
+
+    ls_syslog(LOG_ERR, "\
+%s: LSF_LIBDIR not defined in lsf.conf, no preemption possible",
+              __func__);
+
+    for (qPtr = qDataList->forw;
+         qPtr != (void *)qDataList;
+         qPtr = qPtr->forw) {
+
+        if (qPtr->qAttrib & Q_ATTRIB_PREEMPTIVE) {
+            qPtr->qAttrib &= ~Q_ATTRIB_PREEMPTIVE;
+            ls_syslog(LOG_ERR, "\
+%s: queue %s preemption disabled", __func__, qPtr->queue);
+        }
+    }
+
+    return false;
+}
+
+static bool_t
+is_ownplugin_ok(void)
+{
+    struct qData *qPtr;
+
+    if (daemonParams[LSF_LIBDIR].paramValue)
+        return true;
+
+    ls_syslog(LOG_ERR, "\
+%s: LSF_LIBDIR not defined in lsf.conf, no ownership possible",
+              __func__);
+
+    for (qPtr = qDataList->forw;
+         qPtr != (void *)qDataList;
+         qPtr = qPtr->forw) {
+
+        if (qPtr->ownership) {
+            _free_(qPtr->ownership);
+            qPtr->qAttrib &= ~Q_ATTRIB_OWNERSHIP;
+            ls_syslog(LOG_ERR, "\
+%s: queue %s ownership disabled", __func__, qPtr->queue);
+        }
+    }
+
+    return false;
+}
+
+/* check_ownership()
+ *
+ * Sum up all the slots in the root
+ * group and make sure they do not exceed
+ * the total number of configured ownership.
+ */
+
+static bool_t
+check_ownership(struct qData *qPtr)
+{
+    struct tree_node_ *n;
+    struct share_acct *sacct;
+    int sum;
+
+    sum = 0;
+    n = qPtr->own_sched->tree->root->child;
+    while (n) {
+        sacct = n->data;
+        if (logclass & LC_TRACE) {
+            ls_syslog(LOG_INFO, "\
+%s: group %s num owned slots %d sum %d", __func__, n->name,
+                      sacct->shares, sum);
+        }
+        sum = sum + sacct->shares;
+        n = n->right;
+    }
+
+    if (sum > qPtr->num_owned_slots) {
+        ls_syslog(LOG_ERR, "\
+%s: the sum of owned slots by root groups %d > total slots %d, not allowed",
+                  __func__, sum, qPtr->num_owned_slots);
+        return false;
+    }
+
+    return true;
+}
+
+/* add_host_dedicated_res()
+ */
+static void
+add_host_dedicated_res(struct hData *hPtr, struct hostInfo *lsf)
+{
+    int cc;
+    hEnt *ent;
+
+    if (! daemonParams[MBD_DEDICATED_RESOURCES].paramValue)
+        return;
+
+    for (cc = 0; cc < lsf->nRes; cc++) {
+        /* This resource giving us from openlava base
+         * for this host, is also configured as dedicated
+         * resources in lsf.conf. Remember if in this host.
+         */
+        if (! (ent = h_getEnt_(d_res_tab, lsf->resources[cc])))
+            continue;
+
+        if (logclass & LC_TRACE) {
+            ls_syslog(LOG_INFO, "\
+%s: resource %s is dedicated on host %s", __func__, lsf->resources[cc],
+                      hPtr->host);
+        }
+
+        ent = h_addEnt_(hPtr->dres_tab, strdup(lsf->resources[cc]), NULL);
+        ent->hData = strdup(lsf->resources[cc]);
+    }
 }

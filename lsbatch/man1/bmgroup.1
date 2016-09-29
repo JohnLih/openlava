@@ -1,7 +1,7 @@
 .ds ]W %
 .ds ]L
 .nh
-.TH bmgroup 1 "OpenLava Version 3.0 - Mar 2015"
+.TH bmgroup 1 "OpenLava Version 4.0 - Aug 2016"
 .br
 .SH NAME
 \fBbmgroup\fR - displays information about host groups
@@ -9,7 +9,7 @@
 .BR
 .PP
 .PP
-\fBbmgroup\fR\fB \fR [\fB-w\fR] [\fIhost_group \fR...]
+\fBbmgroup\fR [\fB-r\fR] [\fB-s\fR] [\fIhost_group \fR...]
 .PP
 \fBbmgroup \fR[\fB-h\fR | \fB-V\fR] 
 .SH DESCRIPTION
@@ -23,15 +23,18 @@ By default, displays information about all host groups.
 .BR
 .PP
 .TP 
-\fB-w
+\fB-s
 \fR
 .IP
-Wide format. Displays host and host group names without truncating 
-fields.
-
+Displays GROUP_SLOT and MAX_SLOTS in addition to the host group names and group members.
+Refer to lsb.hosts(5) for more information about GROUP_SLOT and MAX_SLOTS.
 .IP
-
-
+.TP
+\fB-r\fR
+.IP
+Expands host groups recursively. The expanded list contains only host names.
+It does not contain the names of subgroups. Duplicate names are listed only once.
+.IP
 
 .TP 
 \fIhost_group \fR...

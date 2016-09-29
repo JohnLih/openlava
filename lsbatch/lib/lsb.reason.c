@@ -115,10 +115,13 @@ lsb_suspreason (int reasons, int subreasons, struct loadIndexLog *ld)
             sprintf(msgbuf, " CPULIMIT was reached;\n");
         else if (subreasons & SUB_REASON_MEMLIMIT)
             sprintf(msgbuf," MEMLIMIT was reached;\n");
-    } else
+    } else if (reasons & SUSP_MBD_PREEMPT) {
+        sprintf(msgbuf, "Preempted by mbatchd;\n");
+    } else {
         sprintf (msgbuf, " Unknown suspending reason code: %d\n", reasons);
-    return msgbuf;
+    }
 
+    return msgbuf;
 }
 
 char *
@@ -205,6 +208,8 @@ lsb_pendreason(int numReasons, int *rsTb, struct jobInfoHead *jInfoH,
           "Not enough hosts to meet the queue's spanning requirement"},
         { PEND_QUE_WINDOW_WILL_CLOSE,
           "Job will not finish before queue's run window is closed"},
+        { PEND_RES_LIMIT,
+          "Not allowed due to resource limit."},
         /*
          * User Related Reasons (601 - 800)
          */
@@ -329,6 +334,8 @@ lsb_pendreason(int numReasons, int *rsTb, struct jobInfoHead *jInfoH,
           "Preempted job is waiting to be resumed"},
         { PEND_JOB_REQUEUED,
           "The job has been requeued"},
+        {  PEND_JGROUP_LIMIT,
+           "The job group limit has been reached"},
         { 0, NULL}
     };
 
@@ -389,7 +396,13 @@ lsb_pendreason(int numReasons, int *rsTb, struct jobInfoHead *jInfoH,
         } else {
             num = 1;
         }
-
+        /*
+         * Search for the rest of the reasonTb and see whether there
+         * is a matching reason.  If so, we add the associated host name
+         * to the string stored in hostList so that we can provide a
+         * summary information instead of repeating the same reason for
+         * each host.
+         */
         for (j = i + 1; j < numReasons; j++) {
             if (reasonTb[j] == 0)
                 continue;

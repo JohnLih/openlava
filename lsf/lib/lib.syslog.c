@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2011-2012 David Bigagli
+ * Copyright (C) 2011 - 2016 David Bigagli
  * Copyright (C) 2007 Platform Computing Inc
  *
  * This program is free software; you can redistribute it and/or modify
@@ -24,7 +24,6 @@
 #include "lib.h"
 #include "../lib/lproto.h"
 
-
 #define LSF_LOG_MASK   7
 #define DEF_LOG_MASK   LOG_INFO
 #define DEF_LOG_MASK_NAME   "LOG_WARNING"
@@ -48,6 +47,7 @@ static char logfile[MAXPATHLEN];
 static char logident[10];
 static int logmask;
 static enum {LOGTO_SYS, LOGTO_FILE, LOGTO_STDERR} log_dest;
+
 static int openLogFile(const char *, char *);
 
 char *
@@ -424,14 +424,15 @@ getLogClass_(char *lsp, char *tsp)
             class |= LC_COMM;
         if (strcmp (word, "LC_XDR") == 0)
             class |= LC_XDR;
-        if (strcmp (word, "LC_CHKPNT") == 0)
-            class |= LC_CHKPNT;
+        if ((strcmp (word, "LC_FAIRSHARE") == 0)
+            || (strcmp(word, "LC_FAIR") == 0))
+            class |= LC_FAIR;
         if (strcmp (word, "LC_FILE") == 0)
             class |= LC_FILE;
         if (strcmp (word, "LC_AUTH") == 0)
             class |= LC_AUTH;
-        if (strcmp (word, "LC_HANG") == 0)
-            class |= LC_HANG;
+        if (strcmp (word, "LC_DEP") == 0)
+            class |= LC_DEP;
         if (strcmp (word, "LC_SIGNAL") == 0)
             class |= LC_SIGNAL;
         if (strcmp (word, "LC_PIM") == 0)
@@ -448,8 +449,8 @@ getLogClass_(char *lsp, char *tsp)
             class |= LC_PREEMPT;
         if (strcmp (word, "LC_ELIM") == 0)
             class |= LC_ELIM;
-        if (strcmp (word, "LC_M_LOG") == 0)
-            class |= LC_M_LOG;
+        if (strcmp (word, "LC_SWITCH") == 0)
+            class |= LC_SWITCH;
         if (strcmp (word, "LC_PERFM") == 0)
             class |= LC_PERFM;
     }
@@ -462,4 +463,18 @@ void
 ls_closelog_ext(void)
 {
     logfile[0] = '\0';
+}
+
+/* ls_logchown()
+ */
+int
+ls_logchown(uid_t uid)
+{
+    if (log_dest == LOGTO_STDERR)
+	return 0;
+
+    if (chown(logfile, uid, uid) < 0)
+	return -1;
+
+    return 0;
 }

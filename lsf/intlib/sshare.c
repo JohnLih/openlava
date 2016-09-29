@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2014 - 2015 David Bigagli
+ * Copyright (C) 2014 - 2016 David Bigagli
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of version 2 of the GNU General Public License as
@@ -25,6 +25,8 @@
 #include "sshare.h"
 #include <assert.h>
 
+extern void ls_syslog(int, const char *, ...);
+
 static link_t *parse_user_shares(const char *);
 static link_t *parse_group_member(const char *,
                                   uint32_t,
@@ -34,7 +36,6 @@ static struct share_acct *get_sacct(const char *,
 static uint32_t compute_slots(struct tree_node_ *, uint32_t, uint32_t);
 static void sort_siblings(struct tree_node_ *,
                           int (*cmp)(const void *, const void *));
-static void tokenize(char *);
 static char *get_next_word(char **);
 static int node_cmp(const void *, const void *);
 static int node_cmp2(const void *, const void *);
@@ -46,6 +47,16 @@ static uint32_t compute_deviate(struct tree_node_ *, uint32_t, uint32_t);
 static void make_leafs(struct tree_ *);
 
 /* sshare_make_tree()
+ * In this function we match the user_shares as configured
+ * in the queue file with the groups configured in lsb.users.
+ * The fairshare configuration in the queues can be such
+ * that they don't match for example:
+ *
+ * FAIRSHARE = USER_SHARES[[crock ,2] [zebra, 1]]
+ * FAIRSHARE = USER_SHARES[[all, 1]]
+ *
+ * in these cases the shares are specified for users
+ * directly and no groups are involved.
  */
 struct tree_ *sshare_make_tree(const char *user_shares,
                                uint32_t num_grp,
@@ -59,6 +70,7 @@ struct tree_ *sshare_make_tree(const char *user_shares,
     struct tree_node_ *n;
     struct tree_node_ *root;
 
+    n = NULL;
     stack = make_link();
     t = tree_init("");
     /* root summarizes all the tree counters
@@ -66,6 +78,9 @@ struct tree_ *sshare_make_tree(const char *user_shares,
     t->root->data = make_sacct("/", 1);
     root = NULL;
 
+    /* First parse the user shares and make
+     * the first level of the tree
+     */
     l = parse_user_shares(user_shares);
 
 z:
@@ -75,6 +90,9 @@ z:
         root = t->root;
 
     if (l == NULL) {
+        free_sacct(t->root->data);
+        fin_link(stack);
+        tree_free(t, free_sacct);
         return NULL;
     }
 
@@ -82,7 +100,10 @@ z:
     while ((sacct = traverse_link(&iter))) {
 
         n = calloc(1, sizeof(struct tree_node_));
-        n->name = sacct->name;
+        /* dup() the name as later we free both
+         * the tree node and the share account
+         */
+        n->name = strdup(sacct->name);
 
         n = tree_insert_node(root, n);
         enqueue_link(stack, n);
@@ -113,8 +134,14 @@ z:
          */
         sacct = n->data;
         if (n->child == NULL) {
-            if (strcasecmp(sacct->name, "all") == 0)
+            /* all and default are synonyms as they
+             * both indicate a user that is not explicitly
+             * defined.
+             */
+            if (strcasecmp(sacct->name, "all") == 0
+                || strcasecmp(sacct->name, "default") == 0) {
                 sacct->options |= SACCT_USER_ALL;
+            }
             sacct->options |= SACCT_USER;
             sprintf(buf, "%s/%s", n->parent->name, n->name);
             hash_install(t->node_tab, buf, n, NULL);
@@ -141,6 +168,18 @@ z:
     return t;
 }
 
+void
+sshare_sort_tree_by_ran_job(struct tree_ *t)
+{
+    /* This must be emptied after every scheduling
+     * cycle. There could be still some leafs
+     * if not all jobs got dispatched.
+     */
+    while (pop_link(t->leafs))
+        ;
+    sort_tree_by_deviate(t);
+}
+
 /* sshare_distribute_slots()
  */
 int
@@ -154,7 +193,6 @@ sshare_distribute_slots(struct tree_ *t,
     int tried;
 
     stack = make_link();
-    n = t->root->child;
     /* This must be emptied after every scheduling
      * cycle. There could be still some leafs
      * if not all jobs got dispatched.
@@ -166,7 +204,9 @@ sshare_distribute_slots(struct tree_ *t,
     sort_tree_by_deviate(t);
     zero_out_sent(t);
     tried = 0;
-
+    /* only after sort get the first child
+     */
+    n = t->root->child;
 znovu:
 
     /* Iterate at each tree level but
@@ -176,6 +216,9 @@ znovu:
     while (n) {
 
         sacct = n->data;
+        /* all is a dummy share account the
+         * tree is populated with real ones.
+         */
         if (sacct->options & SACCT_USER_ALL) {
             n = n->right;
             continue;
@@ -199,6 +242,103 @@ znovu:
         n = n->right;
     }
 
+    n = pop_link(stack);
+    if (n) {
+        /* tokens come from the parent
+         */
+        sacct = n->data;
+        avail = slots = sacct->sent;
+        n = n->child;
+        goto znovu;
+    }
+
+    if (avail > 0
+        && tried == 0) {
+        ++tried;
+        n = t->root->child;
+        goto znovu;
+    }
+
+    fin_link(stack);
+
+    return 0;
+}
+
+/* sshare_distribute_own_slots()
+ */
+int
+sshare_distribute_own_slots(struct tree_ *t,
+                            uint32_t slots)
+{
+    struct tree_node_ *n;
+    link_t *stack;
+    struct share_acct *sacct;
+    uint32_t avail;
+    int tried;
+    int first;
+
+    stack = make_link();
+    /* This must be emptied after every scheduling
+     * cycle. There could be still some leafs
+     * if not all jobs got dispatched.
+     */
+    while (pop_link(t->leafs))
+        ;
+    avail = slots;
+
+    sort_tree_by_deviate(t);
+    zero_out_sent(t);
+    tried = 0;
+    /* only after sort get the first child
+     */
+    n = t->root->child;
+    first = 0;
+
+znovu:
+    /* Iterate at each tree level but
+     * don't traverse branches without
+     * tokens.
+     */
+    while (n) {
+
+        sacct = n->data;
+        /* all is a dummy share account the
+         * tree is populated with real ones.
+         */
+        if (sacct->options & SACCT_USER_ALL) {
+            n = n->right;
+            continue;
+        }
+
+        /* enqueue as we want to traverse
+         * the tree by priority
+         */
+        if (n->child)
+            enqueue_link(stack, n);
+
+        /* Enforce the ownership/guarantee at the
+         * first level of the tree.
+         */
+        if (first == 0) {
+            if (sacct->numRUN > sacct->shares)
+                sacct->sent = 0;
+            else
+                sacct->sent = sacct->shares - sacct->numRUN;
+        } else {
+            avail = avail - compute_slots(n, slots, avail);
+        }
+
+        assert(avail >= 0);
+        /* As we traverse in priority order
+         * the leafs are also sorted
+         */
+        if (n->child == NULL)
+            enqueue_link(t->leafs, n);
+
+        n = n->right;
+    }
+
+    ++first;
     n = pop_link(stack);
     if (n) {
         /* tokens come from the parent
@@ -308,8 +448,12 @@ make_sacct(const char *name, uint32_t shares)
 /* free_sacct()
  */
 void
-free_sacct(struct share_acct *sacct)
+free_sacct(void *s)
 {
+    struct share_acct *sacct;
+
+    sacct = s;
+
     _free_(sacct->name);
     _free_(sacct);
 }
@@ -365,6 +509,13 @@ znovu:
         /* sum up the historical.
          */
         sum = sum + s->numRAN;
+
+        if (logclass & LC_FAIR) {
+            ls_syslog(LOG_INFO, "\
+%s: updating %s pend %d run %d ran %d", __func__,
+                      s->name, s->numPEND, s->numRAN, s->numRUN);
+        }
+
         n = n->right;
     }
 
@@ -378,6 +529,20 @@ znovu:
     }
 
     sort_siblings(root, node_cmp2);
+
+    if (logclass & LC_FAIR) {
+        /* Verify the sorting order which should be from
+         * less numRAN to higher ones.
+         */
+        n = root->child;
+        while (n) {
+            s = n->data;
+            ls_syslog(LOG_INFO, "\
+%s: sorted %s pend %d ran %d run %d", __func__,
+                      s->name, s->numPEND, s->numRAN, s->numRUN);
+            n = n->right;
+        }
+    }
 
     n = pop_link(stack);
     if (n) {
@@ -410,6 +575,12 @@ compute_deviate(struct tree_node_ *n,
      * you should have used.
      */
     s->dsrv2 = u - s->numRAN;
+
+    if (logclass & LC_FAIR) {
+        ls_syslog(LOG_INFO, "\
+%s: shares %s ideal %f ceil(ideal) %d numRAN %d deserve %d", __func__,
+                  s->name, q, u, s->numRAN, (u - s->numRAN));
+    }
 
     return s->dsrv2;
 }
@@ -453,7 +624,7 @@ sort_siblings(struct tree_node_ *root,
     root->child = NULL;
 
     /* We want to sort in ascending order as we use
-     * tree_inser_node() which always inserts
+     * tree_insert_node() which always inserts
      * node in the left most position.
      */
     qsort(v, num, sizeof(struct tree_node_ *), cmp);
@@ -570,7 +741,11 @@ parse_group_member(const char *gname,
     g = NULL;
     for (cc = 0; cc < num; cc++) {
 
-        if (strcmp(gname, grps[cc].group) == 0) {
+        /* Match the group name and the group
+         * must have shares.
+         */
+        if (strcmp(gname, grps[cc].group) == 0
+            && grps[cc].user_shares) {
             g = calloc(1, sizeof(struct group_acct));
             assert(g);
             g->group = strdup(grps[cc].group);
@@ -627,6 +802,11 @@ get_sacct(const char *acct_name, const char *user_list)
     char *p0;
 
     p0 = p = strdup(user_list);
+    /* If we don't find account name
+     * in the user list make sure we
+     * return NULL and not random memory.
+     */
+    sacct = NULL;
 
     cc = sscanf(p, "%s%u%n", name, &shares, &n);
     if (cc == EOF) {
@@ -662,7 +842,7 @@ pryc:
     return sacct;
 }
 
-static void
+void
 tokenize(char *p)
 {
     int cc;

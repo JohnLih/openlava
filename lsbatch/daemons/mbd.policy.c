@@ -1,6 +1,6 @@
 /*
+ * Copyright (C) 2011-2016 David Bigagli
  * Copyright (C) 2007 Platform Computing Inc
- * Copyright (C) 2011-2015 David Bigagli
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of version 2 of the GNU General Public License as
@@ -208,7 +208,8 @@ static void addReason(struct jData *jp, int hostId, int aReason);
 static int allInOne(struct jData *jp);
 static int ckResReserve(struct hData *,
                         struct resVal *,
-                        int *resource);
+                        int *,
+                        struct jData *);
 
 static int getPeerCand(struct jData *jobp);
 static int getPeerCand1(struct jData *jobp, struct jData *jpbw);
@@ -226,6 +227,15 @@ static int cntUserJobs(struct jData *, struct gData *, struct hData *,
 
 static int candHostOk(struct jData *jp, int indx, int *numAvailSlots,
                       int *hReason);
+static int checkResLimit(struct jData *jp, char*);
+static int checkIfLimitIsOk(struct limitRes *,
+                        limitConsumerType_t,
+                        char *,
+                        limitConsumerType_t,
+                        char *,
+                        struct jData *);
+static int cntConsumerSlots(limitConsumerType_t, char*, char*, int);
+static int cntQSlots(limitConsumerType_t, char*, char*, int);
 static int allocHosts(struct jData *jp);
 static int deallocHosts(struct jData *jp);
 static void jobStarted(struct jData *, struct jobReply *);
@@ -294,13 +304,10 @@ static int notDefaultOrder (struct resVal *);
 static int isQAskedHost (struct hData *, struct jData *);
 static int totalBackfillSlots(LIST_T *);
 static float getNumericLoadValue(struct hData *, int);
-static void  getRawLsbLoad (int, struct candHost *);
 static int handleFirstHost(struct jData *, int, struct candHost * );
 static int needHandleFirstHost(struct jData *);
 static bool_t jobIsReady(struct jData *);
 static bool_t isCandHost (char *, struct jData *);
-void updPreemptResourceByRUNJob(struct jData *);
-void checkAndReserveForPreemptWait(struct jData *);
 int markPreemptForPRHQValues(struct resVal *, int, struct hData **,
                              struct qData *);
 int markPreemptForPRHQInstance(int, float,
@@ -323,6 +330,18 @@ static void groupCands2CandPtr(int, struct groupCandHosts *,
 static void jiter_init(LIST_T *);
 static struct jData *jiter_next_job(LIST_T *);
 static void jiter_fin(LIST_T *);
+static void update_udata_jref(struct jRef *);
+static void empty_udata_jref(struct uData *);
+static void reserve_memory(struct jData *);
+static void free_reserve_memory(struct jData *);
+static void handle_reserve_memory(struct jData *, int);
+static struct jData *jiter_next_job2(LIST_T *);
+static bool_t run_time_ok(struct jData *);
+static bool_t decrease_mem_by_slots(struct jData *);
+static bool_t higher_queue_has_pend_jobs(struct qData *);
+static int get_preempted_slots(struct jData *, struct hData *);
+static bool_t job_res_match_host(struct hData *, struct jData *);
+static bool_t match_host_res(struct hData *, struct resVal *);
 
 static bool_t lsbPtilePack = FALSE;
 
@@ -473,7 +492,7 @@ readyToDisp (struct jData *jpbw, int *numAvailSlots)
         }
         jReason = PEND_QUE_WINDOW_WILL_CLOSE;
     } else if (now_disp < jpbw->shared->jobBill.beginTime) {
-        if (jpbw->jFlags & JFLAG_JOB_PREEMPTED)
+        if (jpbw->jFlags & (JFLAG_RES_PREEMPTED | JFLAG_SLOT_PREEMPTED))
             jReason = PEND_JOB_PREEMPTED;
         else
             jReason = PEND_JOB_START_TIME;
@@ -534,6 +553,9 @@ readyToDisp (struct jData *jpbw, int *numAvailSlots)
         jReason = PEND_JOB_ARRAY_JLIMIT;
     }
 
+    if (! jobgroup_limit_ok(jpbw))
+        jReason = PEND_JGROUP_LIMIT;
+
     if (jReason) {
         jpbw->newReason = jReason;
         jpbw->numReasons = 0;
@@ -547,11 +569,27 @@ readyToDisp (struct jData *jpbw, int *numAvailSlots)
         return FALSE;
     }
 
+    if (! checkResLimit(jpbw, NULL)) {
+        jpbw->newReason = PEND_RES_LIMIT;
+        jpbw->numReasons = 0;
+        FREEUP (jpbw->reasonTb);
+        jpbw->numSlots = 0;
+        *numAvailSlots = 0;
+        if (logclass & (LC_PEND))
+            ls_syslog(LOG_DEBUG2, "\
+%s: Job %s isn't ready for scheduling; newReason=%d", __func__,
+                      lsb_jobid2str(jpbw->jobId), jpbw->newReason);
+        return FALSE;
+    }
+
     jpbw->newReason = 0;
-    jpbw->jFlags &= ~JFLAG_JOB_PREEMPTED;
+    jpbw->jFlags &= ~JFLAG_SLOT_PREEMPTED;
+    jpbw->jFlags &= ~JFLAG_RES_PREEMPTED;
 
     if (logclass & (LC_PEND))
-        ls_syslog(LOG_DEBUG3, "%s: Job %s is ready for dispatch; numSlots=%d numAvailSlots=%d", __func__, lsb_jobid2str(jpbw->jobId), jpbw->numSlots, *numAvailSlots);
+        ls_syslog(LOG_DEBUG3, "\
+%s: Job %s is ready for dispatch; numSlots=%d numAvailSlots=%d", __func__,
+                  lsb_jobid2str(jpbw->jobId), jpbw->numSlots, *numAvailSlots);
 
     INC_CNT(PROF_CNT_numReadyJobsPerSession);
 
@@ -561,43 +599,31 @@ readyToDisp (struct jData *jpbw, int *numAvailSlots)
 int
 getMinGSlots(struct uData *uPtr, struct qData *qPtr, int *numGAvailSlots)
 {
-    static char     fname[] = "getMinGSlots";
-    int             minNumAvailSlots = INFINIT_INT;
-    int             minGUsableSlots = INFINIT_INT;
+    int minNumAvailSlots = INFINIT_INT;
+    int minGUsableSlots = INFINIT_INT;
+    struct userAcct *grpUAcct;
+    int numGUsableSlots;
+    int numGUnUsedSlots;
 
-    FOR_EACH_USER_ANCESTOR_UGRP(uPtr, grp) {
-        struct userAcct      *grpUAcct;
-        int                  numGUsableSlots;
-        int                  numGUnUsedSlots;
-        int                  numGAvailSlots;
+    grpUAcct = getUAcct(qPtr->uAcct, uPtr);
 
-        grpUAcct = getUAcct(qPtr->uAcct, grp);
-        if (grpUAcct == NULL) {
-            ls_syslog(LOG_ERR, _i18n_msg_get(ls_catd , NL_SETN, 7200,
-                                             "%s: expect a non-NULL uAcct for group %s in queue %s, but got a NULL one, please report."), /* catgets 7200 */
-                      fname, grp->user, qPtr->queue);
-            continue;
-        }
+    numGUnUsedSlots = MAX(0, uPtr->maxJobs
+                          - (uPtr->numJobs - uPtr->numPEND));
+    *numGAvailSlots = MIN(grpUAcct->numAvailSUSP + numGUnUsedSlots,
+                          uPtr->maxJobs - (uPtr->numRUN - uPtr->numRESERVE));
+    minNumAvailSlots = MIN(minNumAvailSlots, *numGAvailSlots);
 
-        numGUnUsedSlots = MAX(0, grp->maxJobs
-                              - (grp->numJobs - grp->numPEND));
-        numGAvailSlots = MIN(grpUAcct->numAvailSUSP + numGUnUsedSlots,
-                             grp->maxJobs - (grp->numRUN - grp->numRESERVE));
-        minNumAvailSlots = MIN(minNumAvailSlots, numGAvailSlots);
+    if (uPtr->maxJobs == INFINIT_INT)
+        numGUsableSlots = INFINIT_INT;
+    else {
+        numGUsableSlots = *numGAvailSlots;
+    }
 
-        if (grp->maxJobs == INFINIT_INT)
-            numGUsableSlots = INFINIT_INT;
-        else {
-            numGUsableSlots = numGAvailSlots;
-        }
-
-        minGUsableSlots = MIN(minGUsableSlots, numGUsableSlots);
-
-    } END_FOR_EACH_USER_ANCESTOR_UGRP;
+    minGUsableSlots = MIN(minGUsableSlots, numGUsableSlots);
 
     *numGAvailSlots = minNumAvailSlots;
 
-    return(minGUsableSlots);
+    return minGUsableSlots;
 
 }
 
@@ -936,7 +962,8 @@ getCandHosts (struct jData *jpbw)
 
 
     TIMEVAL(3, nHosts = findBestHosts(jpbw, resValPtr, nHosts, jpbw->numCandPtr,
-                                      jpbw->candPtr, FALSE), tmpVal);
+                                      jpbw->candPtr, false), tmpVal);
+
     timeFindBestHosts += tmpVal;
 
 
@@ -962,10 +989,16 @@ getLsbUsable(void)
     int ldReason;
     struct hData *hPtr;
     int hReason;
+    int num;
+    int num2;
+
+    fin_link(hosts_link);
+    hosts_link = make_link();
 
     INC_CNT(PROF_CNT_getLsbUsable);
-
+    num = num2 = 0;
     nLsbUsable = numReasons = ldReason = 0;
+
     for (hPtr = (struct hData *)hostList->back;
          hPtr != (void *)hostList;
          hPtr = hPtr->back) {
@@ -1001,7 +1034,11 @@ getLsbUsable(void)
             hReason = PEND_HOST_LOCKED;
         else if (LS_ISLOCKEDM(hPtr->limStatus))
             hReason = PEND_HOST_LOCKED_MASTER;
-        else if (hPtr->numJobs >= hPtr->maxJobs) {
+        else if (! has_slot_preemption()
+                 && hPtr->numJobs >= hPtr->maxJobs) {
+            /* Disable this in case preemption is defined.
+             * We will check this later on in getHostJobSlots1()
+             */
             hPtr->hStatus |= HOST_STAT_FULL;
             hReason = PEND_HOST_JOB_LIMIT;
         }
@@ -1009,6 +1046,10 @@ getLsbUsable(void)
         if (!hReason
             && overThreshold(hPtr->lsbLoad, hPtr->loadSched, &ldReason))
             hReason = ldReason;
+
+        if (hReason == PEND_HOST_JOB_LIMIT
+            && has_slot_preemption())
+            hReason = 0;
 
         if (hReason) {
             hReasonTb[1][i] = hReason;
@@ -1025,9 +1066,21 @@ getLsbUsable(void)
         else
             ls_syslog(LOG_DEBUG, "\
 %s: Got one eligible host %s", __func__, hPtr->host);
+        ++num;
+
+        if (mbdParams->enable_proxy_hosts
+            && hReason == 0) {
+            push_link(hosts_link, hPtr);
+            ++num2;
+        }
 
     } /* for (hPtr = hostList->back; ...;...) */
 
+    if (mbdParams->enable_proxy_hosts
+        && (logclass & LC_SCHED)) {
+        ls_syslog(LOG_INFO, "\
+%s: HOST COUNTERS num %d ok proxy %d", __func__, num, num2);
+    }
 
     if (nLsbUsable == 0)
         ls_syslog(LOG_DEBUG, "\
@@ -1197,6 +1250,7 @@ getJUsable(struct jData *jp, int *numJUsable, int *nProc)
     int numBackfillSlots;
     int numNonBackfillSlots;
     int numAvailNonBackfillSlots;
+    linkiter_t iter;
 
     numBackfillSlots
         = numNonBackfillSlots = numAvailNonBackfillSlots = 0;
@@ -1238,39 +1292,72 @@ getJUsable(struct jData *jp, int *numJUsable, int *nProc)
     numHosts = 0;
     numReasons = 0;
 
-    for (hPtr = (struct hData *)hostList->back;
-         hPtr != (void *)hostList;
-         hPtr = hPtr->back) {
+    if (mbdParams->enable_proxy_hosts == 0) {
 
-        i = hPtr->hostId;
-        INC_CNT(PROF_CNT_firstLoopgetJUsable);
+        for (hPtr = (struct hData *)hostList->back;
+             hPtr != (void *)hostList;
+             hPtr = hPtr->back) {
 
-        if (HOST_UNUSABLE_TO_JOB_DUE_TO_H_REASON(hReasonTb[1][i], jp))
-            continue;
+            i = hPtr->hostId;
+            INC_CNT(PROF_CNT_firstLoopgetJUsable);
 
-        if (HOST_UNUSABLE_TO_JOB_DUE_TO_Q_H_REASON(jp->qPtr->reasonTb[1][i], jp))
-            continue;
+            if (HOST_UNUSABLE_TO_JOB_DUE_TO_H_REASON(hReasonTb[1][i], jp))
+                continue;
 
-        if (OUT_SCHED_RS(jp->uPtr->reasonTb[1][i])
-            && HOST_UNUSABLE_TO_JOB_DUE_TO_U_H_REASON(jp->uPtr->reasonTb[1][i], jp))
-            continue;
+            if (HOST_UNUSABLE_TO_JOB_DUE_TO_Q_H_REASON(jp->qPtr->reasonTb[1][i], jp))
+                continue;
 
-        if (hPtr->hStatus & HOST_STAT_REMOTE)
-            continue;
+            if (OUT_SCHED_RS(jp->uPtr->reasonTb[1][i])
+                && HOST_UNUSABLE_TO_JOB_DUE_TO_U_H_REASON(jp->uPtr->reasonTb[1][i], jp))
+                continue;
 
-        if (jp->numAskedPtr == 0 || jp->askedOthPrio >= 0) {
+            if (hPtr->hStatus & HOST_STAT_REMOTE)
+                continue;
+
+            if (jp->numAskedPtr == 0 || jp->askedOthPrio >= 0) {
+                jUsable[numHosts++] = hPtr;
+                continue;
+            }
+
+            if (! isAskedHost (hPtr, jp))
+                continue;
+
             jUsable[numHosts++] = hPtr;
-            continue;
+            if (numHosts == jp->numAskedPtr)
+                break;
+
+        } /* for (hPtr = hostList->back; ...; ...) */
+    }
+
+    if (mbdParams->enable_proxy_hosts) {
+
+        traverse_init(hosts_link, &iter);
+        while ((hPtr = traverse_link(&iter))) {
+
+            i = hPtr->hostId;
+            INC_CNT(PROF_CNT_firstLoopgetJUsableProxy);
+            if (HOST_UNUSABLE_TO_JOB_DUE_TO_H_REASON(hReasonTb[1][i], jp))
+                continue;
+
+            if (HOST_UNUSABLE_TO_JOB_DUE_TO_Q_H_REASON(jp->qPtr->reasonTb[1][i], jp))
+                continue;
+
+            if (OUT_SCHED_RS(jp->uPtr->reasonTb[1][i])
+                && HOST_UNUSABLE_TO_JOB_DUE_TO_U_H_REASON(jp->uPtr->reasonTb[1][i], jp))
+                continue;
+
+            if (jp->numAskedPtr == 0 || jp->askedOthPrio >= 0) {
+                jUsable[numHosts++] = hPtr;
+                continue;
+            }
+
+            if (! isAskedHost(hPtr, jp))
+                continue;
+            jUsable[numHosts++] = hPtr;
+            if (numHosts == jp->numAskedPtr)
+                break;
         }
-
-        if (! isAskedHost (hPtr, jp))
-            continue;
-
-        jUsable[numHosts++] = hPtr;
-        if (numHosts == jp->numAskedPtr)
-            break;
-
-    } /* for (hPtr = hostList->back; ...; ...) */
+    }
 
     if (imposeDCSOnJob(jp, &deadline, &isWinDeadline, &runLimit)) {
         num = numHosts;
@@ -1298,6 +1385,22 @@ getJUsable(struct jData *jp, int *numJUsable, int *nProc)
                 }
                 numHosts++;
             }
+        }
+    }
+
+    num = numHosts;
+    numHosts = 0;
+    for (i = 0; i < num; i++) {
+        if (checkResLimit(jp, jUsable[i]->host)) {
+            if (numHosts != i) {
+                jUsable[numHosts] = jUsable[i];
+            }
+            numHosts++;
+        } else {
+            jUnusable[numReasons] = jUsable[i];
+            jReasonTb[numReasons++] = PEND_RES_LIMIT;
+            if (logclass & (LC_SCHED | LC_PEND))
+                ls_syslog(LOG_DEBUG2, "%s: Host %s isn't eligible; reason=%d", fname, jUsable[i]->host, jReasonTb[numReasons-1]);
         }
     }
 
@@ -1405,10 +1508,16 @@ getJUsable(struct jData *jp, int *numJUsable, int *nProc)
     *numJUsable = 0;
     *nProc = 0;
     for (i = 0; i < numHosts; i++) {
-
         INC_CNT(PROF_CNT_innerLoopgetJUsable);
         hReason = 0;
         numSlots = 0;
+
+        if (!hReason
+            && daemonParams[MBD_DEDICATED_RESOURCES].paramValue) {
+            if (! job_res_match_host(jUsable[i], jp)) {
+                hReason = PEND_HOST_RES_REQ;
+            }
+        }
 
         if (!hReason && (jp->shared->jobBill.options & SUB_EXCLUSIVE)
             && jUsable[i]->numJobs >= 1) {
@@ -1446,7 +1555,8 @@ getJUsable(struct jData *jp, int *numJUsable, int *nProc)
             int resource;
             int num = ckResReserve(jUsable[i],
                                    jp->shared->resValPtr,
-                                   &resource);
+                                   &resource,
+                                   jp);
             if (num < 1) {
                 hReason = resource + PEND_HOST_JOB_RUSAGE;
             }
@@ -1456,7 +1566,8 @@ getJUsable(struct jData *jp, int *numJUsable, int *nProc)
             int resource;
             int num = ckResReserve(jUsable[i],
                                    jp->qPtr->resValPtr,
-                                   &resource);
+                                   &resource,
+                                   jp);
             if (num < 1) {
                 hReason = resource + PEND_HOST_QUE_RUSAGE;
             }
@@ -1522,14 +1633,26 @@ getJUsable(struct jData *jp, int *numJUsable, int *nProc)
             jUnusable[numReasons] = jUsable[i];
             jReasonTb[numReasons++] = hReason;
 
+	    ls_syslog(LOG_INFO, "\
+%s: job %s host %s isn't eligible; reason = %d", fname,
+		      lsb_jobid2str(jp->jobId),
+		      jUsable[i]->host,
+		      jReasonTb[numReasons-1]);
+
             if (logclass & (LC_SCHED | LC_PEND))
                 ls_syslog(LOG_DEBUG2, "%s: Host %s isn't eligible; reason = %d", fname, jUsable[i]->host, jReasonTb[numReasons-1]);
             continue;
         }
 
-        if (logclass & (LC_SCHED))
-            ls_syslog(LOG_DEBUG3, "%s: Got one eligible host %s; numSlots=%d numAvailSlots=%d", fname, jUsable[i]->host, numSlots, numAvailSlots);
+	ls_syslog(LOG_INFO, "\
+%s: job %s got one eligible host %s; numSlots=%d numAvailSlots=%d", fname,
+		  lsb_jobid2str(jp->jobId), jUsable[i]->host,
+		  numSlots, numAvailSlots);
 
+        if (logclass & (LC_SCHED))
+            ls_syslog(LOG_INFO, "\
+%s: Got one eligible host %s; numSlots=%d numAvailSlots=%d",
+                      fname, jUsable[i]->host, numSlots, numAvailSlots);
 
         numAvailSlots = MIN(numAvailSlots, numSlots);
         candHosts[*numJUsable].hData = jUsable[i];
@@ -1547,8 +1670,11 @@ getJUsable(struct jData *jp, int *numJUsable, int *nProc)
             *nProc += numSlots;
         else
             *nProc = jUsable[i]->numCPUs;
-    }
 
+        if (mbdParams->max_num_candidates > 0
+            && *numJUsable >= mbdParams->max_num_candidates)
+            break;
+    }
 
     if (numReasons) {
         int *reasonTb = my_calloc(numReasons + jp->numReasons,
@@ -1565,17 +1691,20 @@ getJUsable(struct jData *jp, int *numJUsable, int *nProc)
         }
         jp->numReasons += numReasons;
         FREEUP(jp->reasonTb);
+        /* Here we copy the reasons why some hosts
+         * cannot be used by this job. Each job will
+         * has its own reason table.
+         */
         jp->reasonTb = reasonTb;
+
     }
 
     if (*numJUsable == 0) {
-        if (logclass & (LC_SCHED | LC_PEND))
-            ls_syslog(LOG_DEBUG1, "%s: Got no eligible host for job %s; numReasons=%d", fname, lsb_jobid2str(jp->jobId), jp->numReasons);
+        if (logclass & (LC_SCHED | LC_TRACE))
+            ls_syslog(LOG_INFO, "\
+%s: Got no eligible host for job %s; numReasons=%d",
+                      fname, lsb_jobid2str(jp->jobId), jp->numReasons);
         return NULL;
-    }
-
-    if (logclass & LC_SCHED) {
-        ls_syslog(LOG_DEBUG2, "%s: Got %d eligible hosts for job %s; numReasons=%d", fname, *numJUsable, lsb_jobid2str(jp->jobId), jp->numReasons);
     }
 
     return candHosts;
@@ -1603,7 +1732,8 @@ allInOne(struct jData *jp)
 static int
 ckResReserve(struct hData *hPtr,
              struct resVal *resValPtr,
-             int *resource)
+             int *resource,
+             struct jData *jPtr)
 {
     int cc;
     int is_set;
@@ -1613,6 +1743,10 @@ ckResReserve(struct hData *hPtr,
     linkiter_t iter;
     struct _rusage_ *r;
     bool_t state;
+    link_t *L;
+    int len;
+    struct name_list *nl;
+    struct resVal r2;
 
     can_use = hPtr->numCPUs;
 
@@ -1627,33 +1761,44 @@ ckResReserve(struct hData *hPtr,
     if (rusage == 0)
         return hPtr->numCPUs;
 
+    _free_(jPtr->run_rusage);
+    L = make_link();
+    len = 0;
     traverse_init(resValPtr->rl, &iter);
     while ((r = traverse_link(&iter))) {
 
-        resValPtr->rusage_bit_map = r->bitmap;
-        resValPtr->val = r->val;
+        r2.rusage_bit_map = r->bitmap;
+        r2.val = r->val;
 
         /* state = ok
          */
         state = 1;
         for (cc = 0; cc < allLsInfo->nRes; cc++) {
+            float x;
 
             if (NOT_NUMERIC(allLsInfo->resTable[cc]))
                 continue;
 
-            TEST_BIT(cc, resValPtr->rusage_bit_map, is_set);
+            TEST_BIT(cc, r2.rusage_bit_map, is_set);
             if (is_set == 0)
                 continue;
 
             *resource = cc;
 
-            if (resValPtr->val[cc] >= INFINIT_LOAD
-                || resValPtr->val[cc] < 0.01)
+            if (r2.val[cc] >= INFINIT_LOAD
+                || r2.val[cc] < 0.01)
                 continue;
 
             /* Built in resource
              */
             if (cc < allLsInfo->numIndx) {
+
+                x = r2.val[cc];
+
+                if (cc == MEM
+                    && decrease_mem_by_slots(jPtr)) {
+                    x = r2.val[cc]/jPtr->shared->jobBill.numProcessors;
+                }
 
                 if (fabs(hPtr->lsfLoad[cc] - INFINIT_LOAD) < 0.001 * INFINIT_LOAD) {
                     /* state = !ok
@@ -1666,32 +1811,32 @@ ckResReserve(struct hData *hPtr,
 
                     if (hPtr->loadStop[cc] < INFINIT_LOAD) {
                         use_val = (int)((hPtr->loadStop[cc]
-                                         - hPtr->lsfLoad[cc])/ resValPtr->val[cc]);
-                        if (use_val < 0) {
+                                         - hPtr->lsfLoad[cc])/x);
+                        if (use_val <= 0) {
                             /* state = !ok
                              */
                             state = 0;
                             break;
                         }
                     }
+
                 } else {
 
                     if (hPtr->loadStop[cc] >= INFINIT_LOAD
                         || hPtr->loadStop[cc] <= -INFINIT_LOAD)
-                        use_val = (int)(hPtr->lsbLoad[cc]/ resValPtr->val[cc]);
-                    else {
+                        use_val = (int)(hPtr->lsbLoad[cc]/x);
+                    else
                         use_val = (int)((hPtr->lsbLoad[cc]
-                                         - hPtr->loadStop[cc])/resValPtr->val[cc]);
-                        if (use_val < 0) {
-                            /* state = !ok
-                             */
-                            state = 0;
-                            break;
-                        }
+                                         - hPtr->loadStop[cc])/x);
+                    if (use_val <= 0) {
+                        /* state = !ok
+                         */
+                        state = 0;
+                        break;
                     }
                 }
                 if (cc == MEM
-                    && (((int)(hPtr->leftRusageMem/resValPtr->val[MEM])) == 0)){
+                    && (((int)(hPtr->leftRusageMem/x)) == 0)){
                     state = 0;
                     break;
                 }
@@ -1709,7 +1854,7 @@ ckResReserve(struct hData *hPtr,
                     break;
                 }
 
-                if (value < resValPtr->val[cc]
+                if (value < r2.val[cc]
                     && allLsInfo->resTable[cc].orderType != INCR) {
                     state = 0;
                     break;
@@ -1717,14 +1862,45 @@ ckResReserve(struct hData *hPtr,
 
                 use_val = hPtr->numCPUs;
             }
+            /* Save the resources used to dispatch
+             * the job.
+             */
+            nl = calloc(1, sizeof(struct name_list));
+            nl->name = allLsInfo->resTable[cc].name;
+            nl->value = r2.val[cc];
+            push_link(L, nl);
+            len = len + strlen(nl->name) + 16;
+
         } /* for (cc = 0; cc < allLsInfo->nres; cc ++) */
 
         /* All requested rusage are in state ok
          */
-        if (state == 1)
+        if (state == 1) {
+            len = len + strlen("LSB_EFFECTIVE_RUSAGE=");
+            jPtr->run_rusage = calloc(len, sizeof(char));
+            sprintf(jPtr->run_rusage, "LSB_EFFECTIVE_RUSAGE=\"");
+            while ((nl = pop_link(L))) {
+                sprintf(jPtr->run_rusage + strlen(jPtr->run_rusage),
+                        "%s=%d ", nl->name, nl->value);
+                _free_(nl);
+            }
+            sprintf(jPtr->run_rusage + strlen(jPtr->run_rusage) - 1, "\"");
+            fin_link(L);
             return hPtr->numCPUs;
+        } else {
+            /* Free the job half done
+             */
+            while ((nl = pop_link(L)))
+                _free_(nl);
+            _free_(jPtr->run_rusage);
+            len = 0;
+        }
 
-    } /* while (all rusage blocks */
+    } /* while (all rusage blocks) */
+
+    while ((nl = pop_link(L)))
+        _free_(nl);
+    fin_link(L);
 
     return 0;
 }
@@ -1763,6 +1939,9 @@ getPeerCand(struct jData *jobp)
     int numJobs = 0;
     int jobDCS, peerDCS, isWinDeadline, jobRunLimit, peerRunLimit;
     time_t jobDeadline, peerDeadline;
+
+    if (mbdParams->disable_peer_jobs)
+        return false;
 
     jobp->usePeerCand = FALSE;
 
@@ -2351,8 +2530,8 @@ getHostJobSlots (struct jData *jp, struct hData *hp, int *numAvailSlots,
 }
 
 static int
-getHostJobSlots1 (int numNeeded, struct jData *jp, struct hData *hp,
-                  int *numAvailSlots, int noHULimits)
+getHostJobSlots1(int numNeeded, struct jData *jp, struct hData *hp,
+                 int *numAvailSlots, int noHULimits)
 {
     static char fname[] = "getHostJobSlots1";
     struct qData *qp = jp->qPtr;
@@ -2366,7 +2545,6 @@ getHostJobSlots1 (int numNeeded, struct jData *jp, struct hData *hp,
 
     INC_CNT(PROF_CNT_getHostJobSlots1);
 
-
     if (hp->maxJobs == INFINIT_INT) {
         numSlots = INFINIT_INT;
         *numAvailSlots = INFINIT_INT;
@@ -2376,26 +2554,47 @@ getHostJobSlots1 (int numNeeded, struct jData *jp, struct hData *hp,
 
             int numUnUsedSlots = MAX(0, hp->maxJobs - hp->numJobs);
 
+
             *numAvailSlots = MIN(hp->maxJobs - hp->numRUN - hp->numRESERVE,
                                  hAcct->numAvailSUSP + numUnUsedSlots);
 
             *numAvailSlots = MAX(0, *numAvailSlots);
             numSlots = *numAvailSlots;
+
+            ls_syslog(LOG_INFO, "\
+%s: job %s hAcct %s numslots %d", __func__,
+                      lsb_jobid2str(jp->jobId), hp->host, numSlots);
+
         } else {
             numSlots = hp->maxJobs - hp->numJobs;
             *numAvailSlots = numSlots;
+            ls_syslog(LOG_INFO, "\
+%s: job %s host %s numslots %d", __func__,
+                      lsb_jobid2str(jp->jobId), hp->host, numSlots);
         }
 
         *numAvailSlots = MAX(0, *numAvailSlots);
         numSlots = MAX(0, numSlots);
 
+
         if (numNeeded > numSlots) {
-            jp->newReason = PEND_HOST_JOB_LIMIT;
-            if (logclass & (LC_JLIMIT))
-                ls_syslog(LOG_DEBUG2, "%s: rs=%d job=%s host=%s maxJobs=%d numJobs=%d", fname, jp->newReason, lsb_jobid2str(jp->jobId), hp->host, hp->maxJobs, hp->numJobs);
-            *numAvailSlots = 0;
-            return 0;
+
+            if (LINK_NUM_ENTRIES(jp->preempted_hosts) > 0) {
+
+                numSlots= *numAvailSlots = get_preempted_slots(jp, hp);
+
+            } else {
+
+                jp->newReason = PEND_HOST_JOB_LIMIT;
+                if (logclass & (LC_JLIMIT))
+                    ls_syslog(LOG_DEBUG2, "\
+%s: rs=%d job=%s host=%s maxJobs=%d numJobs=%d", fname, jp->newReason,
+                          lsb_jobid2str(jp->jobId), hp->host, hp->maxJobs, hp->numJobs);
+                *numAvailSlots = 0;
+                return 0;
+            }
         }
+
         if (jp->numCandPtr == 1
             && *numAvailSlots < jp->shared->jobBill.numProcessors) {
             if (hReasonTb[1][hp->hostId] == 0) {
@@ -2404,18 +2603,15 @@ getHostJobSlots1 (int numNeeded, struct jData *jp, struct hData *hp,
         }
     }
 
-
     if (noHULimits)
         return (numSlots);
 
-
     numSlots1 = ckPerHULimits(qp, hp, up, &numAvailSlots1, &jp->newReason);
-
 
     numSlots = MIN(numSlots, numSlots1);
     *numAvailSlots = MIN(*numAvailSlots, numAvailSlots1);
-    return (numSlots);
 
+    return numSlots;
 }
 
 int
@@ -2753,6 +2949,457 @@ hostSlots (int numNeeded, struct jData *jp, struct hData *hp,
 }
 
 static int
+checkResLimit(struct jData *jp, char* hostname)
+{
+    int i, j;
+    char *queue = NULL;
+    char *save_queue = NULL;
+    int  per_queue = FALSE;
+    char *project = NULL;
+    char *save_project = NULL;
+    char *user = NULL;
+    char *save_user =NULL;
+    char *user_def = NULL;
+    char *save_user_def = NULL;
+    char *host = NULL;
+    char *save_host = NULL;
+    int  per_host = FALSE;
+    char *word = NULL;
+    int hasMe = FALSE;
+    char all[5] = "all";
+    int hasAll = FALSE;
+    int neg = FALSE;
+    int ret;
+    static struct limitRes *lr;
+
+    if (limitConf == NULL || limitConf->nLimit == 0)
+        return TRUE;
+
+    for (i = 0; i < limitConf->nLimit; i++) {
+        /* no consumer defined, ignore */
+        if (limitConf->limits[i].nConsumer <= 0)
+            continue;
+
+        per_queue = per_host = FALSE;
+        for (j = 0; j < limitConf->limits[i].nConsumer; j++) {
+            if (limitConf->limits[i].consumers[j].consumer == LIMIT_CONSUMER_QUEUES
+                    || limitConf->limits[i].consumers[j].consumer == LIMIT_CONSUMER_PER_QUEUE) {
+                per_queue = limitConf->limits[i].consumers[j].consumer == LIMIT_CONSUMER_QUEUES ? FALSE : TRUE;
+                queue = strdup(limitConf->limits[i].consumers[j].value);
+                save_queue = queue;
+            }else if (limitConf->limits[i].consumers[j].consumer == LIMIT_CONSUMER_PROJECTS
+                          || limitConf->limits[i].consumers[j].consumer == LIMIT_CONSUMER_PER_PROJECT) {
+                project = strdup(limitConf->limits[i].consumers[j].value);
+                save_project = project;
+            } else if (limitConf->limits[i].consumers[j].consumer == LIMIT_CONSUMER_HOSTS
+                            || limitConf->limits[i].consumers[j].consumer == LIMIT_CONSUMER_PER_HOST) {
+                per_host = limitConf->limits[i].consumers[j].consumer == LIMIT_CONSUMER_HOSTS ? FALSE : TRUE;
+                host = strdup(limitConf->limits[i].consumers[j].value);
+                save_host = host;
+            } else if (limitConf->limits[i].consumers[j].consumer == LIMIT_CONSUMER_USERS
+                            || limitConf->limits[i].consumers[j].consumer == LIMIT_CONSUMER_PER_USER) {
+                user = strdup(limitConf->limits[i].consumers[j].value);
+                save_user = user;
+                user_def = strdup(limitConf->limits[i].consumers[j].def);
+                save_user_def = user_def;
+            }
+        }
+
+        /* checking hostname but HOSTS is not defined in limit, ignore */
+        if ((hostname && !host)
+            || (!hostname && host))
+            goto clean4next;
+
+        /* enforce limit only if job is submitted to this particular queue */
+        if (queue) {
+            hasMe = FALSE;
+            while ( ( word = getNextWord_ ( &queue) ) != NULL ) {
+                if (strcasecmp(word, jp->qPtr->queue) == 0) {
+                    hasMe = TRUE;
+                    break;
+                }
+            }
+            if (!hasMe)
+                goto clean4next;
+        }
+
+        /* enforce limit only if scheduler is evaluating particular hosts */
+        if (host) {
+            hasMe = FALSE;
+            while (( word = getNextWord_(&host)) != NULL ) {
+                if (strcasecmp(word, hostname) == 0) {
+                    hasMe = TRUE;
+                    break;
+                }
+            }
+            if (!hasMe)
+                goto clean4next;
+
+            if (per_host) {
+                if (!jp->hqPtr
+                    || strcmp(hostname, jp->hqPtr->host))
+                    jp->hqPtr = getLimitUsageData(LIMIT_CONSUMER_PER_HOST,
+                                                  hostname,
+                                                  jp->qPtr->queue);
+
+                lr = getActiveLimit(limitConf->limits[i].res, limitConf->limits[i].nRes);
+                if (lr) {
+                    jp->hqPtr->maxSlots = jp->hqPtr->maxJobs = (int) lr->value;
+                    ret = checkIfLimitIsOk(lr,
+                                       LIMIT_CONSUMER_PER_HOST,
+                                       hostname,
+                                       per_queue,
+                                       save_queue,
+                                       jp);
+                    if (!ret) {
+                        FREEUP(save_queue);
+                        FREEUP(save_project);
+                        FREEUP(save_host);
+                        FREEUP(save_user);
+                        FREEUP(save_user_def);
+                        return FALSE;
+                    }
+                }
+            }
+        }
+
+        /* check if user is allowed to use the queue/host */
+        if (user) {
+            hasMe = FALSE;
+            while ((word = getNextWord_(&user)) != NULL ) {
+                if (strcasecmp(word, jp->userName) == 0) {
+                    hasMe = TRUE;
+                    break;
+                }
+            }
+
+            if (hasMe) {
+                lr = getActiveLimit(limitConf->limits[i].res, limitConf->limits[i].nRes);
+                if (lr) {
+                    jp->uqPtr->maxSlots = jp->uqPtr->maxJobs = (int) lr->value;
+                    if (lr->res == LIMIT_RESOURCE_SLOTS)
+                        jp->uqPtr->maxSlots = (int) lr->value;
+                    else
+                        jp->uqPtr->maxJobs = (int) lr->value;
+
+                    ret = checkIfLimitIsOk(lr,
+                                       LIMIT_CONSUMER_PER_USER,
+                                       jp->userName,
+                                       per_queue,
+                                       save_queue,
+                                       jp);
+                    if (!ret) {
+                        FREEUP(save_queue);
+                        FREEUP(save_project);
+                        FREEUP(save_host);
+                        FREEUP(save_user);
+                        FREEUP(save_user_def);
+                        return FALSE;
+                    }
+                }
+            } else {
+                /* check unix user */
+                char *word2 = NULL;
+                if (strstr(user_def, all) == user_def)
+                    hasAll = TRUE;
+                while ((word2 = getNextWord_(&user_def)) != NULL) {
+                    if (word2[0] == '~') {
+                        neg = TRUE;
+                        word2++;
+                    }
+                    if (strcasecmp(word2, jp->userName) == 0) {
+                        hasMe = TRUE;
+                        break;
+                    } else {
+                        /* check LSF or UNIX user group */
+                        struct gData *gp = NULL;
+
+                        gp = getUGrpData(word2);
+                        if (gp) {
+                            char  **gUsers = NULL;
+                            int   numUsers = 0;
+                            int   i;
+
+                            gUsers = expandGrp(gp, word2, &numUsers);
+                            for (i = 0; i < numUsers; i++) {
+                                if (strcasecmp(gUsers[i], jp->userName) == 0) {
+                                    hasMe = TRUE;
+                                    break;
+                                }
+                            }
+                            FREEUP(gUsers);
+                            if (hasMe)
+                                break;
+                        }
+                    }
+                    neg = FALSE;
+                }
+
+                if ((!hasAll && hasMe)
+                        || (hasAll && hasMe && !neg)
+                        || (hasAll && !hasMe)) {
+                    lr = getActiveLimit(limitConf->limits[i].res, limitConf->limits[i].nRes);
+                    if (lr) {
+                        if (lr->res == LIMIT_RESOURCE_SLOTS)
+                            jp->uqPtr->maxSlots = (int) lr->value;
+                        else
+                            jp->uqPtr->maxJobs = (int) lr->value;
+
+                        ret = checkIfLimitIsOk(lr,
+                                           LIMIT_CONSUMER_PER_USER,
+                                           jp->userName,
+                                           per_queue,
+                                           save_queue,
+                                           jp);
+                        if (!ret) {
+                            FREEUP(save_queue);
+                            FREEUP(save_project);
+                            FREEUP(save_host);
+                            FREEUP(save_user);
+                            FREEUP(save_user_def);
+                            return FALSE;
+                        }
+                    }
+                } else {
+                    goto clean4next;
+                }
+            }
+        }
+
+        /* check if project is allowed to use the queue/host */
+        if (project) {
+            hasMe = FALSE;
+            neg = FALSE;
+            hasAll = FALSE;
+
+            if (strstr(project, all) == project)
+                hasAll = TRUE;
+
+            while ((word = getNextWord_( &project)) != NULL) {
+                if (word[0] == '~') {
+                    neg = TRUE;
+                    word++;
+                }
+                if (strcasecmp(word, jp->shared->jobBill.projectName) == 0) {
+                    hasMe = TRUE;
+                    break;
+                }
+                neg = FALSE;
+            }
+
+             if ((!hasAll && hasMe)
+                    || (hasAll && hasMe && !neg)
+                    || (hasAll && !hasMe)) {
+                lr = getActiveLimit(limitConf->limits[i].res, limitConf->limits[i].nRes);
+                if (lr) {
+                    if (lr->res == LIMIT_RESOURCE_SLOTS)
+                        jp->pqPtr->maxSlots = (int) lr->value;
+                    else
+                        jp->pqPtr->maxJobs = (int) lr->value;
+
+                    ret = checkIfLimitIsOk(lr,
+                                       LIMIT_CONSUMER_PER_PROJECT,
+                                       jp->shared->jobBill.projectName,
+                                       per_queue,
+                                       save_queue,
+                                       jp);
+                    if (!ret) {
+                        FREEUP(save_queue);
+                        FREEUP(save_project);
+                        FREEUP(save_host);
+                        FREEUP(save_user);
+                        FREEUP(save_user_def);
+                        return FALSE;
+                    }
+                }
+            }else  {
+                goto clean4next;
+            }
+        }
+
+    clean4next:
+        FREEUP(save_queue);
+        FREEUP(save_project);
+        FREEUP(save_host);
+        FREEUP(save_user);
+        FREEUP(save_user_def);
+        queue = NULL;
+        project = NULL;
+        host = NULL;
+        user = NULL;
+        user_def = NULL;
+        hasMe = FALSE;
+        hasAll = FALSE;
+        neg = FALSE;
+    }
+
+    return TRUE;
+}
+
+/*
+ * Only support:
+ * i) per user on queues job/slot limit
+ * ii) per project on queues job/slot limit
+ * iii) per host on queues job/slot limit
+ *
+ * ctype is first level consumer: user/project/host
+ * qtype is second level consumer: per_queue/queues
+ */
+static int
+checkIfLimitIsOk(struct limitRes *limit,
+                        limitConsumerType_t ctype,
+                        char *consumer,
+                        limitConsumerType_t qtype,
+                        char *queuelist,
+                        struct jData *jp)
+{
+    struct resData  *rPtr = NULL;
+    int    used = 0;
+    int    free = 0;
+    int    max = limit->value;
+
+    if (ctype == LIMIT_CONSUMER_PROJECTS
+            || ctype == LIMIT_CONSUMER_PER_PROJECT)
+        rPtr = jp->pqPtr;
+    else if (ctype == LIMIT_CONSUMER_USERS
+                || ctype ==LIMIT_CONSUMER_PER_USER)
+        rPtr = jp->uqPtr;
+    else
+        rPtr = jp->hqPtr;
+
+    if (limit->res == LIMIT_RESOURCE_SLOTS) {
+        if (qtype == LIMIT_CONSUMER_PER_QUEUE)
+            used = rPtr->numRUNSlots
+                   + rPtr->numSSUSPSlots
+                   + rPtr->numUSUSPSlots
+                   + rPtr->numRESERVESlots;
+        else
+            used += cntConsumerSlots(ctype,
+                                     consumer,
+                                     queuelist,
+                                     TRUE);
+        free = max
+               - used
+               - jp->shared->jobBill.numProcessors;
+    } else {
+        if (qtype == LIMIT_CONSUMER_PER_QUEUE)
+            used = rPtr->numRUNJobs
+                   + rPtr->numSSUSPSlots
+                   + rPtr->numUSUSPSlots
+                   + rPtr->numRESERVESlots;
+        else
+            used += cntConsumerSlots(ctype,
+                                     consumer,
+                                     queuelist,
+                                     FALSE);
+        free = max - used - 1;
+    }
+
+    if (free < 0)
+        return FALSE;
+    else
+        return TRUE;
+}
+
+struct limitRes *
+getActiveLimit(struct limitRes *limits, int num)
+{
+    struct dayhour dayhour;
+    windows_t *wp;
+    char windOpen;
+    int i;
+
+    for (i = 0; i < num; i++) {
+        if (limits[i].windows == NULL || !strcmp(limits[i].windows, ""))
+            return &limits[i];
+
+        getDayHour(&dayhour, now);
+        if (limits[i].week[dayhour.day] == NULL)
+            continue;
+
+        limits[i].windEdge = now + (24.0 - dayhour.hour) * 3600.0;
+        windOpen = FALSE;
+
+        for (wp = limits[i].week[dayhour.day]; wp != NULL; wp = wp->nextwind) {
+            checkWindow(&dayhour, &windOpen, &limits[i].windEdge, wp, now);
+            if (windOpen)
+                return &limits[i];
+        }
+    }
+
+    return NULL;
+}
+
+/*
+ * Count used slots/jobs of project on a list of queues.
+ */
+static int
+cntConsumerSlots(limitConsumerType_t type,
+                       char* consumer,
+                       char* queuelist,
+                       int slot)
+{
+    char    *queue;
+    char    *save_queue;
+    char    *word;
+    int     used = 0;
+    struct qData *qp;
+
+    if (!consumer)
+        return 0;
+
+    if (queuelist != NULL) {
+        queue = strdup(queuelist);
+        save_queue = queue;
+        while ((word = getNextWord_ (&queue)) != NULL) {
+            used += cntQSlots(type, consumer, word, slot);
+        }
+        FREEUP(save_queue);
+    } else {
+        /* queue not defiend in limit means all queues. */
+        for (qp = qDataList->forw; qp != qDataList; qp = qp->forw) {
+            used += cntQSlots(type, consumer, qp->queue, slot);
+        }
+    }
+
+    return used;
+}
+
+/*
+ * Count consumer used slots/jobs on a queue.
+ * The number of running and suspended (RUN, SSUSP, USUSP) slots/jobs.
+ */
+static int
+cntQSlots(limitConsumerType_t type,
+              char* consumer,
+              char* queue,
+              int slot)
+{
+    struct  resData *rPtr;
+    int     used;
+
+    if (!consumer || !queue)
+        return 0;
+
+    rPtr = getLimitUsageData(type,
+                             consumer,
+                             queue);
+
+    if (slot)
+        used = rPtr->numRUNSlots
+             + rPtr->numSSUSPSlots
+             + rPtr->numUSUSPSlots
+             + rPtr->numRESERVESlots;
+    else
+        used = rPtr->numRUNJobs
+             + rPtr->numSSUSPJobs
+             + rPtr->numUSUSPJobs
+             + rPtr->numRESERVEJobs;
+
+    return used;
+}
+
+static int
 candHostOk (struct jData *jp, int indx, int *numAvailSlots,
             int *hReason)
 {
@@ -2826,7 +3473,8 @@ candHostOk (struct jData *jp, int indx, int *numAvailSlots,
         int resource;
         int num = ckResReserve(hp->hData,
                                jp->qPtr->resValPtr,
-                               &resource);
+                               &resource,
+                               jp);
         if (num < 1) {
             rtReason = resource + PEND_HOST_QUE_RUSAGE;
         } else {
@@ -2840,7 +3488,8 @@ candHostOk (struct jData *jp, int indx, int *numAvailSlots,
         int resource;
         int num = ckResReserve(hp->hData,
                                jp->shared->resValPtr,
-                               &resource);
+                               &resource,
+                               jp);
         if (num < 1) {
             rtReason = resource + PEND_HOST_JOB_RUSAGE;
         } else  {
@@ -2936,24 +3585,20 @@ moveHostPos (struct candHost *candH, int source, int target)
 static int
 allocHosts (struct jData *jp)
 {
-    static char         fname[] = "allocHosts";
-    struct hData        **hPtr;
-    int                 i,
-        j,
-        numh;
+    struct hData **hPtr;
+    int i;
+    int j;
+    int numh;
 
     if (jp->numEligProc <= 0)
         return -1;
 
-    hPtr = (struct hData **) my_calloc (jp->numEligProc,
-                                        sizeof(struct hData *), fname);
-
+    hPtr =  my_calloc(jp->numEligProc, sizeof(struct hData *), __func__);
 
     numh = 0;
     for (i = 0; i < jp->numExecCandPtr; i++) {
-        INC_CNT(PROF_CNT_firstloopallocHosts);
+
         for (j = 0; j < jp->execCandPtr[i].numSlots; j++) {
-            INC_CNT(PROF_CNT_secondloopallocHosts);
 
             if (jp->execCandPtr[i].numSlots <= 0)
                 continue;
@@ -2964,16 +3609,18 @@ allocHosts (struct jData *jp)
     }
 
     if (numh != jp->numEligProc) {
-        ls_syslog(LOG_ERR, _i18n_msg_get(ls_catd , NL_SETN, 7220,
-                                         "%s: numh <%d> jp->numEligProc <%d> are not equal"), /* catgets 7220 */
-                  fname, numh, jp->numEligProc);
+        ls_syslog(LOG_ERR, "\
+%s: numh <%d> jp->numEligProc <%d> are not equal",
+                  __func__, numh, jp->numEligProc);
     }
 
     jp->hPtr = hPtr;
     jp->numHostPtr = numh;
 
     if (logclass & LC_SCHED) {
-        ls_syslog(LOG_DEBUG2, "%s: Allocated %d host/processors to job %s", fname, numh, lsb_jobid2str(jp->jobId));
+        ls_syslog(LOG_DEBUG2, "\
+%s: Allocated %d host/processors to job %s", __func__, numh,
+                  lsb_jobid2str(jp->jobId));
     }
 
     return 0;
@@ -2981,25 +3628,24 @@ allocHosts (struct jData *jp)
 }
 
 static int
-deallocHosts (struct jData *jp)
+deallocHosts(struct jData *jp)
 {
     int i;
 
-    for (i = 0; i < jp->numHostPtr; i++) {
-        INC_CNT(PROF_CNT_loopdeallocHosts);
+    free_reserve_memory(jp);
+
+    for (i = 0; i < jp->numHostPtr; i++)
         jp->hPtr[i]->numDispJobs--;
-    }
 
-    FREEUP (jp->hPtr);
+    FREEUP(jp->hPtr);
     jp->numHostPtr = 0;
-    return 0;
 
+    return 0;
 }
 
 bool_t
 dispatch_it (struct jData *jp)
 {
-    static char fname[] = "dispatch_it";
     sbdReplyType reply;
     struct jobReply jobReply;
     struct jData   *jpbw, *jptr;
@@ -3016,6 +3662,7 @@ dispatch_it (struct jData *jp)
     jp->dispTime = now_disp;
 
     TIMEIT (2, (reply = start_job(jp, jp->qPtr, &jobReply)), "start_job");
+    INC_CNT(PROF_CNT_dispatchJob);
 
     jptr = jp;
     i = 1;
@@ -3027,17 +3674,14 @@ dispatch_it (struct jData *jp)
             case ERR_NO_ERROR:
                 jobStarted (jptr, &jobReply);
                 jptr->newReason = 0;
-
                 continue;
 
             case ERR_NULL:
-
                 jobSig.sigValue = 0;
                 jobSig.actFlags  = 0;
                 jobSig.chkPeriod = 0;
                 jobSig.actCmd = "";
                 reply = signal_job (jptr, &jobSig, &jobReply);
-
                 switch (reply) {
                     case ERR_NO_ERROR:
                         jobStarted (jptr, &jobReply);
@@ -3045,23 +3689,20 @@ dispatch_it (struct jData *jp)
                         continue;
                     case ERR_NO_JOB:
                         jptr->newReason = PEND_JOB_START_FAIL;
-                        ls_syslog(LOG_ERR, _i18n_msg_get(ls_catd , NL_SETN, 7221,
-                                                         "%s: Failed to start job <%s> on host <%s>"), /* catgets 7221 */
-                                  fname,
+                        ls_syslog(LOG_ERR, "\
+%s: Failed to start job %s on host %s", __func__,
                                   lsb_jobid2str(jptr->jobId),
                                   jptr->hPtr[0]->host);
                         return FALSE;
                     default:
                         jptr->newReason = PEND_JOB_START_UNKNWN;
-                        ls_syslog(LOG_ERR, _i18n_msg_get(ls_catd , NL_SETN, 7222,
-                                                         "%s: mbatchd does not know job <%s> is started or not on host <%s> (reply=%d) - assuming job not started"), /* catgets 7222 */
-                                  fname,
-                                  lsb_jobid2str(jptr->jobId),
+                        ls_syslog(LOG_ERR, "\
+%s: mbatchd does not know job %s is started or not on host <%s> (reply=%d) \
+assuming job not started", __func__, lsb_jobid2str(jptr->jobId),
                                   jptr->hPtr[0]->host,
                                   reply);
                         return FALSE;
                 }
-
             default:
                 jobStartError(jptr, reply);
                 return FALSE;
@@ -3507,8 +4148,9 @@ findBestHosts (struct jData *jp, struct resVal *resValPtr, int needed,
         ls_syslog(LOG_DEBUG,"%s: the value of needed is %d", fname, needed);
         ls_syslog(LOG_DEBUG,"%s: the value of ncandidates is %d", fname, ncandidates );
     }
+
     for (i = resVal->nphase - 1; i >= 0; i--) {
-        if( i == 0)
+        if ( i == 0)
             last = TRUE;
         if (abs (resVal->order[i]) - 1 < NBUILTINDEX)
             threshold = bThresholds[abs(resVal->order[i]) - 1];
@@ -3518,8 +4160,6 @@ findBestHosts (struct jData *jp, struct resVal *resValPtr, int needed,
         if (logclass & (LC_EXEC))
             ls_syslog(LOG_DEBUG,"%s: the current sort order is %d",
                       fname, resVal->order[i]);
-        if ((resVal->order[0] == R15S + 1) && scheRawLoad)
-            getRawLsbLoad(ncandidates, hosts);
 
         numHosts = sortHosts(resVal->order[i], needed, ncandidates,
                              hosts, last, threshold, orderForPreempt);
@@ -3531,41 +4171,6 @@ findBestHosts (struct jData *jp, struct resVal *resValPtr, int needed,
     return (numHosts);
 
 }
-
-static void
-getRawLsbLoad(int ncandidates, struct candHost *hosts)
-{
-    static char fname[] = "getRawLsbLoad";
-    int i,  num;
-    char **hostNames;
-    struct hData *hDataPtr;
-    struct hostLoad *newHostLoad;
-
-    if (logclass & LC_TRACE)
-        ls_syslog(LOG_DEBUG, "%s: Enter this rountine ...", fname);
-
-
-    hostNames = my_malloc(ncandidates * sizeof (char *), fname);
-    for (i = 0; i < ncandidates; i++) {
-        hostNames[i] = hosts[i].hData->host;
-    }
-
-    newHostLoad = ls_loadofhosts ("-:server",
-                                  &num,
-                                  0,
-                                  NULL,
-                                  hostNames,
-                                  ncandidates);
-    FREEUP(hostNames);
-    if (newHostLoad != NULL) {
-        for (i = 0; i < num; i++) {
-            if ((hDataPtr = getHostData (newHostLoad[i].hostName)) != NULL) {
-                hDataPtr->lsbLoad[R15S] = newHostLoad[i].li[R15S];
-            }
-        }
-    }
-}
-
 
 static int
 notOrdered(int increasing, int lidx,
@@ -3603,9 +4208,15 @@ getNumericLoadValue(struct hData *hPtr, int lidx)
         return (-INFINIT_LOAD);
     }
 
-    /* Sort by free MXJ
+    /* Sort by MXJ
      */
     if (allLsInfo->resTable[lidx].flags & RESF_MBD_MXJ) {
+        return hPtr->maxJobs;
+    }
+
+    /* Sort by free slots
+     */
+    if (allLsInfo->resTable[lidx].flags & RESF_MBD_FREE_SLOTS) {
         return hPtr->maxJobs - (hPtr->numRUN + hPtr->numSSUSP + hPtr->numUSUSP);
     }
 
@@ -3854,16 +4465,15 @@ isCandHost (char *hostname, struct jData *jp)
 static void
 reserveSlots (struct jData *jp)
 {
-    static char fname[] = "reserveSlots";
     int i;
 
     if (jp->numHostPtr < 0)
         return;
 
     if (jp->jStatus & JOB_STAT_RESERVE) {
-        ls_syslog(LOG_ERR, _i18n_msg_get(ls_catd , NL_SETN, 7230,
-                                         "%s: Job <%s> already has slots reserved before"),/* catgets 7230 */
-                  fname, lsb_jobid2str(jp->jobId));
+        ls_syslog(LOG_ERR, "\
+%s: Job %s already has slots reserved before",
+                  __func__, lsb_jobid2str(jp->jobId));
         return;
     }
 
@@ -3883,10 +4493,12 @@ reserveSlots (struct jData *jp)
             jp->qPtr->numUsable--;
         }
         if (logclass & (LC_SCHED))
-            ls_syslog (LOG_DEBUG2, "%s: Reserve host %s for job %s",
-                       fname, jp->hPtr[i]->host, lsb_jobid2str(jp->jobId));
+            ls_syslog (LOG_DEBUG2, "\
+%s: Reserve host %s for job %s", __func__, jp->hPtr[i]->host,
+                       lsb_jobid2str(jp->jobId));
     }
 
+    reserve_memory(jp);
 }
 
 static int
@@ -3913,7 +4525,6 @@ freeReserveSlots(struct jData *jpbw)
     jpbw->jStatus &= ~JOB_STAT_RESERVE;
 
     deallocHosts(jpbw);
-
 }
 
 static void
@@ -4151,15 +4762,49 @@ scheduleAndDispatchJobs(void)
     hEnt *hashEntryPtr;
     struct jRef *jR;
     struct jData *jPtr;
+    struct jData *jPtr2;
+    int count;
+    bool_t has_ownership;
+    int num_iter;
+    static hTab *susp_jobs;
+    hEnt *ent;
+    sTab stab;
 
     now_disp = time(NULL);
     ZERO_OUT_TIMERS();
+
+    if (qsort_jobs) {
+        sort_job_list(MJL);
+        TIMEIT(0, sort_job_list(PJL), "sort_job_list()");
+    }
+
+    /* suspended jobs table
+     */
+    if (susp_jobs == NULL) {
+        susp_jobs = calloc(1, sizeof(hTab));
+        h_initTab_(susp_jobs, 181);
+    }
+    while ((ent = h_firstEnt_(susp_jobs, &stab))) {
+        h_rmEnt_(susp_jobs, ent);
+        ent = h_nextEnt_(&stab);
+    }
 
     if (jRefList == NULL)
         jRefList = listCreate("job reference list");
 
     if (mSchedStage == 0) {
 
+      ls_syslog(LOG_INFO, "\
+%s: begin a new schedule and dispatch session num_finish %d",
+		__func__, num_finish);
+
+        if (logclass & LC_SCHED) {
+            gettimeofday(&scheduleStartTime, NULL);
+            ls_syslog(LOG_INFO, "\
+%s: begin a new schedule and dispatch session num_finish %d",
+                      __func__, num_finish);
+        }
+        num_finish = 0;
         freedSomeReserveSlot = FALSE;
         updateAccountsInQueue = TRUE;
 
@@ -4173,17 +4818,30 @@ scheduleAndDispatchJobs(void)
                     up->reasonTb[1][i] = 0;
                 }
             }
+            empty_udata_jref(up);
         }
 
+        count = 0;
         for (i = MJL; i <= PJL; i++) {
 
             for (jPtr = jDataList[i]->back;
                  jPtr != jDataList[i];
-                 jPtr = jPtr->back) {
+                 jPtr = jPtr2) {
+
+                /* jPtr can be removed, for example if
+                 * the job is aborted because of -t
+                 * while checking if it is ready.
+                 */
+                jPtr2 = jPtr->back;
 
                 checkSlotReserve(&jPtr, &continueSched);
                 if (continueSched == FALSE) {
-
+                    /* When the reservation is expired we
+                     * don't schedule this job otherwise
+                     * it is going to reserve the resources
+                     * again and the reservation will
+                     * be endless.
+                     */
                     jPtr->processed |= JOB_STAGE_DONE;
                     if (logclass & LC_SCHED) {
                         ls_syslog(LOG_DEBUG2, "\
@@ -4204,14 +4862,21 @@ scheduleAndDispatchJobs(void)
 
                 listInsertEntryAtFront(jRefList,
                                        (struct _listEntry *)jR);
+                if (jPtr->qPtr->qAttrib & Q_ATTRIB_FAIRSHARE
+                    || jPtr->qPtr->qAttrib & Q_ATTRIB_OWNERSHIP) {
+                    update_udata_jref(jR);
+                }
+                ++count;
+                if (count >= max_job_sched) {
+                    if (logclass & LC_SCHED) {
+                        ls_syslog(LOG_INFO, "\
+%s: bailed out at %d max %d", __func__, count, max_job_sched);
+                    }
+                    goto ven;
+                }
             }
         }
-
-        if (logclass & LC_SCHED) {
-            gettimeofday(&scheduleStartTime, NULL);
-            ls_syslog(LOG_DEBUG, "\
-%s: begin a new schedule and dispatch session", __func__);
-        }
+    ven:
 
         mSchedStage |= M_STAGE_INIT;
     }
@@ -4221,15 +4886,6 @@ scheduleAndDispatchJobs(void)
         if (now_disp - lastUpdTime > freshPeriod) {
             int returnCode;
 
-            for (jPtr = jDataList[SJL]->back;
-                 jPtr != jDataList[SJL];
-                 jPtr = jPtr->back) {
-
-                if (jPtr->jStatus & JOB_STAT_RUN) {
-                    accumRunTime(jPtr, jPtr->jStatus, now_disp);
-                }
-            }
-
             if (numResources > 0) {
                 TIMEIT(0, getLsbResourceInfo(), "getLsbResourceInfo()");
                 lastSharedResourceUpdateTime = now_disp;
@@ -4237,9 +4893,32 @@ scheduleAndDispatchJobs(void)
 
             TIMEIT(0, returnCode = getLsbHostLoad(), "getLsbHostLoad()");
             if (returnCode != 0) {
-
+                ls_syslog(LOG_ERR, "\
+%s: ohmygosh failed to get the load of hosts, cannot schedule", __func__);
                 return -1;
             }
+
+            /* After we got the load let's update
+             * the running jobs and accumulate
+             * jobs runtime.
+             */
+            for (jPtr = jDataList[SJL]->back;
+                 jPtr != jDataList[SJL];
+                 jPtr = jPtr->back) {
+
+                adjLsbLoad(jPtr, FALSE, TRUE);
+                if (jPtr->jStatus & JOB_STAT_RUN) {
+                    accumRunTime(jPtr, jPtr->jStatus, now_disp);
+                }
+
+                if (jPtr->jStatus & JOB_STAT_SSUSP) {
+                    h_addEnt_(susp_jobs, jPtr->qPtr->queue, NULL);
+                    ls_syslog(LOG_INFO, "\
+%s: found ssusp job  %s in queue %s", __func__, lsb_jobid2str(jPtr->jobId),
+                              jPtr->qPtr->queue);
+                }
+            }
+
             lastUpdTime = now_disp;
         }
 
@@ -4248,7 +4927,7 @@ scheduleAndDispatchJobs(void)
 
     if (STAY_TOO_LONG) {
         if (logclass & LC_SCHED) {
-            ls_syslog(LOG_DEBUG, "\
+            ls_syslog(LOG_INFO, "\
 %s: Stayed too long in M_STAGE_GOT_LOAD", __func__);
         }
         DUMP_CNT();
@@ -4262,7 +4941,7 @@ scheduleAndDispatchJobs(void)
                       + msleeptime/sharedResourceUpdFactor))) {
 
         if (logclass & LC_SCHED) {
-            ls_syslog(LOG_DEBUG,"\
+            ls_syslog(LOG_INFO,"\
 %s: now_disp=%d lastSharedResourceUpdateTime=%d diff=%d, mSchedStage=%x",
                       __func__, now_disp,
                       lastSharedResourceUpdateTime,
@@ -4283,26 +4962,32 @@ scheduleAndDispatchJobs(void)
         lastSharedResourceUpdateTime = now_disp;
     }
 
-    if (!(mSchedStage & M_STAGE_RESUME_SUSP)) {
-        TIMEIT(0, tryResume(), "tryResume()");
-        mSchedStage |= M_STAGE_RESUME_SUSP;
-    }
-
-    if (logclass & LC_SCHED) {
-        ls_syslog(LOG_DEBUG, "\
-%s: M_STAGE_RESUME_SUSP tryResumed",
-                  __func__);
-    }
-
-    if (STAY_TOO_LONG) {
-        if (logclass & LC_SCHED) {
-            ls_syslog(LOG_DEBUG, "\
-%s: Stayed too long in M_STAGE_RESUME_SUSP", __func__);
+    /* We comment this code out because we want to
+     * resume jobs only if there no pending jobs
+     * in higher priority queues.
+     */
+    if (0) {
+        if (!(mSchedStage & M_STAGE_RESUME_SUSP)) {
+            TIMEIT(0, tryResume(NULL), "tryResume()");
+            mSchedStage |= M_STAGE_RESUME_SUSP;
         }
-        DUMP_CNT();
-        RESET_CNT();
-        return -1;
-    }
+
+        if (logclass & LC_SCHED) {
+            ls_syslog(LOG_INFO, "\
+%s: M_STAGE_RESUME_SUSP tryResumed",
+                      __func__);
+        }
+
+        if (STAY_TOO_LONG) {
+            if (logclass & LC_SCHED) {
+                ls_syslog(LOG_INFO, "\
+%s: Stayed too long in M_STAGE_RESUME_SUSP", __func__);
+            }
+            DUMP_CNT();
+            RESET_CNT();
+            return -1;
+        }
+    } /* if (0) */
 
     if (!(mSchedStage & M_STAGE_LSB_CAND)) {
         TIMEIT(3, numLsbUsable = getLsbUsable(), "getLsbUsable()");
@@ -4311,19 +4996,20 @@ scheduleAndDispatchJobs(void)
 
     if (numLsbUsable <= 0) {
         numLsbUsable = numQUsable = 0;
+        TIMEIT(0, tryResume(NULL), "tryResume()");
         resetSchedulerSession();
         return 0;
     }
 
     if (logclass & LC_SCHED) {
-        ls_syslog(LOG_DEBUG, "\
+        ls_syslog(LOG_INFO, "\
 %s: M_STAGE_LSB_CAND got numLsbUsable=%d",
                   __func__, numLsbUsable);
     }
 
     if (STAY_TOO_LONG) {
         if (logclass & LC_SCHED) {
-            ls_syslog(LOG_DEBUG, "\
+            ls_syslog(LOG_INFO, "\
 %s: Stayed too long in M_STAGE_LSB_CAND", __func__);
         }
         DUMP_CNT();
@@ -4331,21 +5017,40 @@ scheduleAndDispatchJobs(void)
         return -1;
     }
 
+    has_ownership = false;
     if (!(mSchedStage & M_STAGE_QUE_CAND)) {
+        int num;
 
-        for (qp = qDataList->back; qp != qDataList; qp = qp->back) {
+        numQUsable = 0;
+        /* Unlike jobs we want the queue with the highest
+         * number.
+         */
+        for (qp = qDataList->forw; qp != qDataList; qp = qp->forw) {
+            hEnt *ent2;
+
+            if ((ent2 = h_getEnt_(susp_jobs, qp->queue))
+                && higher_queue_has_pend_jobs(qp) == false) {
+                ls_syslog(LOG_INFO, "\
+%s: check if jobs in queue %s can be resumed", __func__, qp->queue);
+                tryResume(qp);
+            }
 
             if (qp->numPEND == 0 && qp->numRESERVE == 0)
                 continue;
 
             INC_CNT(PROF_CNT_getQUsable);
-            TIMEVAL(3, numQUsable = getQUsable(qp), tmpVal);
+            TIMEVAL(3, num = getQUsable(qp), tmpVal);
             timeGetQUsable += tmpVal;
+            numQUsable = numQUsable + num;
 
             /* Initialize the slot fairshare scheduler.
              */
             if (qp->fsSched) {
                 (*qp->fsSched->fs_init_sched_session)(qp);
+            }
+            if (qp->own_sched) {
+                (*qp->own_sched->fs_init_own_sched_session)(qp);
+                has_ownership = true;
             }
 
         }
@@ -4354,31 +5059,23 @@ scheduleAndDispatchJobs(void)
 
     if (numQUsable <= 0) {
         numQUsable = 0;
+        TIMEIT(0, tryResume(NULL), "tryResume()");
         resetSchedulerSession();
         return 0;
     }
 
     if (logclass & LC_SCHED) {
-        ls_syslog(LOG_DEBUG,"\
+        ls_syslog(LOG_INFO,"\
 %s M_STAGE_QUE_CAND numQUsable=%d timeGetQUsable %d ms",
                   __func__, numQUsable, timeGetQUsable);
     }
 
     if (LIST_NUM_ENTRIES(jRefList) == 0) {
-        ls_syslog(LOG_DEBUG, "\
+        ls_syslog(LOG_INFO, "\
 %s: no pending or migrating to jobs to schedule at the moment.", __func__);
+        TIMEIT(0, tryResume(NULL), "tryResume()");
         resetSchedulerSession();
         return 0;
-    }
-
-    if (STAY_TOO_LONG) {
-        if (logclass & LC_SCHED) {
-            ls_syslog(LOG_DEBUG, "\
-%s: Stayed too long in M_STAGE_RESUME_SUSP", __func__);
-        }
-        DUMP_CNT();
-        RESET_CNT();
-        return -1;
     }
 
     loopCount = 0;
@@ -4390,14 +5087,15 @@ scheduleAndDispatchJobs(void)
     /* Return the next priority job
      */
     while ((jPtr = jiter_next_job(jRefList))) {
-
+        ++num_iter;
         TIMEVAL(0, scheduleAJob(jPtr, TRUE, TRUE), tmpVal);
 
         XORDispatch(jPtr, FALSE, dispatchAJob0);
         if (STAY_TOO_LONG) {
             if (logclass & LC_SCHED) {
-                ls_syslog(LOG_DEBUG, "\
-%s: Stayed too long in M_STAGE_RESUME_SUSP", __func__);
+                ls_syslog(LOG_INFO, "\
+%s: Stayed too long in scheduleAJob() num_iter %d mSchedStage 0x%x ",
+                          __func__, num_iter, mSchedStage);
             }
             DUMP_CNT();
             RESET_CNT();
@@ -4405,8 +5103,32 @@ scheduleAndDispatchJobs(void)
         }
     }
 
+    if (has_ownership) {
+        /* Run the feedback loop.
+         */
+        for (qp = qDataList->forw; qp != qDataList; qp = qp->forw) {
+
+            if (qp->numPEND == 0 && qp->numRESERVE == 0)
+                continue;
+            if (!qp->own_sched)
+                continue;
+            if (qp->own_sched) {
+                (*qp->own_sched->fs_init_sched_session)(qp);
+            }
+            while ((jPtr = jiter_next_job2(jRefList))) {
+                TIMEVAL(0, scheduleAJob(jPtr, TRUE, TRUE), tmpVal);
+                dispatchAJob0(jPtr, false);
+            }
+        }
+    }
+
+    if (!(mSchedStage & M_STAGE_RESUME_SUSP)) {
+        TIMEIT(0, tryResume(NULL), "tryResume()");
+        mSchedStage |= M_STAGE_RESUME_SUSP;
+    }
+
     if (logclass & LC_SCHED) {
-        ls_syslog(LOG_DEBUG,"\
+        ls_syslog(LOG_INFO,"\
 %s out of pickAJob/scheduleAJob loopCount <%d>", __func__, loopCount);
         DUMP_TIMERS(__func__);
         DUMP_CNT();
@@ -4422,7 +5144,7 @@ scheduleAndDispatchJobs(void)
         scheduleTime =
             (scheduleFinishTime.tv_sec - scheduleStartTime.tv_sec)*1000 +
             (scheduleFinishTime.tv_usec - scheduleStartTime.tv_usec)/1000;
-        ls_syslog(LOG_DEBUG, "\
+        ls_syslog(LOG_INFO, "\
 %s: Completed a schedule and dispatch session seqNo=%d, time used: %d ms",
                   __func__, schedSeqNo, scheduleTime);
     }
@@ -4472,7 +5194,6 @@ jiter_fin(LIST_T *jRefList)
         free(jR);
         jR = jR0;
     }
-
 }
 
 /* jiter_next_job()
@@ -4516,6 +5237,26 @@ jiter_next_job(LIST_T *jRefList)
         if (jPtr->qPtr->qAttrib & Q_ATTRIB_FAIRSHARE) {
             struct qData *qPtr = jPtr->qPtr;
             (*qPtr->fsSched->fs_elect_job)(qPtr,
+                                           jRefList,
+                                           &jR0);
+            if (jR0) {
+                listRemoveEntry(jRefList,
+                                (LIST_ENTRY_T *)jR0);
+                jPtr0 = jR0->job;
+                free(jR0);
+                return jPtr0;
+            }
+            /* No more jobs from this fairshare queue
+             * so finalize the local plugin data for this
+             * session.
+             */
+            (*qPtr->fsSched->fs_fin_sched_session)(qPtr);
+            continue;
+        }
+
+        if (jPtr->qPtr->qAttrib & Q_ATTRIB_OWNERSHIP) {
+            struct qData *qPtr = jPtr->qPtr;
+            (*qPtr->own_sched->fs_elect_job)(qPtr,
                                              jRefList,
                                              &jR0);
             if (jR0) {
@@ -4529,7 +5270,7 @@ jiter_next_job(LIST_T *jRefList)
              * so finalize the local plugin data for this
              * session.
              */
-            (*qPtr->fsSched->fs_fin_sched_session)(qPtr);
+            (*qPtr->own_sched->fs_fin_sched_session)(qPtr);
             continue;
         }
 
@@ -4573,6 +5314,89 @@ jiter_next_job(LIST_T *jRefList)
     } /* for (jRef = jRefList->back; ...;...) */
 
     return NULL;
+}
+
+/* jiter_next_job2()
+ */
+static struct jData *
+jiter_next_job2(LIST_T *jRefList)
+{
+    struct jRef *jR;
+    struct jRef *jR0;
+    struct jData *jPtr0;
+    struct jData *jPtr;
+
+    jR0 = NULL;
+
+    for (jR = (struct jRef *)jRefList->back;
+         jR != (void *)jRefList;
+         jR = (struct jRef *)jR->back) {
+
+        /* Get the highest priority job
+         */
+        jPtr = jR->job;
+        assert(jPtr->uPtr->numPEND > 0);
+
+        if (jPtr->qPtr->qAttrib & Q_ATTRIB_OWNERSHIP) {
+            struct qData *qPtr = jPtr->qPtr;
+            (*qPtr->own_sched->fs_elect_job)(qPtr,
+                                             jRefList,
+                                             &jR0);
+            if (jR0) {
+                listRemoveEntry(jRefList,
+                                (LIST_ENTRY_T *)jR0);
+                jPtr0 = jR0->job;
+                free(jR0);
+                if (! run_time_ok(jPtr)) {
+                    jPtr->newReason = PEND_SYS_UNABLE;
+                    continue;
+                }
+                return jPtr0;
+            }
+            /* No more jobs from this fairshare queue
+             * so finalize the local plugin data for this
+             * session.
+             */
+            (*qPtr->own_sched->fs_fin_sched_session)(qPtr);
+            continue;
+        }
+    }
+
+    return NULL;
+}
+
+/* higher_queue_has_pend_jobs()
+ */
+static bool_t
+higher_queue_has_pend_jobs(struct qData *qPtr)
+{
+    struct qData *qp;
+
+    /* From the queue where the ssusp job is
+     * walk higher priority jobs and check
+     * if they have pending jobs
+     */
+    for (qp = qPtr->back;  qp != qDataList; qp = qp->back) {
+
+        /* Here we assume that at least one of the pending jobs
+         * in the higher priority queue is pending for the license,
+         * this because the job that trigger this function has
+         * been preempted for a license.
+         */
+        if (qp->numPEND > 0) {
+            ls_syslog(LOG_INFO, "\
+%s: found queue %s priority %d higher than mine %s %d with %d pendjobs", __func__,
+                      qp->queue, qp->priority, qPtr->queue, qPtr->priority,
+                      qp->numPEND);
+            return true;
+        }
+    }
+
+    ls_syslog(LOG_INFO, "\
+%s: no queues higher than mine %s %d with pendjobs", __func__,
+              qPtr->queue, qPtr->priority);
+
+    return false;
 }
 
 static int
@@ -4829,13 +5653,15 @@ other candHost are not allowed to be tried at this stage",
                         if (qAttributes & Q_ATTRIB_BACKFILL) {
                             jobStartTime (jp);
                         }
-                        reserveSlots (jp);
+                        reserveSlots(jp);
                         reserved = TRUE;
                     }
                 } else {
 
                     if (logclass & (LC_SCHED | LC_PEND)) {
-                        ls_syslog(LOG_DEBUG1, "%s: job <%s> will not reserve slots because there not enough online host slots for the job", fname, lsb_jobid2str(jp->jobId));
+                        ls_syslog(LOG_DEBUG1, "\
+%s: job %s will not reserve slots there not enough slots for the job", fname,
+                                  lsb_jobid2str(jp->jobId));
                     }
                 }
             }
@@ -4955,13 +5781,12 @@ getNumSlots(struct jData *jp)
 static enum dispatchAJobReturnCode
 dispatchToCandHost(struct jData *jp)
 {
-    static char fname[] = "dispatchToCandHost";
     int tmpVal;
 
     if (allocHosts(jp) < 0) {
         if (logclass & (LC_SCHED | LC_PEND)) {
             ls_syslog(LOG_DEBUG1, "%s: allocHosts() failed for job <%s>",
-                      fname, lsb_jobid2str(jp->jobId));
+                      __func__, lsb_jobid2str(jp->jobId));
         }
         return DISP_NO_JOB;
     }
@@ -4969,14 +5794,14 @@ dispatchToCandHost(struct jData *jp)
     if (jp->numHostPtr < jp->shared->jobBill.numProcessors) {
         if (logclass & (LC_SCHED | LC_PEND)) {
             ls_syslog(LOG_DEBUG1, "%s: No enough hosts for job %s",
-                      fname, lsb_jobid2str(jp->jobId));
+                      __func__, lsb_jobid2str(jp->jobId));
         }
         deallocHosts(jp);
         return DISP_NO_JOB;
     }
     if (logclass & LC_SCHED) {
         ls_syslog(LOG_DEBUG2, "%s: Try to dispatch job %s to host %s",
-                  fname, lsb_jobid2str(jp->jobId), jp->hPtr[0]->host);
+                  __func__, lsb_jobid2str(jp->jobId), jp->hPtr[0]->host);
     }
 
     jp->newReason = 0;
@@ -4988,7 +5813,7 @@ dispatchToCandHost(struct jData *jp)
         if (logclass & LC_SCHED) {
             ls_syslog(LOG_DEBUG2, "\
 %s: Job %s has been  dispatched to host %s",
-                      fname, lsb_jobid2str(jp->jobId),
+                      __func__, lsb_jobid2str(jp->jobId),
                       jp->hPtr[0]->host);
         }
 
@@ -4997,14 +5822,15 @@ dispatchToCandHost(struct jData *jp)
     } else {
 
         if (logclass & (LC_SCHED | LC_PEND)) {
-            ls_syslog(LOG_DEBUG1, "%s: Job %s failed to start on host %s; reason=%d", fname, lsb_jobid2str(jp->jobId), jp->hPtr[0]->host, jp->newReason);
+            ls_syslog(LOG_DEBUG1, "\
+%s: Job %s failed to start on host %s; reason=%d", __func__,
+                      lsb_jobid2str(jp->jobId), jp->hPtr[0]->host,
+                      jp->newReason);
         }
 
         deallocHosts(jp);
         if (!(jp->newReason & PEND_JOB_NO_FILE)) {
-
             removeCandHost(jp, 0);
-
         }
         return DISP_FAIL;
     }
@@ -5013,8 +5839,8 @@ dispatchToCandHost(struct jData *jp)
 static void
 getNumProcs(struct jData *jp)
 {
-#define HAS_HOST_PREFERNECE(jp) ((jp)->numAskedPtr || (jp)->qPtr->numAskedPtr)
-    static char fname[] = "getNumProcs";
+#define HAS_HOST_PREFERENCE(jp) ((jp)->numAskedPtr || (jp)->qPtr->numAskedPtr)
+
     int i, nSlots, nAvailSlots, backfillSlots;
     struct candHost *execCandPtr;
     struct backfillCand *backfillCandPtr;
@@ -5026,31 +5852,20 @@ getNumProcs(struct jData *jp)
     jp->numEligProc = 0;
     jp->numAvailEligProc = 0;
 
-    execCandPtr = (struct candHost *)my_malloc(jp->numCandPtr * sizeof(struct candHost), fname);
-    for (i = 0; i < jp->numCandPtr; i++) {
-        execCandPtr[i].hData = NULL;
-        execCandPtr[i].numSlots = 0;
-        execCandPtr[i].numAvailSlots = 0;
-        execCandPtr[i].backfilleeList = NULL;
-    }
+    execCandPtr = my_calloc(jp->numCandPtr, sizeof(struct candHost), __func__);
 
     if (JOB_CAN_BACKFILL(jp) &&
-        !HAS_HOST_PREFERNECE(jp) &&
+        !HAS_HOST_PREFERENCE(jp) &&
         jobHasBackfillee(jp) &&
         !allInOne(jp)) {
         sortedBackfilleeList = listCreate(NULL);
 
         sortBackfillee(jp, sortedBackfilleeList);
-        backfillCandPtr = (struct backfillCand *)my_malloc(jp->numCandPtr * sizeof(struct backfillCand), fname);
+        backfillCandPtr = my_calloc(jp->numCandPtr,
+                                    sizeof(struct backfillCand), __func__);
         backfillCandPtrIndex = 0;
-        for (i = 0; i < jp->numCandPtr; i++) {
-            backfillCandPtr[i].numSlots = 0;
-            backfillCandPtr[i].numAvailSlots = 0;
-            backfillCandPtr[i].indexInCandHostList = 0;
-            backfillCandPtr[i].backfilleeList = NULL;
-        }
 
-        (void)listIteratorAttach(&iter, sortedBackfilleeList);
+        listIteratorAttach(&iter, sortedBackfilleeList);
 
         for (backfillee = (struct backfillee *)listIteratorGetCurEntry(&iter);
              !listIteratorIsEndOfList(&iter) &&
@@ -5069,7 +5884,6 @@ getNumProcs(struct jData *jp)
                     break;
                 }
             }
-
 
             maxSlots =
                 jp->candPtr[backfillee->indexInCandHostList].numAvailSlots;
@@ -5370,17 +6184,11 @@ removeNOccuranceOfHost(struct jData *jp, struct hData *host, int num,
 }
 
 static struct backfillee *
-backfilleeCreate()
+backfilleeCreate(void)
 {
-    static char fname[] = "backfilleeCreate";
     struct backfillee *ent;
 
-    ent = (struct backfillee *)my_malloc(sizeof(struct backfillee), fname);
-    ent->backfilleePtr = NULL;
-    ent->indexInCandHostList = 0;
-    ent->backfillSlots = 0;
-    ent->numHostPtr = 0;
-    ent->hPtr = NULL;
+    ent = my_calloc(1, sizeof(struct backfillee), __func__);
 
     return ent;
 }
@@ -5388,10 +6196,9 @@ backfilleeCreate()
 static struct backfillee *
 backfilleeCreateByCopy(struct backfillee *bp)
 {
-    static char fname[] = "backfilleeCreateByCopy";
     struct backfillee *ent;
 
-    ent = (struct backfillee *)my_malloc(sizeof(struct backfillee), fname);
+    ent = my_calloc(1, sizeof(struct backfillee), __func__);
     ent->backfilleePtr = bp->backfilleePtr;
     ent->indexInCandHostList = bp->indexInCandHostList;
     ent->backfillSlots = bp->backfillSlots;
@@ -5414,7 +6221,8 @@ sortBackfillee(struct jData *jp, LIST_T *sortedBackfilleeList)
         if (backfilleeList == NULL) {
             continue;
         }
-        (void)listIteratorAttach(&iter, backfilleeList);
+
+        listIteratorAttach(&iter, backfilleeList);
         for (entry = (struct backfillee *)listIteratorGetCurEntry(&iter);
              !listIteratorIsEndOfList(&iter);
              listIteratorNext(&iter, (LIST_ENTRY_T **)&entry)) {
@@ -6385,56 +7193,6 @@ deallocReservePreemptResources(struct jData *jp)
     return 0;
 }
 
-void
-updPreemptResourceByRUNJob(struct jData *jp)
-{
-    int hostn, resn;
-    float val;
-
-
-    if (!(jp->jStatus & JOB_STAT_RUN)) {
-        return;
-    }
-    if (MARKED_WILL_BE_PREEMPTED(jp)) {
-        return;
-    }
-
-    if (CANNOT_BE_PREEMPTED_FOR_RSRC(jp)) {
-        return;
-    }
-
-    if (!jp->numHostPtr || jp->hPtr == NULL) {
-        return;
-    }
-
-
-    for (hostn = 0; hostn < jp->numHostPtr; hostn++) {
-        if (jp->hPtr[hostn]->hStatus & HOST_STAT_UNAVAIL) {
-            continue;
-        }
-        FORALL_PRMPT_RSRCS(resn) {
-            GET_RES_RSRC_USAGE(resn, val, jp->shared->resValPtr,
-                               jp->qPtr->resValPtr);
-            if (val <= 0.0)
-                continue;
-
-            addRunJobUsedPRHQValue(resn, val, jp->hPtr[hostn], jp->qPtr);
-            if (logclass & (LC_SCHED))
-                printPRMOValues();
-
-        } ENDFORALL_PRMPT_RSRCS;
-
-    }
-    return;
-}
-
-void
-checkAndReserveForPreemptWait(struct jData *jp)
-{
-
-    return;
-}
-
 int
 markPreemptForPRHQValues(struct resVal *resValPtr, int numHosts,
                          struct hData **hPPtr, struct qData *qPtr)
@@ -6871,3 +7629,292 @@ setLsbPtilePack(const bool_t x)
     }
 
 }
+
+/* update_udate_jref()
+ */
+static void
+update_udata_jref(struct jRef *jref)
+{
+    struct uData *uPtr;
+    hEnt *ent;
+
+    ent = h_getEnt_(&uDataList, jref->job->userName);
+    uPtr = ent->hData;
+    dlink_insert(uPtr->jobs, jref);
+}
+
+/* empty_jdata_jref()
+ */
+static void
+empty_udata_jref(struct uData *uPtr)
+{
+    while ((dlink_pop(uPtr->jobs)))
+        ;
+    assert(uPtr->jobs->num == 0);
+}
+
+/* handle_reserve_memory()
+ *
+ * Generic function that reserve or free memory
+ * on a host.
+ */
+static void
+handle_reserve_memory(struct jData *jPtr, int op)
+{
+    int i;
+    int on;
+    struct resVal *r;
+    hTab htab;
+
+    if (! (jPtr->qPtr->qAttrib & Q_ATTRIB_MEM_RESERVE))
+        return;
+
+    if (jPtr->shared->resValPtr == NULL)
+        return;
+
+    ls_syslog(LOG_DEBUG, "\
+%s: Entering job %s operation %d", __func__, lsb_jobid2str(jPtr->jobId), op);
+
+    if ((r = getReserveValues(jPtr->shared->resValPtr,
+                              jPtr->qPtr->resValPtr)) == NULL)
+        return;
+
+    /* Currently we do not support the memory reservation
+     * with rusage || syntax.
+     */
+    if (LINK_NUM_ENTRIES(jPtr->shared->resValPtr->rl) > 1)
+        return;
+
+    TEST_BIT(MEM, r->rusage_bit_map, on);
+    if (on == 0)
+        return;
+
+    memset(&htab, 0, sizeof(hTab));
+    h_initTab_(&htab, 11);
+
+    for (i = 0; i < jPtr->numHostPtr; i++) {
+        int new;
+        char hbuf[64];
+
+        sprintf(hbuf, "%p", jPtr->hPtr[i]);
+        h_addEnt_(&htab, hbuf, &new);
+        if (new == FALSE)
+            continue;
+
+        /* If we are reserving memory and the host does
+         * not have enough skip it, this should not
+         * really happen because we have checked if the
+         * host has enough memory in ckResReserve().
+         * If we are returning memory then don't run the if....
+         */
+        if (op == 1
+            && r->val[MEM] > jPtr->hPtr[i]->lsbLoad[MEM])
+            continue;
+
+        /* op is either 1 or -1 so we can
+         * share the code between the two operations
+         * reserve and free.
+         */
+        ls_syslog(LOG_DEBUG, "\
+%s: reserving %4.2f GB on host %s with %4.2f GB", __func__,
+                  r->val[MEM], jPtr->hPtr[i]->host,
+                  jPtr->hPtr[i]->lsbLoad[MEM]);
+
+        jPtr->hPtr[i]->lsbLoad[MEM]
+            = jPtr->hPtr[i]->lsbLoad[MEM] - r->val[MEM] * op;
+    }
+
+    h_freeRefTab_(&htab);
+}
+
+static void
+reserve_memory(struct jData *jPtr)
+{
+    if (! (jPtr->qPtr->qAttrib & Q_ATTRIB_MEM_RESERVE))
+        return;
+
+    handle_reserve_memory(jPtr, 1);
+}
+
+static void
+free_reserve_memory(struct jData *jPtr)
+{
+    if (! (jPtr->qPtr->qAttrib & Q_ATTRIB_MEM_RESERVE))
+        return;
+
+    handle_reserve_memory(jPtr, -1);
+}
+
+/* run_time_ok()
+ *
+ * Check if the job in the ownership queue
+ * has a runtime shorter than the loan period.
+ */
+static bool_t
+run_time_ok(struct jData *jPtr)
+{
+    uint32_t loan;
+
+    /* Use seconds.
+     */
+    loan = jPtr->qPtr->loan_duration * 60;
+    /* If loan duration is not set don't loan
+     * anything
+     */
+    if (loan == 0)
+        return false;
+
+    if (logclass & LC_FAIR) {
+        ls_syslog(LOG_INFO, "\
+%s: loan period %d job runlimit %d", __func__, loan,
+                  jPtr->abs_run_limit);
+    }
+
+    if (jPtr->abs_run_limit == -1)
+        return false;
+
+    if (jPtr->abs_run_limit > loan)
+        return false;
+
+    return true;
+}
+
+bool_t
+decrease_mem_by_slots(struct jData *jPtr)
+{
+    if ((hasResSpanHosts(jPtr->shared->resValPtr)
+         || hasResSpanHosts(jPtr->qPtr->resValPtr))
+        && (jPtr->shared->jobBill.numProcessors > 1)
+        && (jPtr->shared->jobBill.numProcessors
+            == jPtr->shared->jobBill.maxNumProcessors)) {
+        return true;
+    }
+
+    return false;
+}
+
+static int
+get_preempted_slots(struct jData *jPtr, struct hData *hPtr)
+{
+    linkiter_t iter;
+    struct hData *hPtr2;
+    int num_slots;
+
+    num_slots = 0;
+    traverse_init(jPtr->preempted_hosts, &iter);
+    while ((hPtr2 = traverse_link(&iter))) {
+
+        if (hPtr2 == hPtr) {
+            ++num_slots;
+            if (logclass & LC_PREEMPT) {
+                ls_syslog(LOG_INFO, "\
+%s: job %s host %s num_slots %d", __func__, lsb_jobid2str(jPtr->jobId),
+                          hPtr->host, num_slots);
+            }
+        }
+    }
+
+    return num_slots;
+}
+
+/* job_res_match_host()
+ */
+static bool_t
+job_res_match_host(struct hData *hPtr, struct jData *jPtr)
+{
+    bool_t r;
+    bool_t r2;
+
+    /* No dedicated resources in the system keep filtering
+     * this host.
+     */
+    if (! daemonParams[MBD_DEDICATED_RESOURCES].paramValue)
+        return true;
+
+    /* No dedicated resoures on this host apply next filter
+     * on this candidate host
+     */
+    if (HTAB_NUM_ELEMENTS(hPtr->dres_tab) <= 0)
+        return true;
+
+    if (logclass & LC_TRACE) {
+        ls_syslog(LOG_INFO, "\
+%s: job %s host %s queue %s MBD_DEDICATED_RESOURCES %s",
+                  __func__, lsb_jobid2str(jPtr->jobId),
+                  hPtr->host, jPtr->qPtr->queue,
+                  daemonParams[MBD_DEDICATED_RESOURCES].paramValue);
+    }
+
+    /* This job/queue is not asking for any resource so a host
+     * with a dedicated resource which must be specified
+     * cannot be its candidate.
+     */
+    if (!jPtr->shared->resValPtr
+        && !jPtr->qPtr->resValPtr) {
+
+        if (logclass & LC_TRACE) {
+            ls_syslog(LOG_INFO, "\
+%s: no job or queue resreq host is not candidate", __func__);
+        }
+
+        return false;
+    }
+
+    if (jPtr->shared->resValPtr
+        && !jPtr->qPtr->resValPtr) {
+        return match_host_res(hPtr, jPtr->shared->resValPtr);
+    }
+
+    if (! jPtr->shared->resValPtr
+        && jPtr->qPtr->resValPtr)
+        return match_host_res(hPtr, jPtr->qPtr->resValPtr);
+
+    if (jPtr->shared->resValPtr
+        && jPtr->qPtr->resValPtr) {
+        r = match_host_res(hPtr, jPtr->shared->resValPtr);
+        r2 = match_host_res(hPtr, jPtr->qPtr->resValPtr);
+    }
+
+    if (r || r2)
+        return true;
+
+    return false;
+}
+
+/* match_host_res()
+ */
+static bool_t
+match_host_res(struct hData *hPtr, struct resVal *r)
+{
+    hEnt *ent;
+    sTab s;
+    char *res;
+
+    ent = h_firstEnt_(hPtr->dres_tab, &s);
+    while (ent) {
+        /* Search if job/queue resVal is requesting
+         * the resource that is dedicated on the host
+         * hPtr.
+         */
+        res = ent->hData;
+        if (strstr(r->selectStr, res)) {
+
+            if (logclass & LC_TRACE) {
+                ls_syslog(LOG_INFO, "\
+%s: host %s res %s matches job/queue requested res %s", __func__, hPtr->host,
+                          res, r->selectStr);
+            }
+
+            return true;
+        }
+        ent = h_nextEnt_(&s);
+    }
+
+    if (logclass & LC_TRACE) {
+        ls_syslog(LOG_INFO, "\
+%s: job/queue resreq %s does not match host %s dedicated resources",
+                  __func__, r->selectStr, hPtr->host);
+    }
+    return false;
+}
+

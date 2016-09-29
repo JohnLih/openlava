@@ -1,6 +1,6 @@
 /*
- * Copyright (C) 2007 Platform Computing Inc
  * Copyright (C) 2015 David Bigagli
+ * Copyright (C) 2007 Platform Computing Inc
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of version 2 of the GNU General Public License as
@@ -35,7 +35,6 @@ extern  int setOption_(int argc, char **argv, char *template,
                         struct submit *req, int mask, int mask2, char **errMsg);
 extern  struct submit * parseOptFile_(char *filename,
                                       struct submit *req, char **errMsg);
-extern void subUsage_(int, char **);
 static  int parseLine(char *line, int *embedArgc, char ***embedArgv, int option);
 
 static int emptyCmd = TRUE;
@@ -71,17 +70,15 @@ do_sub(int argc, char **argv, int option)
 
     if (lsb_init(argv[0]) < 0) {
         sub_perror("lsb_init");
-        fprintf(stderr, ". %s.\n",
-                (_i18n_msg_get(ls_catd,NL_SETN,1551, "Job not submitted"))); /* catgets  1551  */
+        fprintf(stderr, ". %s.\n", "Job not submitted");
         return -1;
     }
 
     if (logclass & (LC_TRACE | LC_SCHED | LC_EXEC))
         ls_syslog(LOG_DEBUG, "%s: Entering this routine...", __func__);
 
-    if (fillReq(argc, argv, option, &req) < 0){
-        fprintf(stderr,  ". %s.\n",
-                (_i18n_msg_get(ls_catd,NL_SETN,1551, "Job not submitted")));
+    if (fillReq(argc, argv, option, &req) < 0 ){
+        fprintf(stderr,  ". %s.\n", "Job not submitted");
         return -1;
     }
 
@@ -91,8 +88,7 @@ do_sub(int argc, char **argv, int option)
     TIMEIT(0, (jobId = lsb_submit(&req, &reply)), "lsb_submit");
     if (jobId < 0) {
         prtErrMsg (&req, &reply);
-        fprintf(stderr,  ". %s.\n",
-                (_i18n_msg_get(ls_catd,NL_SETN,1551, "Job not submitted")));
+        fprintf(stderr,  ". %s.\n", "Job not submitted");
         return -1;
     }
 
@@ -147,11 +143,11 @@ fillReq(int argc, char **argv, int operate, struct submit *req)
     } else if (operate == CMD_BMODIFY) {
         req->options = SUB_MODIFY;
         template = "h|V|O|Tn|T:xn|x|rn|r|Bn|B|Nn|N|En|E:a:wn|w:fn|f:kn|k:Rn\
-|R:mn|m:Jn|J:isn|is:in|i:en|e:qn|q:bn|b:tn|t:spn|sp:sn|s:cn|c:Wn|W:Fn|\
+|R:mn|m:Jdn|Jd:Jn|J:isn|is:in|i:en|e:qn|q:bn|b:tn|t:spn|sp:sn|s:cn|c:Wn|W:Fn|\
 F:Dn|D:Sn|S:Cn|C:Mn|M:on|o:nn|n:un|u:Pn|P:Ln|L:Xn|X:Zsn|Zs:Z:";
     } else if (operate == CMD_BSUB) {
         req->options = 0;
-        template = "E:T:a:w:f:k:R:m:J:L:u:is:i:o:e:Zs|n:q:b:t:sp:s:c:v:p:\
+        template ="g:E:T:a:w:f:k:R:m:Jd:J:L:u:is:i:o:e:Zs|n:q:b:t:sp:s:c:v:p:\
 W:F:D:S:C:M:O:G:P:Ip|Is|I|r|H|x|N|B|h|V|X:K|";
     }
 
@@ -175,6 +171,7 @@ W:F:D:S:C:M:O:G:P:Ip|Is|I|r|H|x|N|B|h|V|X:K|";
     req->delOptions = 0;
     req->delOptions2 = 0;
     req->userPriority = -1;
+    req->cwd = NULL;
 
     if ((req->projectName = getenv("LSB_DEFAULTPROJECT")) != NULL)
         req->options |= SUB_PROJECT_NAME;
@@ -194,7 +191,6 @@ W:F:D:S:C:M:O:G:P:Ip|Is|I|r|H|x|N|B|h|V|X:K|";
 
         if ((statBuf.st_mode & S_IFREG) == S_IFREG
             || (statBuf.st_mode & S_IFLNK) == S_IFLNK) {
-
             redirect = (ftell(stdin) == 0) ? 1 : 0;
         }
     }
@@ -213,7 +209,7 @@ W:F:D:S:C:M:O:G:P:Ip|Is|I|r|H|x|N|B|h|V|X:K|";
 
             req->command = chkDir;
         } else
-            subUsage_(req->options, NULL);
+            bsub_usage(req->options);
 
     } else {
         if (myArgc > 0 && myArgv0 != NULL) {
@@ -411,7 +407,7 @@ CopyCommand(char **from, int len)
 
     size += 1 + 1;
 
-    if ((commandline = (char *) malloc(size)) == NULL) {
+    if ((commandline = malloc(size)) == NULL) {
         fprintf(stderr, I18N_FUNC_FAIL,__func__,"malloc" );
         return false;
     }
@@ -588,8 +584,7 @@ parseLine(char *line, int *embedArgc, char ***embedArgv, int option)
     char *sp, *sQuote, *dQuote, quoteMark;
 
     if (argBuf == NULL) {
-        if ((argBuf = (char **) malloc(INCREASE * sizeof(char *)))
-            == NULL) {
+        if ((argBuf = malloc(INCREASE * sizeof(char *))) == NULL) {
             fprintf(stderr, I18N_FUNC_FAIL,__func__,"malloc" );
             return -1;
         }

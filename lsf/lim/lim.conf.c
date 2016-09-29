@@ -1,6 +1,6 @@
 /*
+ * Copyright (C) 2014 - 2015 David Bigagli
  * Copyright (C) 2007 Platform Computing Inc
- * Copyright (C) 2014 David Bigagli
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of version 2 of the GNU General Public License as
@@ -1744,11 +1744,6 @@ readCluster(int checkMode)
     if ((hname = ls_getmyhostname()) == NULL)
         lim_Exit("readCluster/ls_getmyhostname");
 
-    /* Use virtual name if virtual lim
-     */
-    if (machineName)
-        hname = machineName;
-
     myHostPtr = findHostbyList(myClusterPtr->hostList, hname);
     if (!myHostPtr) {
         myHostPtr = findHostbyList(myClusterPtr->clientList, hname);
@@ -2471,12 +2466,6 @@ setMyClusterName(void)
 
     if ((hname = ls_getmyhostname()) == NULL)
         lim_Exit("setMyClusterName/ls_getmyhostname failed");
-
-    /* If we are a virtual host use our
-     * virtual name
-     */
-    if (machineName)
-        hname = machineName;
 
     ls_syslog(LOG_DEBUG, "%s: searching cluster files ...", __func__);
 
@@ -3732,14 +3721,20 @@ addHostModel(char *model, char *arch, float factor)
     for (i = 0; i < allInfo.nModels; ++i) {
 
         if (strcmp(allInfo.hostModels[i], model) == 0) {
-            ls_syslog(LOG_ERR, "\
+	    /* If we have multiple arch definitions this
+	     * routine is invoked multiple times with the
+	     * same model however we only save the first arch.
+	     */
+            ls_syslog(LOG_DEBUG1, "\
 %s: host model %s multiply defined, ignored.", __func__, model);
             return TRUE;
         }
     }
 
     strcpy(allInfo.hostModels[allInfo.nModels], model);
-    strcpy(allInfo.hostArchs[allInfo.nModels], arch);
+    /* arch can be NULL if we just have () in arch column.
+     */
+    strcpy(allInfo.hostArchs[allInfo.nModels], arch ? arch : "");
     allInfo.cpuFactor[allInfo.nModels] = factor;
     shortInfo.hostModels[shortInfo.nModels]
         = allInfo.hostModels[allInfo.nModels];
@@ -4557,13 +4552,13 @@ saveHostIPAddr(struct hostNode *hPtr, struct hostent *hp)
     return 0;
 }
 
-/* addMigrantHost()
+/* lim_add_migrant_host()
  */
 void
-addMigrantHost(XDR *xdrs,
-               struct sockaddr_in *from,
-               struct LSFHeader *reqHdr,
-               int chan)
+lim_add_migrant_host(XDR *xdrs,
+		     struct sockaddr_in *from,
+		     struct LSFHeader *reqHdr,
+		     int chan)
 {
     static char buf[MSGSIZE];
     struct LSFHeader hdr;
@@ -4704,10 +4699,10 @@ addHostByTab(hTab *tab)
 /* rmMigrantHost()
  */
 void
-rmMigrantHost(XDR *xdrs,
-              struct sockaddr_in *from,
-              struct LSFHeader *reqHdr,
-              int chan)
+lim_rm_migrant_host(XDR *xdrs,
+		    struct sockaddr_in *from,
+		    struct LSFHeader *reqHdr,
+		    int chan)
 {
     static char buf[MSGSIZE];
     struct LSFHeader hdr;

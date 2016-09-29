@@ -1,4 +1,5 @@
-/* $Id: misc.c 397 2007-11-26 19:04:00Z mblack $
+/*
+ * Copyright (C) 2015 David Bigagli
  * Copyright (C) 2007 Platform Computing Inc
  *
  * This program is free software; you can redistribute it and/or modify
@@ -59,9 +60,6 @@ hostValue(void)
     return (int) value;
 
 }
-
-
-
 
 int
 getBootTime(time_t *bootTime)
@@ -238,11 +236,24 @@ int
 matchName(char *pattern, char *name)
 {
     int i, ip;
+    char *p1, *n1;
 
     if (!pattern || !name)
         return false;
 
     ip = (int)strlen(pattern);
+    if (pattern[0]=='*' && pattern[1]!='\0') {
+        if (pattern[ip-1]=='*')
+            p1=strndup(pattern+1, ip-2);
+        else
+            p1=strdup(pattern+1);
+        n1=strstr(name, p1);
+        free (p1);
+        if (n1==NULL)
+            return false;
+        else
+            return true;
+    }
     for (i = 0; i < ip && pattern[i] != '['; i++) {
 
         if (pattern[i] == '*')
@@ -379,13 +390,17 @@ END:
     return argv;
 }
 
-int
-FCLOSEUP(FILE **fp)
+inline int
+_fclose_(FILE **fp)
 {
-    if (*fp == NULL)
+    if (fp == NULL
+	|| *fp == NULL)
         return EOF;
 
-    return fclose(*fp);
+    fclose(*fp);
+    *fp = NULL;
+
+    return 0;
 }
 
 #undef getopt
@@ -421,7 +436,8 @@ linux_getopt(nargc, nargv, ostr)
 	char *p;
 
 	if (!*place) {
-		if (linux_optind >= nargc || *(place = nargv[linux_optind]) != '-') {
+	    if (linux_optind >= nargc
+		|| *(place = nargv[linux_optind]) != '-') {
 			place = EMSG;
 			opterr = linux_opterr;
 			optopt = linux_optopt;

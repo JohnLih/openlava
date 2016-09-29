@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2015 David Bigagli
+ * Copyright (C) 2015-2016 David Bigagli
  * Copyright (C) 2007 Platform Computing Inc
  *
  * This program is free software; you can redistribute it and/or modify
@@ -1695,7 +1695,7 @@ appendJobFile(struct jobCard *jobCard, char *header, struct hostent *hp,
         (fprintf(jobFile_fp, "%d\n", jobCard->jobSpecs.jobPid) < 0)) {
         sprintf(errMsg, I18N_FUNC_S_S_FAIL_M, fname, "fprintf",
                 jobCard->jobSpecs.jobFile, "JOB_PID");
-        FCLOSEUP(&jobFile_fp);
+        _fclose_(&jobFile_fp);
         return -1;
     }
 
@@ -1703,7 +1703,7 @@ appendJobFile(struct jobCard *jobCard, char *header, struct hostent *hp,
         (fprintf(jobFile_fp, "%d\n", jobCard->jobSpecs.jobPGid) < 0)) {
         sprintf(errMsg, I18N_FUNC_S_S_FAIL_M, fname, "fprintf",
                 jobCard->jobSpecs.jobFile, "JOB_PGID");
-        FCLOSEUP(&jobFile_fp);
+        _fclose_(&jobFile_fp);
         return -1;
     }
 
@@ -1711,11 +1711,11 @@ appendJobFile(struct jobCard *jobCard, char *header, struct hostent *hp,
         (fprintf(jobFile_fp, "\n%d\n", jobCard->w_status) < 0)) {
         sprintf(errMsg, I18N_FUNC_S_S_FAIL_M, fname, "fprintf",
                 jobCard->jobSpecs.jobFile, "STATUS");
-        FCLOSEUP(&jobFile_fp);
+        _fclose_(&jobFile_fp);
         return -1;
     }
 
-    if (FCLOSEUP(&jobFile_fp) < 0) {
+    if (_fclose_(&jobFile_fp) < 0) {
         sprintf(errMsg, I18N_FUNC_S_FAIL_M, fname, "fclose",
                 jobCard->jobSpecs.jobFile);
         return -1;
@@ -1737,7 +1737,7 @@ writePreJobFail(struct jobCard *jp)
         ls_syslog(LOG_ERR, I18N_JOB_FAIL_S_S_M, fname,
                   lsb_jobid2str(jp->jobSpecs.jobId), "fopen", fn);
     } else {
-        if (FCLOSEUP(&fp) < 0)
+        if (_fclose_(&fp) < 0)
             ls_syslog(LOG_ERR, I18N_JOB_FAIL_S_S_M, fname,
                       lsb_jobid2str(jp->jobSpecs.jobId), "fclose", fn);
     }
@@ -1906,7 +1906,7 @@ jobFileExitStatus(struct jobCard *jobCard)
 %s: gethostbyname() %s failed job %s", __func__,
                   jobCard->jobSpecs.fromHost,
                   lsb_jobid2str(jobCard->jobSpecs.jobId));
-                  exit(jobCard->w_status);
+        exit(jobCard->w_status);
     }
 
     chuser(jobCard->jobSpecs.execUid);
@@ -1940,7 +1940,7 @@ jobFileExitStatus(struct jobCard *jobCard)
                 break;
             }
         }
-        FCLOSEUP(&jobFile_fp);
+        _fclose_(&jobFile_fp);
     }
 
     chuser(batchId);

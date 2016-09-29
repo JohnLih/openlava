@@ -70,16 +70,15 @@ struct config_param limParams[] =
     {"LSF_LOG_MASK",NULL},
     {"LSF_CONF_RETRY_MAX", NULL},
     {"LSF_CONF_RETRY_INT", NULL},
-    {"LSF_CROSS_UNIX_NT", NULL},
     {"LSF_LIM_IGNORE_CHECKSUM", NULL},
-    {"LSF_MASTER_LIST", NULL},
-    {"LSF_REJECT_NONLSFHOST", NULL},
     {"LSF_LIM_JACKUP_BUSY", NULL},
     {"LIM_RSYNC_CONFIG", NULL},
     {"LIM_COMPUTE_ONLY", NULL},
     {"LSB_SHAREDIR", NULL},
     {"LIM_NO_MIGRANT_HOSTS", NULL},
     {"LIM_DONT_FORK", NULL},
+    {"LIM_DEFINE_NCPUS", NULL},
+    {"LIM_ACCEPT_FLOAT_CLIENT", NULL},
     {NULL, NULL},
 };
 
@@ -104,16 +103,11 @@ extern char *getExtResourcesVal(char *);
  */
 static char reqBuf[MSGSIZE];
 
-/* If this is a virtual host this is
- * its name
- */
-char *machineName;
-
 static void
 usage(void)
 {
     fprintf(stderr, "\
-lim: [-C] [-V] [-h] [-t] [-debug_level] [-d env_dir] [-m machine@port]\n");
+lim: [-C] [-V] [-h] [-t] [-debug_level] [-d env_dir] \n");
 }
 
 /* LIM main()
@@ -159,9 +153,6 @@ main(int argc, char **argv)
                 return 0;
             case 't':
                 showTypeModel = 1;
-                break;
-            case 'm':
-                machineName = strdup(optarg);
                 break;
             case 'h':
             case '?':
@@ -376,7 +367,7 @@ Reading configuration from %s/lsf.conf\n", env_dir);
             doAcceptConn();
         }
 
-        clientIO(&chanmask);
+        lim_client_io(&chanmask);
 
         sigprocmask(SIG_SETMASK, &oldMask, NULL);
 
@@ -559,7 +550,8 @@ doAcceptConn(void)
     ch = chanAccept_(limTcpSock, &from);
     if (ch < 0) {
         ls_syslog(LOG_ERR, "\
-%s: failed accept() new connection socket %d: %M", __func__, limTcpSock);
+%s: failed accept() new connection socket %d: %M", __func__,
+		  limTcpSock);
         return;
     }
 
@@ -574,6 +566,10 @@ doAcceptConn(void)
                           __func__, sockAdd2Str_(&from));
         return;
     }
+
+    if (fromHost == NULL
+	&& limParams[LIM_ACCEPT_FLOAT_CLIENT].paramValue)
+	fromHost = myHostPtr;
 
     client = calloc(1, sizeof(struct clientNode));
     if (!client) {
@@ -767,7 +763,7 @@ static void
 term_handler(int signum)
 {
 
-    if (logclass & (LC_TRACE | LC_HANG))
+    if (logclass & LC_TRACE)
         ls_syslog(LOG_DEBUG, "%s: Entering this routine...", __func__);
 
     Signal_(signum, SIG_DFL);
@@ -796,23 +792,11 @@ child_handler(int sig)
     int           pid;
     LS_WAIT_T     status;
 
-    if (logclass & (LC_TRACE | LC_HANG))
-        ls_syslog(LOG_DEBUG1, "%s: Entering this routine...", __func__);
-
     while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
         if (pid == elim_pid) {
-            ls_syslog(LOG_ERR, "\
-%s: elim (pid=%d) died (exit_code=%d, exit_sig=%d)",
-                      __func__,
-                      (int)elim_pid,
-                      WEXITSTATUS (status),
-                      WIFSIGNALED (status) ? WTERMSIG (status) : 0);
             elim_pid = -1;
         }
         if (pid == pimPid) {
-            if (logclass & LC_PIM)
-                ls_syslog(LOG_DEBUG, "\
-child_handler: pim (pid=%d) died", pid);
             pimPid = -1;
         }
     }
@@ -824,8 +808,6 @@ initSock(int checkMode)
 {
     struct sockaddr_in limTcpSockId;
     socklen_t size;
-    struct hostNode hPtr;
-    uint16_t port;
 
     if (limParams[LSF_LIM_PORT].paramValue == NULL) {
         ls_syslog(LOG_ERR, "\
@@ -843,30 +825,18 @@ initSock(int checkMode)
         return -1;
     }
 
-    port = lim_port;
-    if (machineName) {
-        /* A virtual host must bind to its own port
-         * but uses the lim_port to talk to master lim
-         */
-        hPtr.hostName = strdup(machineName);
-        port = getLIMPort(&hPtr);
-        _free_(hPtr.hostName);
-        /* Virtual lim is a compute only one don't
-         * try to take over the master.
-         */
-        limParams[LIM_COMPUTE_ONLY].paramValue = "si";
-    }
-
     /* Tell the channel code to set the reuse option
      * for the socket.
      */
-    limSock = chanServSocket_(SOCK_DGRAM, port, -1, CHAN_OP_SOREUSE);
+    limSock = chanServSocket_(SOCK_DGRAM, lim_port, -1, CHAN_OP_SOREUSE);
     if (limSock < 0) {
         ls_syslog(LOG_ERR, "\
 %s: unable to create datagram socket port %d; another LIM running?: %M ",
                   __func__, lim_port);
         return -1;
     }
+
+    lim_port = htons(lim_port);
 
     /* bind to a dynamic port
      */
@@ -960,11 +930,6 @@ startPIM(int argc, char **argv)
     char *pargv[16];
     int i;
     static time_t lastTime = 0;
-
-    /* Dont start pim on a virtual host
-     */
-    if (machineName)
-        return;
 
     if (time(NULL) - lastTime < 60 * 2)
         return;

@@ -1,6 +1,6 @@
 /*
+ * Copyright (C) 2015 - 2016 David Bigagli
  * Copyright (C) 2007 Platform Computing Inc
- * Copyright (C) 2015 David Bigagli
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of version 2 of the GNU General Public License as
@@ -158,4 +158,16 @@ extern bool_t xdr_shareAcct(XDR *,
                             struct LSFHeader *);
 extern bool_t xdr_jobID(XDR *,
                         LS_LONG_INT *,
+                        struct LSFHeader *);
+extern bool_t xdr_jobdep(XDR *, struct job_dep *, struct LSFHeader *);
+extern bool_t xdr_jobgroup(XDR *, struct job_group *, struct LSFHeader *);
+extern bool_t xdr_resLimitReply(XDR *,
+                    struct resLimitReply *,
+                    struct LSFHeader *);
+
+extern bool_t xdr_resLimitEnt(XDR *,
+                        struct resLimit *,
+                        struct LSFHeader *);
+extern bool_t xdr_resLimitUsageEnt(XDR *,
+                        struct resLimitUsage *,
                         struct LSFHeader *);

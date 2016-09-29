@@ -40,8 +40,14 @@ static void freeJobHead(struct jobInfoHead *);
 static void freeJobInfoReply(struct jobInfoReply *);
 static void freeShareResourceInfoReply(struct  lsbShareResourceInfoReply *);
 static int xdrsize_QueueInfoReply(struct queueInfoReply * );
+static int xdrsize_ResLimitInfoReply (struct resLimitReply *);
+static void addResUsage(struct resLimitReply *);
+static struct resLimitUsage * getLimitUsage(struct resLimit *, struct resData *);
+static void freeResLimitUsage(int, struct resLimitUsage *);
 extern void closeSession(int);
 static int sendLSFHeader(int, int);
+static int get_dep_link_size(link_t *);
+static int enqueueLSFHeader(int, int);
 
 int
 do_submitReq(XDR *xdrs,
@@ -167,6 +173,11 @@ do_jobInfoReq(XDR *xdrs,
         ls_syslog(LOG_DEBUG, "\
 %s: Entering this routine...; channel=%d", __func__,chfd);
 
+    if (qsort_jobs) {
+        sort_job_list(MJL);
+        sort_job_list(PJL);
+    }
+
     jobInfoHead.hostNames = NULL;
     jobInfoHead.jobIds  = NULL;
 
@@ -215,9 +226,13 @@ do_jobInfoReq(XDR *xdrs,
     if (jobInfoReq.options & HOST_NAME) {
         jobInfoHead.hostNames = my_calloc(numofhosts(),
                                           sizeof(char *), __func__);
-        for (hPtr = (struct hData *)hostList->back;
+        /* Traverse the list in increasing hostId number
+         * since the library uses it to match the hostname
+         * with the id and the correct pending reason.
+         */
+        for (hPtr = (struct hData *)hostList->forw;
              hPtr != (void *)hostList;
-             hPtr = (struct hData *)hPtr->back) {
+             hPtr = (struct hData *)hPtr->forw) {
             jobInfoHead.hostNames[i] = hPtr->host;
             ++i;
         }
@@ -275,9 +290,9 @@ do_jobInfoReq(XDR *xdrs,
             return -1;
         }
         if (!jgrplist[i].isJData &&
-             ((len = packJgrpInfo((struct jgTreeNode *)jgrplist[i].info,
-                                  listSize - 1 - i,
-                                  &buf, schedule, reqHdr->version)) < 0)) {
+            ((len = packJgrpInfo((struct jgTreeNode *)jgrplist[i].info,
+                                 listSize - 1 - i,
+                                 &buf, schedule, reqHdr->version)) < 0)) {
             ls_syslog(LOG_ERR, "%s: packJgrpInfo() failed: %m", __func__);
             FREEUP(jgrplist);
             return -1;
@@ -453,8 +468,8 @@ packJobInfo(struct jData *jobData,
     job_reasonTb = jobData->reasonTb;
 
     if (reasonTb == NULL) {
-        reasonTb = my_calloc(numofhosts(), sizeof(int), __func__);
-        jReasonTb = my_calloc(numofhosts(), sizeof(int), __func__);
+        reasonTb = my_calloc(numofhosts() + 1, sizeof(int), __func__);
+        jReasonTb = my_calloc(numofhosts() + 1, sizeof(int), __func__);
     }
 
     jobInfoReply.jobId = jobData->jobId;
@@ -635,6 +650,7 @@ packJobInfo(struct jData *jobData,
         jobInfoReply.jobBill->numProcessors = 1;
         jobInfoReply.jobBill->maxNumProcessors = 1;
     }
+
     if (jobInfoReply.jobBill->jobName)
         FREEUP(jobInfoReply.jobBill->jobName);
     fullJobName_r(jobData, fullName);
@@ -675,7 +691,11 @@ packJobInfo(struct jData *jobData,
         }
     }
 
-    if (cpuFactor != NULL && *cpuFactor > 0) {
+    /* Scale back for user to display
+     */
+    if (cpuFactor != NULL
+        && *cpuFactor > 0
+        && mbdParams->run_abs_limit == false) {
 
         if (jobInfoReply.jobBill->rLimits[LSF_RLIMIT_CPU] > 0)
             jobInfoReply.jobBill->rLimits[LSF_RLIMIT_CPU] /= *cpuFactor;
@@ -853,14 +873,14 @@ do_jobMsg(XDR *xdrs,
         ls_syslog(LOG_DEBUG1, "%s: Entering this routine ...", __func__);
 
     if (! xdr_jobID(xdrs, &jobID, hdr)) {
-        lsberrno = LSBE_XDR;
+        reply = LSBE_XDR;
         goto Reply;
     }
 
     msg = calloc(LSB_MAX_MSGSIZE, sizeof(char));
 
     if (! xdr_wrapstring(xdrs, &msg)) {
-        lsberrno = LSBE_XDR;
+        reply = LSBE_XDR;
         goto Reply;
     }
 
@@ -1317,7 +1337,7 @@ do_hostInfoReq(XDR *xdrs,
     reply = checkHosts(&hostsReq, &hostsReply);
 
     count = hostsReply.numHosts * (sizeof(struct hostInfoEnt)
-                                   + MAXLINELEN + MAXHOSTNAMELEN
+                                   + 2*MAXLINELEN + MAXHOSTNAMELEN
                                    + hostsReply.nIdx * 4 * sizeof(float)) + 100;
 
     reply_buf = my_calloc(count, sizeof(char), __func__);
@@ -1484,7 +1504,7 @@ xdrsize_QueueInfoReply(struct queueInfoReply * qInfoReply)
                       * (sizeof(struct queueInfoEnt)
                          + MAX_LSB_NAME_LEN
                          +
-                        qInfoReply->nIdx * 2 * sizeof(float))
+                         qInfoReply->nIdx * 2 * sizeof(float))
                       + qInfoReply->numQueues * NET_INTSIZE_);
 
     return len;
@@ -1603,10 +1623,9 @@ do_groupInfoReq(XDR *xdrs,
             reply = LSBE_NO_HOST_GROUP;
         } else {
 
-            groupInfoReply.groups = (struct groupInfoEnt *)
-                my_calloc(numofhgroups,
-                          sizeof(struct groupInfoEnt),
-                          "do_groupInfoReq");
+            groupInfoReply.groups = my_calloc(numofhgroups,
+                                              sizeof(struct groupInfoEnt),
+                                              "do_groupInfoReq");
 
             reply = checkGroups(&groupInfoReq, &groupInfoReply);
 
@@ -1670,21 +1689,24 @@ int
 do_paramInfoReq(XDR * xdrs, int chfd, struct sockaddr_in * from,
                 struct LSFHeader * reqHdr)
 {
-    static char             fname[] = "do_paramInfoReq()";
-    char                   *reply_buf;
-    XDR                     xdrs2;
-    int                     reply;
-    struct LSFHeader        replyHdr;
-    char                   *replyStruct;
-    int                     count, jobSpoolDirLen;
-    struct infoReq          infoReq;
-    struct parameterInfo    paramInfo;
+    char *reply_buf;
+    XDR xdrs2;
+    int reply;
+    struct LSFHeader replyHdr;
+    char *replyStruct;
+    int count;
+    int jobSpoolDirLen;
+    struct infoReq infoReq;
+    struct parameterInfo paramInfo;
 
     if (!xdr_infoReq(xdrs, &infoReq, reqHdr)) {
         reply = LSBE_XDR;
-        ls_syslog(LOG_ERR, I18N_FUNC_FAIL, fname, "xdr_infoReq");
-    } else
-        checkParams(&infoReq, &paramInfo);
+        ls_syslog(LOG_ERR, "%s: xdr_infoReq() failed", __func__);
+        sendLSFHeader(chfd, LSBE_XDR);
+        return -1;
+    }
+
+    checkParams(&infoReq, &paramInfo);
     reply = LSBE_NO_ERROR;
 
     if (paramInfo.pjobSpoolDir != NULL) {
@@ -1693,16 +1715,19 @@ do_paramInfoReq(XDR * xdrs, int chfd, struct sockaddr_in * from,
         jobSpoolDirLen = 4;
     }
 
-    count = sizeof(struct parameterInfo) + strlen(paramInfo.defaultQueues)
-        + strlen(paramInfo.defaultHostSpec)
-        + strlen(paramInfo.defaultProject) + 100 + jobSpoolDirLen;
+    count = sizeof(struct parameterInfo)
+        + ALIGNWORD_(strlen(paramInfo.defaultQueues) + 1)
+        + ALIGNWORD_(strlen(paramInfo.defaultHostSpec) + 1)
+        + ALIGNWORD_(strlen(paramInfo.defaultProject) + 1)
+        + jobSpoolDirLen;
+    count = count * sizeof(int);
 
-    reply_buf = my_malloc(count, "do_paramInfoReq");
+    reply_buf = calloc(count, sizeof(char));
     xdrmem_create(&xdrs2, reply_buf, count, XDR_ENCODE);
 
     initLSFHeader_(&replyHdr);
     replyHdr.opCode = reply;
-    replyStruct = (char *) &paramInfo;
+    replyStruct = (char *)&paramInfo;
 
     if (! xdr_encodeMsg(&xdrs2,
                         replyStruct,
@@ -1710,15 +1735,15 @@ do_paramInfoReq(XDR * xdrs, int chfd, struct sockaddr_in * from,
                         xdr_parameterInfo,
                         0,
                         NULL)) {
-        ls_syslog(LOG_ERR, I18N_FUNC_FAIL, fname, "xdr_encodeMsg");
+        ls_syslog(LOG_ERR, "%s: xdr_encodeMsg() failed", __func__);
         xdr_destroy(&xdrs2);
         FREEUP(reply_buf);
         return -1;
     }
 
     if (chanWrite_(chfd, reply_buf, XDR_GETPOS(&xdrs2)) <= 0) {
-        ls_syslog(LOG_ERR, I18N_FUNC_D_FAIL_M, fname, "chanWrite_",
-                  XDR_GETPOS(&xdrs2));
+        ls_syslog(LOG_ERR, "%s: chanWrite_() failed sending %d bytes",
+                  __func__, XDR_GETPOS(&xdrs2));
         xdr_destroy(&xdrs2);
         FREEUP (reply_buf);
         return -1;
@@ -1988,15 +2013,15 @@ initSubmit(int *first, struct submitReq *subReq,
 
     if (*first == TRUE) {
         subReq->fromHost = my_calloc(MAXHOSTNAMELEN, sizeof(char), __func__);
-        subReq->jobFile = my_calloc(MAXHOSTNAMELEN, sizeof(char), __func__);
-        subReq->inFile =  my_calloc(MAXHOSTNAMELEN, sizeof(char), __func__);
-        subReq->outFile = my_calloc(MAXHOSTNAMELEN, sizeof(char), __func__);
-        subReq->errFile = my_calloc(MAXHOSTNAMELEN, sizeof(char), __func__);
-        subReq->inFileSpool = my_calloc(MAXHOSTNAMELEN, sizeof(char), __func__);
-        subReq->commandSpool = my_calloc(MAXHOSTNAMELEN, sizeof(char), __func__);
-        subReq->cwd = my_calloc(MAXHOSTNAMELEN, sizeof(char), __func__);
-        subReq->subHomeDir = my_calloc(MAXHOSTNAMELEN, sizeof(char), __func__);
-        subReq->chkpntDir = my_calloc(MAXHOSTNAMELEN, sizeof(char), __func__);
+        subReq->jobFile = my_calloc(MAXLSFNAMELEN, sizeof(char), __func__);
+        subReq->inFile =  my_calloc(MAXLSFNAMELEN, sizeof(char), __func__);
+        subReq->outFile = my_calloc(MAXLSFNAMELEN, sizeof(char), __func__);
+        subReq->errFile = my_calloc(MAXLSFNAMELEN, sizeof(char), __func__);
+        subReq->inFileSpool = my_calloc(MAXLSFNAMELEN, sizeof(char), __func__);
+        subReq->commandSpool = my_calloc(MAXLSFNAMELEN, sizeof(char), __func__);
+        subReq->cwd = my_calloc(MAXLSFNAMELEN, sizeof(char), __func__);
+        subReq->subHomeDir = my_calloc(MAXLSFNAMELEN, sizeof(char), __func__);
+        subReq->chkpntDir = my_calloc(MAXLSFNAMELEN, sizeof(char), __func__);
         subReq->hostSpec = my_calloc(MAXHOSTNAMELEN, sizeof(char), __func__);
         submitReply->badJobName = my_calloc(MAX_CMD_DESC_LEN, sizeof(char), __func__);
         *first = FALSE;
@@ -2049,52 +2074,48 @@ sendBack (int reply, struct submitReq *submitReq,
 void
 doNewJobReply(struct sbdNode *sbdPtr, int exception)
 {
-    static char fname[] = "doNewJobReply";
     struct LSFHeader replyHdr;
     XDR xdrs;
     struct jData *jData = sbdPtr->jData;
-
     struct jobReply jobReply;
     struct Buffer *buf;
     struct LSFHeader hdr;
     int cc, s, svReason, replayReason;
 
     if (logclass & LC_COMM)
-        ls_syslog(LOG_DEBUG, "%s: Entering ...", fname);
+        ls_syslog(LOG_DEBUG, "%s: Entering ...", __func__);
 
-
+    /* If we already got the jobPid, we don't need to do anything.  This
+     * can happen if a status report arrives before the jobaccept reply.
+     */
     if (jData->jobPid != 0)
         return;
 
     if (exception == TRUE || chanRecv_(sbdPtr->chanfd, &buf) < 0) {
         if (exception == TRUE)
-            ls_syslog(LOG_ERR, _i18n_msg_get(ls_catd , NL_SETN, 7887,
-                                             "%s: Exception bit of <%d> is set for job <%s>"), /* catgets 7887 */
-                      fname, sbdPtr->chanfd, lsb_jobid2str(jData->jobId));
+            ls_syslog(LOG_ERR, "\
+%s: Exception bit of <%d> is set for job <%s>",
+                      __func__, sbdPtr->chanfd,
+                      lsb_jobid2str(jData->jobId));
         else
-            ls_syslog(LOG_ERR, I18N_JOB_FAIL_S,
-                      fname,
-                      lsb_jobid2str(jData->jobId),
-                      "chanRecv_");
+            ls_syslog(LOG_ERR, "\
+%s: chanRecv_() failed for job %s", __func__, lsb_jobid2str(jData->jobId));
 
         if (IS_START(jData->jStatus)) {
             jData->newReason = PEND_JOB_START_FAIL;
-            jStatusChange(jData, JOB_STAT_PEND, LOG_IT, fname);
+            jStatusChange(jData, JOB_STAT_PEND, LOG_IT, __func__);
         }
         return;
     }
 
     xdrmem_create(&xdrs, buf->data, buf->len, XDR_DECODE);
-
-    if (!xdr_LSFHeader(&xdrs, &replyHdr)) {
-        ls_syslog(LOG_ERR, I18N_JOB_FAIL_S,
-                  fname,
-                  lsb_jobid2str(jData->jobId),
-                  "xdr_LSFHeader");
-
+    if (! xdr_LSFHeader(&xdrs, &replyHdr)) {
+        ls_syslog(LOG_ERR, "\
+%s: xdr_LSFHeader() failed for job %s", __func__,
+                  lsb_jobid2str(jData->jobId));
         if (IS_START(jData->jStatus)) {
             jData->newReason = PEND_JOB_START_FAIL;
-            jStatusChange(jData, JOB_STAT_PEND, LOG_IT, fname);
+            jStatusChange(jData, JOB_STAT_PEND, LOG_IT, __func__);
         }
         goto Leave;
     }
@@ -2102,21 +2123,23 @@ doNewJobReply(struct sbdNode *sbdPtr, int exception)
     if (replyHdr.opCode != ERR_NO_ERROR) {
         if (IS_START(jData->jStatus)) {
 
-            replayReason = jobStartError(jData, (sbdReplyType) replyHdr.opCode);
+            replayReason = jobStartError(jData,
+                                         (sbdReplyType)replyHdr.opCode);
             svReason = jData->newReason;
             jData->newReason = replayReason;
-            jStatusChange(jData, JOB_STAT_PEND, LOG_IT, fname);
+            jStatusChange(jData, JOB_STAT_PEND, LOG_IT, __func__);
             jData->newReason = svReason;
         }
         goto Leave;
     }
 
-    if(!xdr_jobReply(&xdrs, &jobReply, &replyHdr)) {
-        ls_syslog(LOG_ERR, I18N_JOB_FAIL_S,
-                  fname, lsb_jobid2str(jData->jobId), "xdr_jobReply");
+    if (! xdr_jobReply(&xdrs, &jobReply, &replyHdr)) {
+        ls_syslog(LOG_ERR, "\
+%s: xdr_jobReply() for job %s", __func__,
+                  lsb_jobid2str(jData->jobId));
         if (IS_START(jData->jStatus)) {
             jData->newReason =  PEND_JOB_START_FAIL;
-            jStatusChange(jData, JOB_STAT_PEND, LOG_IT, fname);
+            jStatusChange(jData, JOB_STAT_PEND, LOG_IT, __func__);
         }
         goto Leave;
     }
@@ -2131,20 +2154,22 @@ doNewJobReply(struct sbdNode *sbdPtr, int exception)
             struct Buffer *replyBuf;
 
             if (chanAllocBuf_(&replyBuf, sizeof(struct LSFHeader)) < 0) {
-                ls_syslog(LOG_ERR, I18N_FUNC_FAIL_M, fname, "chanAllocBuf_");
+                ls_syslog(LOG_ERR, "\
+%s: chanAllocBuf_() for job %s", __func__,
+                          lsb_jobid2str(jData->jobId));
                 goto Leave;
             }
 
-            memcpy((char *) replyBuf->data, (char *) buf->data,
-                   LSF_HEADER_LEN);
+            memcpy(replyBuf->data, buf->data, LSF_HEADER_LEN);
 
             replyBuf->len = LSF_HEADER_LEN;
 
             if (chanEnqueue_(sbdPtr->chanfd, replyBuf) < 0) {
-                ls_syslog(LOG_ERR, I18N_FUNC_FAIL_M, fname, "chanEnqueue");
+                ls_syslog(LOG_ERR, "\
+%s: chanEnqueue_() for job %s", __func__,
+                          lsb_jobid2str(jData->jobId));
                 chanFreeBuf_(replyBuf);
             } else {
-
                 sbdPtr->reqCode = MBD_NEW_JOB_KEEP_CHAN;
             }
         } else {
@@ -2155,8 +2180,9 @@ doNewJobReply(struct sbdNode *sbdPtr, int exception)
             io_block_(s);
 
             if ((cc = writeEncodeHdr_(sbdPtr->chanfd, &hdr, chanWrite_)) < 0) {
-                ls_syslog(LOG_ERR, I18N_JOB_FAIL_S_MM,
-                          fname, lsb_jobid2str(jData->jobId), "writeEncodeHdr");
+                ls_syslog(LOG_ERR, "\
+%s: writeEncodeHEader_() for job %s", __func__,
+                          lsb_jobid2str(jData->jobId));
             }
         }
     }
@@ -2909,4 +2935,735 @@ sendLSFHeader(int ch, int opcode)
     chanWrite_(ch, buf, sizeof(buf));
 
     return 0;
+}
+
+static int
+enqueueLSFHeader(int ch, int opcode)
+{
+    XDR xdrs2;
+    struct Buffer *buf;
+    struct LSFHeader replyHdr;
+
+
+    if (chanAllocBuf_(&buf, sizeof(struct LSFHeader)) < 0) {
+        ls_syslog(LOG_ERR, "%s: chanAllocBuf() failed %s", __func__);
+        return -1;
+    }
+
+    initLSFHeader_(&replyHdr);
+    replyHdr.opCode = opcode;
+    replyHdr.length = 0;
+
+    xdrmem_create (&xdrs2, buf->data, sizeof(struct LSFHeader), XDR_ENCODE);
+
+    if (!xdr_LSFHeader(&xdrs2, &replyHdr)) {
+        ls_syslog(LOG_ERR, "%s: xdr_LSFHeader() failed", __func__);
+        xdr_destroy(&xdrs2);
+        return -1;
+
+    }
+
+    buf->len = XDR_GETPOS(&xdrs2);
+
+    if (chanEnqueue_(ch, buf) < 0) {
+        ls_syslog(LOG_ERR, "%s: chanEnqueue_() failed", __func__);
+        xdr_destroy(&xdrs2);
+        return -1;
+    }
+
+    xdr_destroy(&xdrs2);
+
+    return 0;
+}
+
+/* do_jobDepInfo()
+ */
+int
+do_jobDepInfo(XDR *xdrs,
+              int chfd,
+              struct sockaddr_in *from,
+              char *hostname,
+              struct LSFHeader *hdr)
+{
+    LS_LONG_INT jobID;
+    XDR xdrs2;
+    int cc;
+    int len;
+    char *replyBuf;
+    struct LSFHeader hdr2;
+    struct jData *jPtr;
+    link_t *l;
+    struct job_dep *jdep;
+
+    if (! xdr_jobID(xdrs, &jobID, hdr)) {
+        ls_syslog(LOG_ERR, "%s: xdr_jobID() failed", __func__);
+        sendLSFHeader(chfd, LSBE_XDR);
+        return -1;
+    }
+
+    if ((jPtr = getJobData(jobID)) == NULL) {
+        sendLSFHeader(chfd, LSBE_NO_JOB);
+        return -1;
+    }
+
+    /* Check if the job has dependencies
+     */
+    if (jPtr->shared->jobBill.dependCond[0] == 0) {
+        sendLSFHeader(chfd, LSBE_NODEP_COND);
+        return 0;
+    }
+    /* make the link and evaluate the dependency
+     * condition.
+     */
+    l = make_link();
+    evalDepCond(jPtr->shared->dptRoot, jPtr, l);
+    cc = get_dep_link_size(l) + sizeof(struct LSFHeader);
+    cc = cc * sizeof(int);
+
+    replyBuf = calloc(cc, sizeof(char));
+    xdrmem_create(&xdrs2, replyBuf, cc, XDR_ENCODE);
+
+    initLSFHeader_(&hdr2);
+    hdr2.opCode = LSBE_NO_ERROR;
+    XDR_SETPOS(&xdrs2, LSF_HEADER_LEN);
+
+    if (! xdr_int(&xdrs2, &l->num)) {
+        sendLSFHeader(chfd, LSBE_XDR);
+        _free_(replyBuf);
+        return -1;
+    }
+
+    /* XDR the job dep elements
+     */
+    while ((jdep = dequeue_link(l))) {
+        if (! xdr_jobdep(&xdrs2, jdep, hdr)) {
+            sendLSFHeader(chfd, LSBE_XDR);
+            _free_(replyBuf);
+            return -1;
+        }
+        _free_(jdep->dependency);
+        _free_(jdep->jobid);
+        _free_(jdep);
+    }
+    fin_link(l);
+
+    len = XDR_GETPOS(&xdrs2);
+    hdr2.length = len - LSF_HEADER_LEN;
+    XDR_SETPOS(&xdrs2, 0);
+
+    if (!xdr_LSFHeader(&xdrs2, &hdr2)) {
+        sendLSFHeader(chfd, LSBE_XDR);
+        _free_(replyBuf);
+        return -1;
+    }
+    XDR_SETPOS(&xdrs2, len);
+
+    if (chanWrite_(chfd, replyBuf, XDR_GETPOS(&xdrs2)) <= 0) {
+        ls_syslog(LOG_ERR, "%s: chanWrite %dbytes failed",
+                  __func__, XDR_GETPOS(&xdrs2));
+        _free_(replyBuf);
+        xdr_destroy(&xdrs2);
+        return -1;
+    }
+
+    _free_(replyBuf);
+    xdr_destroy(&xdrs2);
+
+    return 0;
+
+}
+
+/* get_dep_link_size()
+ */
+static int
+get_dep_link_size(link_t *l)
+{
+    linkiter_t iter;
+    struct job_dep *jd;
+    int bytes;
+
+    traverse_init(l, &iter);
+    bytes = 0;
+
+    while ((jd = traverse_link(&iter))) {
+        bytes = bytes + ALIGNWORD_(strlen(jd->dependency))
+            + ALIGNWORD_(strlen(jd->jobid)) + 2 * sizeof(int);
+    }
+
+    return bytes;
+}
+
+/* do_jobGroupAdd()
+ */
+int
+do_jobGroupAdd(XDR *xdrs,
+               int chfd,
+               struct sockaddr_in *from,
+               char *hostname,
+               struct LSFHeader *hdr,
+               struct lsfAuth *auth)
+{
+    struct job_group group;
+    int cc;
+
+    group.group_name = calloc(MAXLSFNAMELEN, sizeof(char));
+
+    if (! xdr_jobgroup(xdrs, &group, hdr)) {
+        ls_syslog(LOG_ERR, "%s: xdr_jobgroup() failed", __func__);
+        enqueueLSFHeader(chfd, LSBE_XDR);
+        return -1;
+    }
+
+    cc = add_job_group(&group, auth);
+
+    /* send back the answer to the library
+     */
+    enqueueLSFHeader(chfd, cc);
+    _free_(group.group_name);
+
+    return 0;
+}
+
+/* do_jobGroupDel()
+ */
+int
+do_jobGroupDel(XDR *xdrs,
+               int chfd,
+               struct sockaddr_in *from,
+               char *hostname,
+               struct LSFHeader *hdr,
+               struct lsfAuth *auth)
+{
+    struct job_group group;
+    int cc;
+
+    group.group_name = calloc(MAXLSFNAMELEN, sizeof(char));
+
+    if (! xdr_jobgroup(xdrs, &group, hdr)) {
+        ls_syslog(LOG_ERR, "%s: xdr_jobgroup() failed", __func__);
+        enqueueLSFHeader(chfd, LSBE_XDR);
+        return -1;
+    }
+
+    cc = del_job_group(&group, auth);
+
+    /* send back the answer to the library
+     */
+    enqueueLSFHeader(chfd, cc);
+    _free_(group.group_name);
+
+    return 0;
+}
+
+/* do_jobGroupInfo()
+ */
+int
+do_jobGroupInfo(XDR *xdrs,
+                int chfd,
+                struct sockaddr_in *from,
+                char *hostname,
+                struct LSFHeader *hdr)
+{
+    int size;
+    XDR xdrs2;
+    char *buf;
+    int cc;
+    int n;
+    int len;
+    struct LSFHeader hdr2;
+
+    /* Get the tree size and the number of
+     * nodes on the tree itself.
+     */
+    size = tree_size(&n);
+    size = size * sizeof(int) + sizeof(struct LSFHeader) + sizeof(int);
+
+    buf = calloc(size, sizeof(char));
+
+    xdrmem_create(&xdrs2, buf, size, XDR_ENCODE);
+
+    initLSFHeader_(&hdr2);
+    hdr2.opCode = LSBE_NO_ERROR;
+    XDR_SETPOS(&xdrs2, LSF_HEADER_LEN);
+
+    if (! xdr_int(&xdrs2, &n)) {
+        ls_syslog(LOG_ERR, "\
+%s: failed encoding num nodes %d bytes", __func__, size);
+        sendLSFHeader(chfd, LSBE_XDR);
+        _free_(buf);
+        return -1;
+    }
+
+    cc = encode_nodes(&xdrs2, &n, JGRP_NODE_GROUP, hdr);
+    if (cc < 0) {
+        ls_syslog(LOG_ERR, "\
+%s: failed encoding nodes %d bytes", __func__, size);
+        sendLSFHeader(chfd, LSBE_XDR);
+        _free_(buf);
+        xdr_destroy(&xdrs2);
+        return -1;
+    }
+
+    len = XDR_GETPOS(&xdrs2);
+    hdr2.length = len - LSF_HEADER_LEN;
+    XDR_SETPOS(&xdrs2, 0);
+
+    if (!xdr_LSFHeader(&xdrs2, &hdr2)) {
+        sendLSFHeader(chfd, LSBE_XDR);
+        _free_(buf);
+        return -1;
+    }
+
+    XDR_SETPOS(&xdrs2, len);
+
+    if (chanWrite_(chfd, buf, XDR_GETPOS(&xdrs2)) <= 0) {
+        ls_syslog(LOG_ERR, "%s: chanWrite() %dbytes failed",
+                  __func__, XDR_GETPOS(&xdrs2));
+        _free_(buf);
+        xdr_destroy(&xdrs2);
+        return -1;
+    }
+
+    _free_(buf);
+    xdr_destroy(&xdrs2);
+
+    return 0;
+}
+
+/* do_jobGroupModify()
+ */
+int
+do_jobGroupModify(XDR *xdrs,
+                  int chfd,
+                  struct sockaddr_in *from,
+                  char *hostname,
+                  struct LSFHeader *hdr,
+                  struct lsfAuth *auth)
+{
+    struct job_group group;
+    int cc;
+
+    group.group_name = calloc(MAXLSFNAMELEN, sizeof(char));
+
+    if (! xdr_jobgroup(xdrs, &group, hdr)) {
+        ls_syslog(LOG_ERR, "%s: xdr_jobgroup() failed", __func__);
+        enqueueLSFHeader(chfd, LSBE_XDR);
+        return -1;
+    }
+
+    cc = modify_job_group(&group, auth);
+
+    /* send back the answer to the library
+     */
+    enqueueLSFHeader(chfd, cc);
+    _free_(group.group_name);
+
+    return 0;
+}
+
+/* do_resLimitInfo
+ */
+int
+do_resLimitInfo(XDR *xdrs,
+                int chfd,
+                struct sockaddr_in *from,
+                struct LSFHeader *hdr)
+{
+    XDR xdrs2;
+    struct LSFHeader replyHdr;
+    char *reply_buf;
+    struct resLimitReply limits;
+    int count;
+
+    limits.numLimits = limitConf->nLimit;
+    limits.limits = limitConf->limits;
+    limits.numUsage = 0;
+    limits.usage = NULL;
+    addResUsage(&limits);
+
+    count = xdrsize_ResLimitInfoReply(&limits);
+    reply_buf = my_calloc(count, sizeof(char), __func__);
+    xdrmem_create(&xdrs2, reply_buf, count, XDR_ENCODE);
+
+    initLSFHeader_(&replyHdr);
+    replyHdr.opCode = LSBE_NO_ERROR;
+    XDR_SETPOS(&xdrs2, LSF_HEADER_LEN);
+
+    if (!xdr_encodeMsg(&xdrs2,
+                       (char *) &limits,
+                       &replyHdr,
+                       xdr_resLimitReply,
+                       0,
+                       NULL)) {
+        ls_syslog(LOG_ERR, "\
+%s: failed encode %dbytes reply to %s", __func__,
+                  XDR_GETPOS(&xdrs2), sockAdd2Str_(from));
+        freeResLimitUsage(limits.numUsage, limits.usage);
+        FREEUP(reply_buf);
+        xdr_destroy(&xdrs2);
+        return -1;
+    }
+
+    if (chanWrite_(chfd, reply_buf, XDR_GETPOS(&xdrs2)) <= 0) {
+        ls_syslog(LOG_ERR, "\
+%s: failed encode %dbytes reply to %s", __func__,
+                  XDR_GETPOS(&xdrs2), sockAdd2Str_(from));
+        freeResLimitUsage(limits.numUsage, limits.usage);
+        xdr_destroy(&xdrs2);
+        FREEUP(reply_buf);
+        return -1;
+    }
+
+    freeResLimitUsage(limits.numUsage, limits.usage);
+    xdr_destroy(&xdrs2);
+    FREEUP(reply_buf);
+    return 0;
+}
+
+static int
+xdrsize_ResLimitInfoReply (struct resLimitReply *limits)
+{
+    int    len;
+    int    i, j;
+
+    len = ALIGNWORD_(sizeof(struct resLimitReply)
+                     + sizeof(int)
+                     + limits->numLimits * sizeof(struct resLimit));
+
+    for (i = 0; i < limits->numLimits; i++) {
+        len += getXdrStrlen(limits->limits[i].name)
+            + ALIGNWORD_(2 * sizeof(int)
+                         + limits->limits[i].nConsumer * sizeof(struct limitConsumer)
+                         + limits->limits[i].nRes * sizeof(struct limitRes));
+
+        for (j = 0 ; j < limits->limits[i].nConsumer; j++) {
+            len += getXdrStrlen(limits->limits[i].consumers[j].def)
+                + getXdrStrlen(limits->limits[i].consumers[j].value)
+                + ALIGNWORD_(sizeof(int));
+        }
+
+        for (j = 0; j < limits->limits[i].nRes; j++) {
+            len += getXdrStrlen(limits->limits[i].res[j].windows)
+                + sizeof(float)
+                + sizeof(int);
+        }
+    }
+
+    len += ALIGNWORD_(limits->numUsage * sizeof(struct resLimitUsage))
+        + sizeof(int);
+
+    for (i = 0; i < limits->numUsage; i++) {
+        len += getXdrStrlen(limits->usage[i].limitName)
+            + getXdrStrlen(limits->usage[i].project)
+            + getXdrStrlen(limits->usage[i].user)
+            + getXdrStrlen(limits->usage[i].queue)
+            + getXdrStrlen(limits->usage[i].host)
+            + 4 * sizeof(float);
+    }
+
+    return len;
+}
+
+/* addResUsage() */
+static void
+addResUsage(struct resLimitReply *limits)
+{
+    struct sTab   sTab;
+    struct sTab   sTab2;
+    hEnt   *ent;
+    hEnt   *ent2;
+    struct consumerData *pData;
+    struct resData *pqData;
+    int    i;
+    int    n = 0;
+    struct resLimitUsage *usage;
+    struct resLimitUsage *allLimitUsage[MAX_RES_LIMITS * 20];
+
+    ent = h_firstEnt_(&pDataTab, &sTab);
+    while (ent) {
+        pData = ent->hData;
+        ent2 = h_firstEnt_(pData->rAcct, &sTab2);
+        while (ent2) {
+            pqData = ent2->hData;
+            for (i = 0; i < limits->numLimits; i++) {
+                usage = getLimitUsage(&limits->limits[i], pqData);
+                if (usage) {
+                    allLimitUsage[n++] = usage;
+                }
+            }
+            ent2 = h_nextEnt_(&sTab2);
+        }
+        ent = h_nextEnt_(&sTab);
+    }
+
+    ent = h_firstEnt_(&uDataTab, &sTab);
+    while (ent) {
+        pData = ent->hData;
+        ent2 = h_firstEnt_(pData->rAcct, &sTab2);
+        while (ent2) {
+            pqData = ent2->hData;
+            for (i = 0; i < limits->numLimits; i++) {
+                usage = getLimitUsage(&limits->limits[i], pqData);
+                if (usage) {
+                    allLimitUsage[n++] = usage;
+                }
+            }
+            ent2 = h_nextEnt_(&sTab2);
+        }
+        ent = h_nextEnt_(&sTab);
+    }
+
+    ent = h_firstEnt_(&hDataTab, &sTab);
+    while (ent) {
+        pData = ent->hData;
+        ent2 = h_firstEnt_(pData->rAcct, &sTab2);
+        while (ent2) {
+            pqData = ent2->hData;
+            for (i = 0; i < limits->numLimits; i++) {
+                usage = getLimitUsage(&limits->limits[i], pqData);
+                if (usage) {
+                    allLimitUsage[n++] = usage;
+                }
+            }
+            ent2 = h_nextEnt_(&sTab2);
+        }
+        ent = h_nextEnt_(&sTab);
+    }
+
+    limits->numUsage = n;
+    limits->usage = my_calloc(limits->numUsage, sizeof(struct resLimitUsage), __func__);
+    for (i = 0; i < limits->numUsage; i++) {
+        limits->usage[i].limitName = allLimitUsage[i]->limitName;
+        limits->usage[i].project = allLimitUsage[i]->project == NULL ? strdup("") : allLimitUsage[i]->project;
+        limits->usage[i].user = allLimitUsage[i]->user == NULL ? strdup("") : allLimitUsage[i]->user;
+        limits->usage[i].queue = allLimitUsage[i]->queue == NULL ? strdup("") : allLimitUsage[i]->queue;
+        limits->usage[i].host = allLimitUsage[i]->host == NULL ? strdup("") : allLimitUsage[i]->host;
+        limits->usage[i].slots = allLimitUsage[i]->slots;
+        limits->usage[i].maxSlots = allLimitUsage[i]->maxSlots;
+        limits->usage[i].jobs = allLimitUsage[i]->jobs;
+        limits->usage[i].maxJobs = allLimitUsage[i]->maxJobs;
+        FREEUP(allLimitUsage[i]);
+    }
+}
+
+/* getLimitUsage() */
+static struct resLimitUsage *
+getLimitUsage(struct resLimit *limit, struct resData *pAcct)
+{
+    int    i, j;
+    char   *project = NULL;
+    char   *save_project = NULL;
+    char   *queue = NULL;
+    char   *save_queue = NULL;
+    char   *user = NULL;
+    char   *save_user = NULL;
+    char   *user_def = NULL;
+    char   *save_user_def = NULL;
+    char   *host = NULL;
+    char   *save_host = NULL;
+    char   *word = NULL;
+    int    hasMe = FALSE;
+    int    hasAll = FALSE;
+    int    neg = FALSE;
+    struct resLimitUsage *usage = NULL;
+    static struct limitRes *lr;
+
+    if (!limit || !pAcct)
+        return NULL;
+
+    if (pAcct->numRUNSlots == 0
+        && pAcct->numSSUSPSlots == 0
+        && pAcct->numUSUSPSlots == 0
+        && pAcct->numRESERVESlots == 0)
+        return NULL;
+
+    for (i = 0; i < limit->nRes; i++) {
+        if (limit->res[i].value != 0)
+            break;
+    }
+
+    if (i == limit->nRes)
+        return NULL;
+
+    for (j = 0; j < limit->nConsumer; j++) {
+        if (limit->consumers[j].consumer == LIMIT_CONSUMER_PROJECTS
+            || limit->consumers[j].consumer == LIMIT_CONSUMER_PER_PROJECT) {
+            project = strdup(limit->consumers[j].value);
+            save_project = project;
+            if (!pAcct->project
+                    && limit->consumers[j].consumer == LIMIT_CONSUMER_PER_PROJECT)
+                goto clean;
+
+        } else if (limit->consumers[j].consumer == LIMIT_CONSUMER_QUEUES
+                   || limit->consumers[j].consumer == LIMIT_CONSUMER_PER_QUEUE) {
+            queue = strdup(limit->consumers[j].value);
+            save_queue = queue;
+            if (!pAcct->queue
+                    && limit->consumers[j].consumer == LIMIT_CONSUMER_PER_QUEUE)
+                goto clean;
+
+        } else if (limit->consumers[j].consumer == LIMIT_CONSUMER_USERS
+                   || limit->consumers[j].consumer == LIMIT_CONSUMER_PER_USER) {
+            user = strdup(limit->consumers[j].value);
+            save_user = user;
+            user_def = strdup(limit->consumers[j].def);
+            save_user_def = user_def;
+            if (!pAcct->user
+                    && limit->consumers[j].consumer == LIMIT_CONSUMER_PER_USER)
+                goto clean;
+
+        } else if (limit->consumers[j].consumer == LIMIT_CONSUMER_HOSTS
+                   || limit->consumers[j].consumer == LIMIT_CONSUMER_PER_HOST) {
+            host = strdup(limit->consumers[j].value);
+            save_host = host;
+            if (!pAcct->host
+                    && limit->consumers[j].consumer == LIMIT_CONSUMER_PER_HOST)
+                goto clean;
+
+        }
+    }
+
+    if (queue && pAcct->queue) {
+        while ((word = getNextWord_(&queue)) != NULL) {
+            if (strcasecmp(word, pAcct->queue) == 0)
+                break;
+        }
+        if (!word)
+            goto clean;
+    }
+
+    if (host && pAcct->host) {
+        while ((word = getNextWord_(&host)) != NULL) {
+            if (strcasecmp(word, pAcct->host) == 0)
+                break;
+        }
+        if (!word)
+            goto clean;
+    }
+
+    if (user && pAcct->user) {
+        while ((word = getNextWord_(&user)) != NULL) {
+            if (strcasecmp(word, pAcct->user) == 0)
+                break;
+        }
+        if (!word) {
+            /* check unix user */
+            char *word2 = NULL;
+            if (strstr(user_def, "all") == user_def)
+                hasAll = TRUE;
+
+            while ((word2 = getNextWord_(&user_def)) != NULL) {
+                if (word2[0] == '~') {
+                    neg = TRUE;
+                    word2++;
+                }
+                if (strcasecmp(word2, pAcct->user) == 0) {
+                    hasMe = TRUE;
+                    break;
+                } else {
+                    /* check LSF or UNIX user group */
+                    struct gData *gp = NULL;
+
+                    gp = getUGrpData(word2);
+                    if (gp) {
+                        char  **gUsers = NULL;
+                        int   numUsers = 0;
+                        int   i;
+
+                        gUsers = expandGrp(gp, word2, &numUsers);
+                        for (i = 0; i < numUsers; i++) {
+                            if (strcasecmp(gUsers[i], pAcct->user) == 0) {
+                                hasMe = TRUE;
+                                break;
+                            }
+                        }
+                        FREEUP(gUsers);
+                        if (hasMe)
+                            break;
+                    }
+                }
+                neg = FALSE;
+            }
+            if((!hasAll && !hasMe)
+               || (hasAll && hasMe && neg))
+                goto clean;
+        }
+    }
+
+    if (project && pAcct->project) {
+        hasMe = FALSE;
+        neg = FALSE;
+        hasAll = FALSE;
+
+        if (strstr(project, "all") != NULL)
+            hasAll = TRUE;
+
+        while ((word = getNextWord_(&project)) != NULL) {
+            if (word[0] == '~') {
+                neg = TRUE;
+                word++;
+            }
+            if (strcasecmp(word, pAcct->project) == 0) {
+                hasMe = TRUE;
+                break;
+            }
+            neg = FALSE;
+        }
+        if((!hasAll && !hasMe)
+           || (hasAll && hasMe && neg))
+            goto clean;
+    }
+
+    if ((lr = getActiveLimit(limit->res, limit->nRes)) == NULL)
+        goto clean;
+
+    usage = my_calloc(1, sizeof(struct resLimitUsage), __func__);
+    usage->limitName = strdup(limit->name);
+    if (pAcct->project)
+        usage->project= strdup(pAcct->project);
+    if (pAcct->user)
+        usage->user = strdup(pAcct->user);
+    if (pAcct->queue)
+        usage->queue = strdup(pAcct->queue);
+    if (pAcct->host)
+        usage->host = strdup(pAcct->host);
+
+    usage->slots= pAcct->numRUNSlots
+        + pAcct->numSSUSPSlots
+        + pAcct->numUSUSPSlots
+        + pAcct->numRESERVESlots;
+
+    usage->jobs= pAcct->numRUNJobs
+        + pAcct->numSSUSPJobs
+        + pAcct->numUSUSPJobs
+        + pAcct->numRESERVEJobs;
+
+    usage->maxSlots = usage->maxJobs = lr->value;
+
+clean:
+    FREEUP(save_queue);
+    FREEUP(save_project);
+    FREEUP(save_user);
+    FREEUP(save_user_def);
+    FREEUP(save_host);
+    return usage;
+}
+
+/* freeResLimitUsage() */
+static void
+freeResLimitUsage(int num, struct resLimitUsage *usage)
+{
+    int    i;
+
+    if (num ==0 || usage == NULL)
+        return;
+
+    for (i = 0; i < num; i++) {
+        FREEUP(usage[i].limitName);
+        FREEUP(usage[i].project);
+        FREEUP(usage[i].user);
+        FREEUP(usage[i].queue);
+        FREEUP(usage[i].host);
+    }
+    FREEUP(usage);
 }

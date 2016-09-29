@@ -337,7 +337,7 @@ hostInfoReq(XDR *xdrs,
     char  fromEligible, clName;
     struct tclHostData tclHostData;
 
-    if (logclass & (LC_TRACE | LC_HANG | LC_COMM))
+    if (logclass & (LC_TRACE | LC_COMM))
         ls_syslog(LOG_DEBUG1, "%s: Entering this routine...", fname);
 
     initResVal(&resVal);
@@ -546,7 +546,7 @@ infoReq(XDR *xdrs, struct sockaddr_in *from, struct LSFHeader *reqHdr, int s)
             return;
         }
     }
-    if (logclass & (LC_TRACE | LC_HANG | LC_COMM))
+    if (logclass & (LC_TRACE | LC_COMM))
         ls_syslog(LOG_DEBUG1, "%s: Entering this routine...", fname);
 
     limReplyCode = LIME_NO_ERR;
@@ -647,23 +647,7 @@ Reply:
 int
 validHosts(char **hostList, int num, char *clName, int options)
 {
-    struct clusterNode *clPtr;
-    int cc;
-
-    myClusterPtr->status |= CLUST_ELIGIBLE;
-    *clName = FALSE;
-    clPtr = myClusterPtr;
-
-    for (cc = 0; cc < num; cc++) {
-
-        if (findHostbyList(clPtr->hostList, hostList[cc]) == NULL) {
-            ls_syslog(LOG_WARNING, "\
-%s: Unknown host %s in request", __func__, hostList[cc]);
-            return FALSE;
-        }
-    }
-
-    return TRUE;
+    return true;
 }
 
 static struct shortLsInfo *
@@ -721,7 +705,7 @@ resourceInfoReq(XDR *xdrs, struct sockaddr_in *from, struct LSFHeader *reqHdr, i
     struct resourceInfoReply resourceInfoReply;
     int cc = 0;
 
-    if (logclass & (LC_TRACE | LC_HANG | LC_COMM))
+    if (logclass & (LC_TRACE | LC_COMM))
         ls_syslog(LOG_DEBUG1, "%s: Entering this routine...", fname);
 
     limReplyCode = LIME_NO_ERR;

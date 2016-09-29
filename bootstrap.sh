@@ -8,3 +8,7 @@ autoheader
 automake --add-missing --copy
 #set +x
 #test -n "$NOCONFIGURE" || ./configure "$@"
+if [ ! -d ".git" ]; then
+  /bin/echo "No .git directory, no commit file"
+  exit 0
+fi

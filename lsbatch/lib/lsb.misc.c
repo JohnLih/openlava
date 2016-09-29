@@ -23,7 +23,7 @@ void
 initTab(struct hTab *tabPtr)
 {
     if (tabPtr) {
-        h_initTab_ (tabPtr, 50);
+        h_initTab_ (tabPtr, 10891);
     }
 }
 
@@ -260,21 +260,14 @@ sndJobFile_(int s, struct lenData *jf)
     return 0;
 }
 
-
-void
-upperStr(char *in, char *out)
-{
-    for (; *in != '\0'; in++, out++)
-	*out = toupper(*in);
-    *out = '\0';
-}
-
-
+/* copyJUsage()
+ */
 void
 copyJUsage(struct jRusage *to, struct jRusage *from)
 {
     struct pidInfo *newPidInfo;
     int *newPgid;
+    int i;
 
     to->mem = from->mem;
     to->swap = from->swap;
@@ -282,7 +275,8 @@ copyJUsage(struct jRusage *to, struct jRusage *from)
     to->stime = from->stime;
 
     if (from->npids) {
-        newPidInfo =  calloc(from->npids, sizeof(struct pidInfo));
+
+        newPidInfo = calloc(from->npids, sizeof(struct pidInfo));
         if (newPidInfo != NULL) {
             if (to->npids)
                 FREEUP (to->pidInfo);
@@ -291,24 +285,45 @@ copyJUsage(struct jRusage *to, struct jRusage *from)
             memcpy(to->pidInfo,
                    from->pidInfo,
                    from->npids * sizeof(struct pidInfo));
+
+            if (logclass & LC_SIGNAL) {
+                for (i = 0; i < from->npids; i++) {
+                    ls_syslog(LOG_INFO, "\
+%s: pid %d ppid %d pgid %d jobid %d", __func__,
+                              from->pidInfo[i].pid,
+                              from->pidInfo[i].ppid,
+                              from->pidInfo[i].pgid,
+                              from->pidInfo[i].jobid);
+                }
+            }
+
         }
     } else if (to->npids) {
-        FREEUP (to->pidInfo);
+        FREEUP(to->pidInfo);
         to->npids = 0;
     }
 
     if (from->npgids) {
+
+        if (logclass & LC_SIGNAL) {
+            for (i = 0; i < from->npgids; i++) {
+                ls_syslog(LOG_INFO, "\
+%s: pigds %d", __func__, from->pgid[i]);
+            }
+        }
+
         newPgid = calloc(from->npgids, sizeof(int));
-        if (newPgid == NULL) return;
+        if (newPgid == NULL)
+            return;
         if (to->npgids)
-            FREEUP (to->pgid);
+            FREEUP(to->pgid);
         to->pgid = newPgid;
         to->npgids = from->npgids;
         memcpy(to->pgid,
                from->pgid,
                from->npgids * sizeof(int));
     } else if (to->npgids) {
-        FREEUP (to->pgid);
+        FREEUP(to->pgid);
         to->npgids = 0;
     }
 }
@@ -761,3 +776,19 @@ supportJobNamePattern(char * jobname)
    return 0;
 }
 
+void
+freeWeek (windows_t *week[])
+{
+    windows_t *wp, *wpp;
+    int j;
+
+    for (j = 0; j < 8; j++) {
+        for (wp = week[j]; wp; wp = wpp) {
+            wpp =  wp->nextwind;
+            if (wp)
+                free (wp);
+        }
+        week[j] = NULL;
+    }
+
+}

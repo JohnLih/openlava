@@ -478,8 +478,16 @@ ls_nioselect(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds,
                     xdrmem_create(&xdrs, (char *) &bufHdr,
                                   sizeof(struct LSFHeader), XDR_DECODE);
 
-                    if (readDecodeHdr_(conn[i].sock.fd, (char *) &bufHdr,
-                                       NB_SOCK_READ_FIX, &xdrs, &msgHdr) < 0) {
+                    if ((retVal = readDecodeHdr_(conn[i].sock.fd,
+                                                 (char *) &bufHdr,
+                                                 NB_SOCK_READ_FIX,
+                                                 &xdrs,
+                                                 &msgHdr)) < 0) {
+                        /* skip: select again */
+                        if (retVal == -3) {
+                            xdr_destroy(&xdrs);
+                            continue;
+                        }
                         if (!conn[i].dead) {
                             memset((void *)&status, 0, sizeof(LS_WAIT_T));
                             SETTERMSIG(status, STATUS_IOERR);
@@ -507,7 +515,9 @@ ls_nioselect(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds,
 
                     xdr_destroy(&xdrs);
 
-                    conn[i].rtag = msgHdr.reserved0;
+                    /* The header carry the task id.
+                     */
+                    conn[i].rtag = msgHdr.reserved;
 
                     if (nioDebug)
                         ls_syslog(LOG_DEBUG, "\

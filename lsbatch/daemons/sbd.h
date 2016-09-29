@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2015 David Bigagli
+ * Copyright (C) 2015 -2016 David Bigagli
  * Copyright (C) 2007 Platform Computing Inc
  *
  * This program is free software; you can redistribute it and/or modify
@@ -16,6 +16,10 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA
  *
  */
+
+#if !defined(_SBD_H_)
+#define _SBD_H
+
 #include <unistd.h>
 #include <stdio.h>
 #include <errno.h>
@@ -40,10 +44,7 @@
 #define JOBFILEEXT ""
 
 #define JOBFILE_CREATED -1
-
-enum {
-    JSUPER_STAT_SUSP
-};
+#define JSUPER_STAT_SUSP 0
 
 struct jobCard {
     struct jobCard *forw;
@@ -105,13 +106,49 @@ struct jobCard {
     char   *spooledExec;
     char   postJobStarted;
     char   userJobSucc;
+    int    *cores;    /* an array of core index that the job is bound to */
+    int    numCores;  /* number of bound cores */
 };
+
+/* openlava core representation
+ */
+struct ol_core {
+    int core_num;  /* core number decimal */
+    int bound;      /* number of bound processes */
+};
+
+/* openlava numa represenation
+ */
+typedef enum {
+    NUMA_HOST,       /* numa machine */
+    NUMA_NODE,       /* memory node */
+    NUMA_SOCKET,     /* processor socket */
+    NUMA_CORE,       /* processor core */
+} numa_type;
+
+typedef struct numa_obj {
+    struct numa_obj *forw;
+    struct numa_obj *back;
+    struct numa_obj *parent;
+    struct numa_obj *child;
+    numa_type type;         /* numa object type */
+    int total;              /* number of cores under this object*/
+    int used;               /* number of used cores under this object*/
+    int index;              /* logical index number */
+    int bound;              /* number of bound processes */
+} numa_obj_t;
 
 typedef enum {
     NO_SIGLOG,
     SIGLOG
 } logType;
 
+struct share_core {
+    char   *queue;
+    float  shares;
+    int    num;
+    int    *cores;
+};
 
 #define JOB_RUNNING(jp) (((jp)->jobSpecs.jStatus & JOB_STAT_RUN) && \
                           (JOB_STARTED(jp)))
@@ -205,6 +242,7 @@ extern time_t     host_windEdge;
 extern char       host_active;
 extern char master_unknown;
 extern char myStatus;
+extern int hostAffinity;
 
 #define NO_LIM		0x0001
 
@@ -222,7 +260,7 @@ extern struct clientNode *clientList;
 extern struct bucket     *jmQueue;
 
 extern int statusChan;
-
+extern int num_numa_cores;
 
 extern void start_master(void);
 extern void shutDownClient(struct clientNode *);
@@ -234,11 +272,10 @@ extern void do_probe(XDR *xdrs, int s, struct LSFHeader *);
 extern void do_reboot(XDR *xdrs, int s, struct LSFHeader *);
 extern void do_shutdown(XDR *xdrs, int s, struct LSFHeader *);
 extern void do_jobSetup(XDR *xdrs, int s, struct LSFHeader *);
-extern void do_jobSyslog(XDR *xdrs, int s, struct LSFHeader *);
-extern void do_jobMsg(struct bucket *, XDR *, int s, struct LSFHeader *);
-extern void do_rmConn(XDR *, int, struct LSFHeader *, struct clientNode *);
-extern void do_lsbMsg(XDR *, int s, struct LSFHeader *);
+extern void do_jobSyslog(XDR *xdrs, int , struct LSFHeader *);
+extern void do_blaunch_rusage(XDR *, int, struct LSFHeader *);
 extern void deliverMsg(struct bucket *);
+extern void do_jobSetup(XDR *xdrs, int s, struct LSFHeader *);
 
 extern void getJobsState(struct sbdPackage *sbdPackage);
 extern int status_job(mbdReqType, struct jobCard *, int, sbdReplyType);
@@ -308,18 +345,41 @@ extern int  fcp(char *, char *, struct hostent *);
 extern int rmDir(char *);
 extern void closeBatchSocket (void);
 extern void getManagerId(struct sbdPackage *);
-
-bool_t xdr_jobSetup (XDR *, struct jobSetup *, struct LSFHeader *);
-bool_t xdr_jobSyslog (XDR *, struct jobSyslog *, struct LSFHeader *);
+bool_t xdr_jobSetup(XDR *, struct jobSetup *, struct LSFHeader *);
+bool_t xdr_jobSyslog(XDR *, struct jobSyslog *, struct LSFHeader *);
 bool_t xdr_jobCard(XDR *, struct jobCard*, struct LSFHeader *);
 extern int sizeofJobCard(struct jobCard *);
-
-extern int jobSigStart (struct jobCard *jp, int sigValue, int actFlags, int actPeriod, logType logFlag);
+extern int jobSigStart(struct jobCard *, int, int, int, logType);
 extern int jobact (struct jobCard *, int, char *, int, int);
 extern int jobsig(struct jobCard *jobTable, int sig, int forkKill);
 extern int sbdread_jobstatus (struct jobCard *jp);
 extern int sbdCheckUnreportedStatus();
 extern void exeActCmd(struct jobCard *jp, char *actCmd, char *exitFile);
 extern void exeChkpnt(struct jobCard *jp, int chkFlags, char *exitFile);
-extern int cmp_cpus(const void *, const void *);
+extern void init_cores(void);
+extern int *find_free_core(int num);
+extern void free_core(int, int*, int);
+extern int bind_to_core(pid_t, int, int*);
+extern int *find_bound_core(pid_t, int *);
+extern int* get_core_shares(char *, float, int*);
+extern void set_core_shares(char *, float, int, int *);
+extern char *covert_cores_to_str(int, int *);
 
+#ifdef HAVE_HWLOC_H
+extern int init_numa_topology(void);
+extern void init_numa_cores(void);
+extern int *find_free_numa_core(int);
+extern int bind_to_numa_core(pid_t, int, int*);
+extern void bind_to_numa_mem(int*, int);
+extern void free_numa_core(int, int*, int);
+extern int *find_numa_bound_core(pid_t, int*);
+#endif
+extern void updateJUsage(struct jobCard *, struct jRusage *);
+extern void copyPidInfo(struct jobCard *, struct jRusage *);
+extern void writePidInfoFile(struct jobCard *, struct jRusage *);
+extern void update_job_rusage(struct jobCard *, struct jRusage *);
+extern int sbdlog_newstatus(struct jobCard *);
+extern void free_jrusage(struct jRusage **);
+extern struct jRusage *get_blaunch_jrusage(void);
+extern struct jRusage *merge_jrusage(struct jRusage *, struct jRusage *);
+#endif /* _SBD_H_ */

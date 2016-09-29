@@ -19,11 +19,6 @@
 
 #include "mbd.h"
 
-extern void addHost(struct hostInfo *lsf,
-                    struct hData *thPtr,
-                    char *filename,
-                    int override);
-
 static void   initHostStat(void);
 static void   hostJobs(struct hData *, int);
 static void   hostQueues(struct hData *, int);
@@ -267,6 +262,8 @@ copyHostInfo(struct hData *hData, struct hostInfoEnt *hInfo)
     hInfo->busyStop = hData->busyStop;
     hInfo->realLoad = hData->lsfLoad;
     hInfo->load = hData->lsbLoad;
+    hInfo->hCtrlMsg = hData->message;
+    hInfo->affinity = hData->affinity;
 
     hInfo->mig = (hData->mig != INFINIT_INT) ? hData->mig/60 : INFINIT_INT;
     switch (hData->chkSig) {
@@ -848,25 +845,18 @@ ctrlHost(struct controlReq *hcReq,
             if (hData->hStatus & HOST_STAT_UNAVAIL)
                 return LSBE_SBATCHD;
 
-            if (hData->hStatus & HOST_STAT_DISABLED) {
-                hData->hStatus &= ~HOST_STAT_DISABLED;
-                log_hoststatus(hData, hcReq->opCode,
-                               auth->uid, auth->lsfUserName);
-                return LSBE_NO_ERROR;
-            }
-            else
-                return LSBE_NO_ERROR;
+            hData->hStatus &= ~HOST_STAT_DISABLED;
+            strcpy (hData->message, hcReq->message);
+            log_hoststatus(hData, hcReq->opCode,
+                           auth->uid, auth->lsfUserName, hcReq->message);
+            return LSBE_NO_ERROR;
 
         case HOST_CLOSE :
-            if (hData->hStatus & HOST_STAT_DISABLED) {
-                return LSBE_NO_ERROR;
-            }
-            else {
-                hData->hStatus |= HOST_STAT_DISABLED;
-                log_hoststatus(hData, hcReq->opCode,
-                               auth->uid, auth->lsfUserName);
-                return LSBE_NO_ERROR;
-            }
+            hData->hStatus |= HOST_STAT_DISABLED;
+            strcpy (hData->message, hcReq->message);
+            log_hoststatus(hData, hcReq->opCode,
+                           auth->uid, auth->lsfUserName, hcReq->message);
+            return LSBE_NO_ERROR;
         default :
             return LSBE_LSBLIB;
     }
@@ -976,6 +966,10 @@ getLsbHostInfo(void)
         queueHostsPF(qp, &i);
 }
 
+/* getLsbHostLoad()
+ *
+ * Get the load of all hosts used by the batch system
+ */
 int
 getLsbHostLoad(void)
 {
@@ -987,7 +981,6 @@ getLsbHostLoad(void)
     int gone;
     char update;
     struct hData *hPtr;
-    struct jData *jpbw;
 
     ls_syslog(LOG_DEBUG, "%s: Entering this routine...", __func__);
 
@@ -1105,11 +1098,6 @@ getLsbHostLoad(void)
         hPtr->flags |= HOST_UPDATE;
 
     } /* for ( i = 0; i < num; i++) */
-
-    for (jpbw = jDataList[SJL]->back;
-         (jpbw != jDataList[SJL]); jpbw = jpbw->back) {
-        adjLsbLoad(jpbw, FALSE, TRUE);
-    }
 
     /* Detect which hosts has left the
      * cluster only if the migrant hosts
@@ -1281,6 +1269,7 @@ adjLsbLoad(struct jData *jpbw, int forResume, bool_t doAdj)
     struct resourceInstance *instance;
     static int *rusage_bit_map;
     int adjForPreemptableResource = FALSE;
+    int sameHost = FALSE;
 
     if (logclass & LC_TRACE)
         ls_syslog(LOG_DEBUG, "%s: Entering this routine...", __func__);
@@ -1305,6 +1294,12 @@ adjLsbLoad(struct jData *jpbw, int forResume, bool_t doAdj)
     if (resAssign == 0)
         return;
 
+    if ((hasResSpanHosts(jpbw->shared->resValPtr)
+         || hasResSpanHosts(jpbw->qPtr->resValPtr))
+        && (jpbw->shared->jobBill.numProcessors > 1)
+        && (jpbw->shared->jobBill.numProcessors == jpbw->shared->jobBill.maxNumProcessors)) {
+        sameHost = TRUE;
+    }
     duration = (float) resValPtr->duration;
     decay = resValPtr->decay;
     if (resValPtr->duration != INFINIT_INT && (duration - jpbw->runTime <= 0)){
@@ -1382,6 +1377,18 @@ adjLsbLoad(struct jData *jpbw, int forResume, bool_t doAdj)
             if (jackValue >= INFINIT_LOAD || jackValue <= -INFINIT_LOAD)
                 continue;
 
+            if (jackValue > 0 && ldx == MEM && sameHost) {
+                jackValue /= jpbw->shared->jobBill.numProcessors;
+                if (logclass & LC_SCHED) {
+                    ls_syslog(LOG_DEBUG1, "\
+%s: Updating reserved memory of job <%s> to <%f> as all <%d> processors are on the same host.",
+                              __func__,
+                              lsb_jobid2str(jpbw->jobId),
+                              jackValue,
+                              jpbw->shared->jobBill.numProcessors);
+                }
+            }
+
             if (ldx < allLsInfo->numIndx)
                 load = jpbw->hPtr[i]->lsbLoad[ldx];
             else {
@@ -1393,7 +1400,7 @@ adjLsbLoad(struct jData *jpbw, int forResume, bool_t doAdj)
 
                     TEST_BIT (ldx, rusage_bit_map, isSet)
                         if ((isSet == TRUE) && !slotResourceReserve) {
-                           continue;
+                            continue;
                         }
                     SET_BIT(ldx, rusage_bit_map);
                 }
@@ -1653,7 +1660,24 @@ hasResReserve(struct resVal *resVal)
 
 }
 
+int
+hasResSpanHosts(struct resVal *resVal)
+{
+    if (resVal == NULL) {
+        return false;
+    }
+    if ((resVal->options & PR_SPAN)
+        && (resVal->numHosts == 1)) {
+        return true;
+    }
+    return false;
+}
+
 /* addMigrantHost()
+ *
+ * This function follows the same
+ * flow as addHostData() in mbd.init.c
+ *
  */
 static void
 addMigrantHost(struct hostInfo *info)
@@ -1663,15 +1687,17 @@ addMigrantHost(struct hostInfo *info)
     initHData(&hPtr);
     hPtr.host = strdup(info->hostName);
     hPtr.hStatus = HOST_STAT_OK;
-    /* Agressive openlava all hosts
-     * today are quad cores.
-     * In any case for a floating host
-     * turn on autoconfigure MXJ.
-     */
-    hPtr.numCPUs = 4;
-    hPtr.maxJobs = -1;
 
-    addHost(info, &hPtr, NULL, 0);
+    /* resPriority is used by migrant host
+     * to set the MXJ for the batch migrant.
+     */
+    if (info->rexPriority > 0) {
+        hPtr.maxJobs = info->rexPriority;
+        info->maxCpus = info->rexPriority;
+    }
+
+    addHost(info, &hPtr);
+    _free_(hPtr.host);
 }
 
 /* rmMigrantHost()
